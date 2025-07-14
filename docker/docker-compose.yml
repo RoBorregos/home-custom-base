@@ -1,0 +1,41 @@
+x-common: &common
+  runtime: nvidia
+  environment:
+    - DISPLAY=${DISPLAY}
+    - QT_X11_NO_MITSHM=1
+    - NVIDIA_VISIBLE_DEVICES=all
+    - LIBGL_ALWAYS_INDIRECT=0
+  volumes:
+    - /tmp/.X11-unix:/tmp/.X11-unix
+    - ../:/home/rosuser/ros2_ws
+  devices:
+    - /dev/dri:/dev/dri
+  network_mode: host
+  privileged: true
+  stdin_open: true
+  tty: true
+
+services:
+  home_base:
+    <<: *common
+    build:
+      context: .
+      dockerfile: base.dockerfile
+      args:
+        USER_UID: ${UID:-1000}
+        USER_GID: ${GID:-1000}
+        USERNAME: rosuser
+    container_name: home_base
+    image: home_base:latest
+
+  home_base_cuda:
+    <<: *common
+    build:
+      context: .
+      dockerfile: cuda.dockerfile
+      args:
+        USER_UID: ${UID:-1000}
+        USER_GID: ${GID:-1000}
+        USERNAME: rosuser
+    container_name: home_base_cuda
+    image: home_base_cuda:latest
