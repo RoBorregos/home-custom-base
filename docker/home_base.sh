@@ -3,6 +3,7 @@
 DEFAULT_BASE_TAG="cpu_base"
 CUDA_BASE_TAG="cuda_base"
 GPU_TAG="nav2_gpu"
+CUDA_TAG="nav2_cuda"
 BASE_REPO="roborregos/home_base"
 NAV2_REPO="roborregos/nav2"
 
@@ -17,15 +18,28 @@ function parse_gpu_flag() {
     echo "$use_gpu"
 }
 
+# Utility to determine CUDA support
+function has_cuda_support() {
+    local use_CUDA=false
+    for arg in "$@"; do
+        if [[ "$arg" == "--cuda" ]]; then
+            use_CUDA=true
+        fi
+    done
+    echo "$use_CUDA"
+}
+
 function get_base_tag() {
     local gpu_flag
     gpu_flag=$(parse_gpu_flag "$@")
+    cuda_flag=$(has_cuda_support "$@")
     if [[ "$gpu_flag" == "true" ]]; then
-        # Temprarily disable CUDA support
-        # echo "$CUDA_BASE_TAG"
         echo "$DEFAULT_BASE_TAG"
+    elif [[ "$cuda_flag" == "true" ]]; then
+        echo "$CUDA_BASE_TAG"
     else
         echo "$DEFAULT_BASE_TAG"
+
     fi
 }
 
@@ -34,6 +48,8 @@ function get_nav2_service() {
     gpu_flag=$(parse_gpu_flag "$@")
     if [[ "$gpu_flag" == "true" ]]; then
         echo "nav2_gpu"
+    elif [[ "$(has_cuda_support "$@")" == "true" ]]; then
+        echo "nav2_cuda"
     else
         echo "nav2_cpu"
     fi
@@ -83,11 +99,18 @@ function attach_shell() {
 
 # Top-level operations
 function deploy() {
+    # Require at least one argument (e.g., --gpu, --cuda, or default)
+    if [[ $# -lt 2 ]]; then
+        echo "❌ Error: Please specify a target to deploy (e.g., --gpu, --cuda)"
+        exit 1
+    fi
+
     build_base_image "$@"
     build_nav2_image "$@"
     run_container "$@"
     attach_shell "$@"
 }
+
 
 function dev_mode() {
     run_container "$@"
@@ -95,6 +118,22 @@ function dev_mode() {
 }
 
 function stop_container() {
+    # At least one argument is required after -stop
+    if [[ $# -lt 2 ]]; then
+        echo "❌ Error: Please specify a container to stop (e.g., --gpu, --cuda, or 'all')"
+        exit 1
+    fi
+
+    # Check for "all"
+    for arg in "$@"; do
+        if [[ "$arg" == "all" ]]; then
+            echo "🛑 Stopping all containers from docker-compose.yml..."
+            docker compose stop
+            return
+        fi
+    done
+
+    # Otherwise stop the specific one
     local service
     service=$(get_nav2_service "$@")
 
@@ -102,10 +141,35 @@ function stop_container() {
     docker compose stop "$service"
 }
 
-function remove_all() {
-    echo "🧹 Removing all containers and resources..."
-    docker compose down
+function remove_container() {
+    # At least one argument is required after -remove
+    if [[ $# -lt 2 ]]; then
+        echo "❌ Error: Please specify a container to remove (e.g., --gpu, --cuda, or 'all')"
+        exit 1
+    fi
+
+    # Check for "all"
+    for arg in "$@"; do
+        if [[ "$arg" == "all" ]]; then
+            echo "🛑 Removing all containers from docker-compose.yml..."
+            docker compose down
+            return
+        fi
+    done
+
+    # Otherwise stop the specific one
+    local service
+    service=$(get_nav2_service "$@")
+
+    echo "🛑 Removing container: $service"
+    docker compose remove "$service"
 }
+
+
+# function remove_all() {
+#     echo "🧹 Removing all containers and resources..."
+#     docker compose down
+# }
 
 function help_message() {
     echo "Usage: ./home_base.sh [COMMAND] [--gpu]"
@@ -115,7 +179,7 @@ function help_message() {
     echo "  -build-nav2 [--gpu]      Build only the Nav2 image"
     echo "  -run [--gpu]             Start only the container"
     echo "  -dev-mode [--gpu]        Run + attach to shell"
-    echo "  -deploy [--gp]          Build everything, run, and attach"
+    echo "  -deploy [--gpu|--cuda]       Build everything, run, and attach"
     echo "  -remove                  Remove all containers"
     echo "  -help                    Show this help message"
     echo
@@ -143,7 +207,7 @@ case "$1" in
         deploy "$@"
         ;;
     -remove)
-        remove_all
+        remove_container "$@"
         ;;
     -help|--help)
         help_message

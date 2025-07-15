@@ -7,13 +7,44 @@ services:
         BASE_IMAGE: ubuntu:22.04
     image: roborregos/home_base:cpu_base
 
-  # cuda_base:
-  #   build:
-  #     context: .
-  #     dockerfile: ros.dockerfile
-  #     args:
-  #       BASE_IMAGE: nvidia/cuda:11.8.0-runtime-ubuntu22.04
-  #   image: roborregos/home_base:cuda_base
+  cuda_base:
+    build:
+      context: .
+      dockerfile: ros.dockerfile
+      args:
+        BASE_IMAGE: nvidia/cuda:11.8.0-runtime-ubuntu22.04
+    image: roborregos/home_base:cuda_base
+
+  nav2_cuda:
+    build:
+      context: .
+      dockerfile: nav.dockerfile
+      args:
+        BASE_IMAGE: ${NAV2_BASE_IMAGE}
+    image: roborregos/nav2_cuda:${NAV2_BASE_IMAGE_TAG}
+    container_name: nav2_cuda
+    runtime: nvidia
+    environment:
+      - DISPLAY=${DISPLAY}
+      - QT_X11_NO_MITSHM=1
+      - NVIDIA_VISIBLE_DEVICES=all
+      - LIBGL_ALWAYS_INDIRECT=0
+    volumes:
+      - /tmp/.X11-unix:/tmp/.X11-unix
+      - ../:/home/rosuser/ros2_ws
+    devices:
+      - /dev/dri:/dev/dri
+    network_mode: host
+    privileged: true
+    stdin_open: true
+    tty: true
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
 
   nav2_gpu:
     build:
