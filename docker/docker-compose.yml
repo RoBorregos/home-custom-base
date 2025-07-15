@@ -1,41 +1,59 @@
-x-common: &common
-  runtime: nvidia
-  environment:
-    - DISPLAY=${DISPLAY}
-    - QT_X11_NO_MITSHM=1
-    - NVIDIA_VISIBLE_DEVICES=all
-    - LIBGL_ALWAYS_INDIRECT=0
-  volumes:
-    - /tmp/.X11-unix:/tmp/.X11-unix
-    - ../:/home/rosuser/ros2_ws
-  devices:
-    - /dev/dri:/dev/dri
-  network_mode: host
-  privileged: true
-  stdin_open: true
-  tty: true
-
 services:
-  home_base:
-    <<: *common
+  cpu_base:
     build:
       context: .
-      dockerfile: base.dockerfile
+      dockerfile: ros.dockerfile
       args:
-        USER_UID: ${UID:-1000}
-        USER_GID: ${GID:-1000}
-        USERNAME: rosuser
-    container_name: home_base
-    image: home_base:latest
+        BASE_IMAGE: ubuntu:22.04
+    image: roborregos/home_base:cpu_base
 
-  home_base_cuda:
-    <<: *common
+  # cuda_base:
+  #   build:
+  #     context: .
+  #     dockerfile: ros.dockerfile
+  #     args:
+  #       BASE_IMAGE: nvidia/cuda:11.8.0-runtime-ubuntu22.04
+  #   image: roborregos/home_base:cuda_base
+
+  nav2_gpu:
     build:
       context: .
-      dockerfile: cuda.dockerfile
+      dockerfile: nav.dockerfile
       args:
-        USER_UID: ${UID:-1000}
-        USER_GID: ${GID:-1000}
-        USERNAME: rosuser
-    container_name: home_base_cuda
-    image: home_base_cuda:latest
+        BASE_IMAGE: ${NAV2_BASE_IMAGE}
+    image: roborregos/nav2_gpu:${NAV2_BASE_IMAGE_TAG}
+    container_name: nav2_gpu
+    runtime: nvidia
+    environment:
+      - DISPLAY=${DISPLAY}
+      - QT_X11_NO_MITSHM=1
+      - NVIDIA_VISIBLE_DEVICES=all
+      - LIBGL_ALWAYS_INDIRECT=0
+    volumes:
+      - /tmp/.X11-unix:/tmp/.X11-unix
+      - ../:/home/rosuser/ros2_ws
+    devices:
+      - /dev/dri:/dev/dri
+    network_mode: host
+    privileged: true
+    stdin_open: true
+    tty: true
+  
+  nav2_cpu:
+    build:
+      context: .
+      dockerfile: nav.dockerfile
+      args:
+        BASE_IMAGE: ${NAV2_BASE_IMAGE}
+    image: roborregos/nav2_cpu:${NAV2_BASE_IMAGE_TAG}
+    container_name: nav2_cpu
+    network_mode: host
+    environment:
+      - DISPLAY=${DISPLAY}
+      - QT_X11_NO_MITSHM=1
+    volumes:
+      - /tmp/.X11-unix:/tmp/.X11-unix
+      - ../:/workspace
+    stdin_open: true
+    tty: true
+    privileged: true
