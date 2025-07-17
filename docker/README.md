@@ -49,7 +49,7 @@ Both base images provide ROS 2 development support, but they differ in GPU capab
   Designed for machines without a CUDA-compatible GPU or NVIDIA Container Toolkit. It’s built on Ubuntu 22.04 docker image.  
   If your system has NVIDIA drivers and the container toolkit installed, this image *can still access the GPU* using the `--gpu` flag for GPU-accelerated rendering (e.g., Gazebo, OpenGL).  
   This makes it ideal for lightweight setups that don’t require the full CUDA toolchain.  
-  *Note: Support for non-NVIDIA GPUs via OpenGL is currently unavailable.*
+  *Note: Support for non-NVIDIA GPUs is currently unavailable.*
 
 - **CUDA Base Image (`cuda_base`)**  
   Designed for full CUDA development. This image supports GPU compute libraries and tools for advanced GPU workloads.  
