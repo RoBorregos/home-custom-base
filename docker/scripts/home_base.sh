@@ -1,5 +1,8 @@
 #!/bin/bash
 
+COMPOSE_FILE_PATH="$(dirname "$0")/../compose/docker-compose.yml"
+
+
 DEFAULT_BASE_TAG="cpu_base"
 CUDA_BASE_TAG="cuda_base"
 GPU_TAG="nav2_gpu"
@@ -60,7 +63,7 @@ function build_base_image() {
     local base_tag
     base_tag=$(get_base_tag "$@")
     echo "🚧 Building base image: $base_tag"
-    docker compose build "$base_tag"
+    docker compose -f "$COMPOSE_FILE_PATH"  build "$base_tag"
 }
 
 function build_nav2_image() {
@@ -72,7 +75,7 @@ function build_nav2_image() {
     echo "🔧 Building Nav2 image: $service (based on $base_tag)"
     NAV2_BASE_IMAGE="$BASE_REPO:$base_tag" \
     NAV2_BASE_IMAGE_TAG="$base_tag" \
-    docker compose build "$service"
+    docker compose -f "$COMPOSE_FILE_PATH"  build "$service"
 }
 
 function run_container() {
@@ -86,7 +89,7 @@ function run_container() {
     xhost +local:docker
     NAV2_BASE_IMAGE="$base_image" \
     NAV2_BASE_IMAGE_TAG="$base_tag" \
-    docker compose up -d "$service"
+    docker compose -f "$COMPOSE_FILE_PATH"  up -d "$service"
 }
 
 function attach_shell() {
@@ -128,7 +131,7 @@ function stop_container() {
     for arg in "$@"; do
         if [[ "$arg" == "all" ]]; then
             echo "🛑 Stopping all containers from docker-compose.yml..."
-            docker compose stop
+            docker compose -f "$COMPOSE_FILE_PATH"  stop
             return
         fi
     done
@@ -138,7 +141,7 @@ function stop_container() {
     service=$(get_nav2_service "$@")
 
     echo "🛑 Stopping container: $service"
-    docker compose stop "$service"
+    docker compose -f "$COMPOSE_FILE_PATH"  stop "$service"
 }
 
 function remove_container() {
@@ -152,7 +155,7 @@ function remove_container() {
     for arg in "$@"; do
         if [[ "$arg" == "all" ]]; then
             echo "🛑 Removing all containers from docker-compose.yml..."
-            docker compose down
+            docker compose -f "$COMPOSE_FILE_PATH"  down
             return
         fi
     done
@@ -162,13 +165,13 @@ function remove_container() {
     service=$(get_nav2_service "$@")
 
     echo "🛑 Removing container: $service"
-    docker compose remove "$service"
+    docker compose -f "$COMPOSE_FILE_PATH"  remove "$service"
 }
 
 
 # function remove_all() {
 #     echo "🧹 Removing all containers and resources..."
-#     docker compose down
+#     docker compose -f "$COMPOSE_FILE_PATH"  down
 # }
 
 function help_message() {
