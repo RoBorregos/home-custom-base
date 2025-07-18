@@ -1,6 +1,7 @@
 #!/bin/bash
 
-COMPOSE_FILE_PATH="$(dirname "$0")/../compose/docker-compose.yml"
+PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+COMPOSE_FILE_PATH="$PROJECT_ROOT/compose/docker-compose.yml"
 
 
 DEFAULT_BASE_TAG="cpu_base"

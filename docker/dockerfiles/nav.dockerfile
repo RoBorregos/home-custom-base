@@ -24,9 +24,5 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN apt-get update && apt-get install -y \
     terminator nano net-tools iputils-ping
 
-# Set workspace
-USER ros
-WORKDIR /workspace
-
 # Ensure ROS 2 is sourced
 RUN echo "source /opt/ros/${ROS_DISTRO}/setup.bash" >> ~/.bashrc
