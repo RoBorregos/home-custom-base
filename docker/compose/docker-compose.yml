@@ -84,7 +84,7 @@ services:
       - QT_X11_NO_MITSHM=1
     volumes:
       - /tmp/.X11-unix:/tmp/.X11-unix
-      - ../:/workspace
+      - ../../:/ros/home_base_ws/
     stdin_open: true
     tty: true
     privileged: true

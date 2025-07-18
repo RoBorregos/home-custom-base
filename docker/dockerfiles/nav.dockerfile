@@ -26,3 +26,5 @@ RUN apt-get update && apt-get install -y \
 
 # Ensure ROS 2 is sourced
 RUN echo "source /opt/ros/${ROS_DISTRO}/setup.bash" >> ~/.bashrc
+USER ros
+WORKDIR /ros/home_base_ws/

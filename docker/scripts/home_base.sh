@@ -156,18 +156,19 @@ function remove_container() {
     for arg in "$@"; do
         if [[ "$arg" == "all" ]]; then
             echo "🛑 Removing all containers from docker-compose.yml..."
-            docker compose -f "$COMPOSE_FILE_PATH"  down
+            docker compose -f "$COMPOSE_FILE_PATH" down
             return
         fi
     done
 
-    # Otherwise stop the specific one
+    # Otherwise remove the specific service
     local service
     service=$(get_nav2_service "$@")
 
     echo "🛑 Removing container: $service"
-    docker compose -f "$COMPOSE_FILE_PATH"  remove "$service"
+    docker compose -f "$COMPOSE_FILE_PATH" down "$service"
 }
+
 
 
 # function remove_all() {
