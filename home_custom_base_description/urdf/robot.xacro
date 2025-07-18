@@ -1,0 +1,11 @@
+<?xml version="1.0"?>
+<robot name="home_base" xmlns:xacro="http://ros.org/wiki/xacro">
+    <!-- Properties and Macros -->
+    <xacro:arg name="name" default="home_base"/>
+    <xacro:arg name="prefix" default=""/>
+    <!-- Include base description -->
+    <xacro:include filename="$(find home_custom_base_description)/urdf/inc/base.xacro"/>
+
+<xacro:home_base_description name="home_base" prefix="home_base_" />
+
+</robot>
