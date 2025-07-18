@@ -31,7 +31,7 @@ services:
       - LIBGL_ALWAYS_INDIRECT=0
     volumes:
       - /tmp/.X11-unix:/tmp/.X11-unix
-      - ../:/home/rosuser/ros2_ws
+      - ../../:/ros/home_base_ws/
     devices:
       - /dev/dri:/dev/dri
     network_mode: host
@@ -62,7 +62,7 @@ services:
       - LIBGL_ALWAYS_INDIRECT=0
     volumes:
       - /tmp/.X11-unix:/tmp/.X11-unix
-      - ../:/home/rosuser/ros2_ws
+      - ../../:/ros/home_base_ws/
     devices:
       - /dev/dri:/dev/dri
     network_mode: host
