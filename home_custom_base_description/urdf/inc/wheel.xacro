@@ -1,0 +1,42 @@
+<?xml version="1.0"?>
+<robot xmlns:xacro="http://ros.org/wiki/xacro">
+
+  <xacro:property name="mesh_dir" value="file://$(find home_custom_base_description)/meshes/collision"/>
+
+  <xacro:macro name="home_base_wheel" params="wheel_orientation wheel_type parent_link prefix x_offset y_offset z_offset roll_offset pitch_offset yaw_offset axis_x axis_y axis_z scale">
+
+    <link name="${prefix}_${wheel_type}_${wheel_orientation}_wheel_link">
+      <visual>
+        <origin xyz="${x_offset} ${y_offset} ${z_offset}" rpy="${roll_offset} ${pitch_offset} ${yaw_offset}"/>
+        <geometry>
+          <mesh filename="${mesh_dir}/${wheel_type}_${wheel_orientation}.stl" scale="${scale} ${scale} ${scale}"/>
+        </geometry>
+        <material name="gray">
+          <color rgba="0.6 0.6 0.6 1"/>
+        </material>
+      </visual>
+      <collision>
+        <origin xyz="${x_offset} ${y_offset} ${z_offset}" rpy="${roll_offset} ${pitch_offset} ${yaw_offset}"/>
+        <geometry>
+          <mesh filename="${mesh_dir}/${wheel_type}_${wheel_orientation}.stl" scale="${scale} ${scale} ${scale}"/>
+        </geometry>
+      </collision>
+      <inertial>
+        <origin xyz="0 0 0" rpy="0 0 0"/>
+        <mass value="0.2"/>
+        <inertia ixx="0.0001" ixy="0" ixz="0" iyy="0.0001" iyz="0" izz="0.0001"/>
+      </inertial>
+    </link>
+
+    <joint name="${prefix}_${wheel_type}_${wheel_orientation}_wheel_joint" type="continuous">
+      <parent link="${parent_link}"/>
+      <child link="${prefix}_${wheel_type}_${wheel_orientation}_wheel_link"/>
+      <origin xyz="${x_offset} ${y_offset} ${z_offset}" rpy="${roll_offset} ${pitch_offset} ${yaw_offset}"/>
+      <axis xyz="${axis_x} ${axis_y} ${axis_z}"/>
+      <limit lower="-1000.0" upper="1000.0" effort="1.0" velocity="100.0"/>
+      <dynamics damping="0.0" friction="0.0"/>
+    </joint>
+
+  </xacro:macro>
+
+</robot>

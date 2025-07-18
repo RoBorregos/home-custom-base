@@ -1,11 +1,32 @@
 <?xml version="1.0"?>
-<robot name="home_base" xmlns:xacro="http://ros.org/wiki/xacro">
+<robot name="home_base"
+    xmlns:xacro="http://ros.org/wiki/xacro">
     <!-- Properties and Macros -->
-    <xacro:arg name="name" default="home_base"/>
-    <xacro:arg name="prefix" default=""/>
+    <xacro:property name="name" default="home_base"/>
+    <xacro:property name="prefix" default="home_base"/>
+
     <!-- Include base description -->
     <xacro:include filename="$(find home_custom_base_description)/urdf/inc/base.xacro"/>
+    <xacro:include filename="$(find home_custom_base_description)/urdf/inc/wheel.xacro"/>
 
-<xacro:home_base_description name="home_base" prefix="home_base_" />
+    <!-- Define base-->
+    <xacro:home_base_description name="${name}" prefix="${prefix}" />
+
+    <!-- Define wheel parent links -->
+    <xacro:property name="left_rear_parent_link" value="${prefix}_rear_left_wheel_frame"/>
+    <xacro:property name="right_rear_parent_link" value="${prefix}_rear_right_wheel_frame"/>
+    <xacro:property name="left_front_parent_link" value="${prefix}_front_left_wheel_frame"/>
+    <xacro:property name="right_front_parent_link" value="${prefix}_front_right_wheel_frame"/>
+
+    <!-- Define wheel connectors -->
+    <xacro:property name="connector_x_offset" value="0.0"/>
+    <xacro:property name="connector_y_offset" value="0.0"/>
+    <xacro:property name="connector_z_offset" value="0.015"/>
+
+    <!-- Define wheels -->
+    <xacro:home_base_wheel wheel_orientation="left" wheel_type="mecanum" parent_link="${left_rear_parent_link}" prefix="home_base_rear_left" x_offset="${connector_x_offset}" y_offset="${connector_y_offset}" z_offset="${connector_z_offset}" roll_offset="0.0" pitch_offset="0.0" yaw_offset="0.0" scale="0.001" axis_x="0" axis_y="0" axis_z="1" />
+    <xacro:home_base_wheel wheel_orientation="right" wheel_type="mecanum" parent_link="${right_rear_parent_link}" prefix="home_base_rear_right" x_offset="${connector_x_offset}" y_offset="${connector_y_offset}" z_offset="${connector_z_offset}" roll_offset="0.0" pitch_offset="0.0" yaw_offset="0.0" scale="0.001" axis_x="0" axis_y="0" axis_z="1" />
+    <xacro:home_base_wheel wheel_orientation="right" wheel_type="mecanum" parent_link="${right_front_parent_link}" prefix="home_base_front_right" x_offset="${connector_x_offset}" y_offset="${connector_y_offset}" z_offset="${connector_z_offset}" roll_offset="0.0" pitch_offset="0.0" yaw_offset="0.0" scale="0.001" axis_x="0" axis_y="0" axis_z="1" />
+    <xacro:home_base_wheel wheel_orientation="left" wheel_type="mecanum" parent_link="${left_front_parent_link}" prefix="home_base_front_left" x_offset="${connector_x_offset}" y_offset="${connector_y_offset}" z_offset="${connector_z_offset}" roll_offset="0.0" pitch_offset="0.0" yaw_offset="0.0" scale="0.001" axis_x="0" axis_y="0" axis_z="1" />
 
 </robot>
