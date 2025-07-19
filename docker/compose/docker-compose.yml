@@ -38,6 +38,7 @@ services:
     privileged: true
     stdin_open: true
     tty: true
+    command: []
     deploy:
       resources:
         reservations:
@@ -69,6 +70,7 @@ services:
     privileged: true
     stdin_open: true
     tty: true
+    command: []
     
   
   nav2_cpu:
@@ -89,3 +91,4 @@ services:
     stdin_open: true
     tty: true
     privileged: true
+    command: []
