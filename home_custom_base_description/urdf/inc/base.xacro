@@ -1,109 +1,105 @@
 <?xml version="1.0"?>
 <robot xmlns:xacro="http://ros.org/wiki/xacro">
 
-    <!-- Properties and Macros -->
-    <xacro:property name="mesh_dir" value="file://$(find home_custom_base_description)/meshes/collision"/>
-    <xacro:arg name="name" default="home_base"/>
+  <!-- Properties and Macros -->
+  <xacro:property name="mesh_dir" value="file://$(find home_custom_base_description)/meshes/collision"/>
+  <xacro:arg name="name" default="home_base"/>
 
-    <xacro:macro name="home_base_description" params="prefix name">
+  <xacro:macro name="home_base_description" params="prefix name">
 
-        <!-- Base dimensions -->
-        <xacro:property name="base_length" value="0.4"/>
-        <xacro:property name="base_width" value="0.4"/>
-        <xacro:property name="wheel_connector_z" value="-0.12"/>
+    <!-- Dimensions -->
+    <xacro:property name="base_length" value="0.4"/>
+    <xacro:property name="base_width" value="0.4"/>
+    <xacro:property name="wheel_connector_z" value="-0.12"/>
 
-        <!-- Common wheel connector properties -->
-        <xacro:property name="wheel_connector_roll" value="-1.57"/>
-        <xacro:property name="wheel_connector_pitch" value="0.0"/>
-        <xacro:property name="wheel_connector_yaw" value="0.0"/>
-        <xacro:property name="wheel_connector_axis_x" value="0"/>
-        <xacro:property name="wheel_connector_axis_y" value="0"/>
-        <xacro:property name="wheel_connector_axis_z" value="1"/>
+    <xacro:property name="wheel_connector_roll" value="-1.57"/>
+    <xacro:property name="wheel_connector_pitch" value="0.0"/>
+    <xacro:property name="wheel_connector_yaw" value="0.0"/>
+    <xacro:property name="wheel_connector_axis_x" value="0"/>
+    <xacro:property name="wheel_connector_axis_y" value="0"/>
+    <xacro:property name="wheel_connector_axis_z" value="1"/>
 
-        <material name="gray">
-            <color rgba="0.6 0.6 0.6 1"/>
-        </material>
+    <material name="gray">
+      <color rgba="0.6 0.6 0.6 1"/>
+    </material>
 
-        <!-- Links -->
-        <link name="${prefix}_base_link">
-            <visual>
-                <origin xyz="0 0 0" rpy="3.14 0 0"/>
-                <geometry>
-                    <mesh filename="${mesh_dir}/body.stl" scale="0.001 0.001 0.001"/>
-                </geometry>
-                <material name="gray"/>
-            </visual>
-            <collision>
-                <origin xyz="0 0 0" rpy="0 0 0"/>
-                <geometry>
-                    <mesh filename="${mesh_dir}/body.stl" scale="0.001 0.001 0.001"/>
-                </geometry>
-            </collision>
-        </link>
+    <!-- base_link -->
+    <link name="${prefix}_base_link">
+      <visual>
+        <origin xyz="0 0 0" rpy="3.14 0 0"/>
+        <geometry>
+          <mesh filename="${mesh_dir}/body.stl" scale="0.001 0.001 0.001"/>
+        </geometry>
+        <material name="gray"/>
+      </visual>
+      <collision>
+        <origin xyz="0 0 0" rpy="0 0 0"/>
+        <geometry>
+          <mesh filename="${mesh_dir}/body.stl" scale="0.001 0.001 0.001"/>
+        </geometry>
+      </collision>
+      <inertial>
+        <mass value="10.0"/>
+        <origin xyz="0 0 0" rpy="0 0 0"/>
+        <inertia ixx="0.01" ixy="0" ixz="0" iyy="0.01" iyz="0" izz="0.01"/>
+      </inertial>
+    </link>
 
-        <link name="${prefix}_base_footprint">
-            <visual>
-                <origin xyz="0 0 0" rpy="0 0 0"/>
-                <geometry>
-                    <box size="0 0 0"/>
-                </geometry>
-                <material name="gray"/>
-            </visual>
-            <collision>
-                <origin xyz="0 0 0" rpy="0 0 0"/>
-                <geometry>
-                    <box size="0 0 0"/>
-                </geometry>
-            </collision>
-            <inertial>
-                <origin xyz="0 0 0" rpy="0 0 0"/>
-                <mass value="10.5"/>
-                <inertia ixx="0.0001" ixy="0" ixz="0" iyy="0.0001" iyz="0" izz="0.0001"/>
-            </inertial>
-        </link>
+    <!-- base_footprint (no geometry, only inertial) -->
+    <link name="${prefix}_base_footprint">
+      <inertial>
+        <mass value="0.001"/>
+        <origin xyz="0 0 0" rpy="0 0 0"/>
+        <inertia ixx="0.00001" ixy="0" ixz="0" iyy="0.00001" iyz="0" izz="0.00001"/>
+      </inertial>
+    </link>
 
-        <!-- Wheel frames: no geometry for simplicity -->
-        <link name="${prefix}_rear_left_wheel_frame"/>
-        <link name="${prefix}_rear_right_wheel_frame"/>
-        <link name="${prefix}_front_left_wheel_frame"/>
-        <link name="${prefix}_front_right_wheel_frame"/>
-
-        <!-- Joints connecting wheels to base_link -->
-        <joint name="${prefix}_base_link_joint" type="fixed">
-            <parent link="${prefix}_base_footprint"/>
-            <child link="${prefix}_base_link"/>
-            <origin xyz="0 0 0.2" rpy="0 0 0"/>
-        </joint>
-
-        <!-- Rear Left -->
-        <joint name="${prefix}_rear_left_wheel_joint" type="fixed">
-            <parent link="${prefix}_base_link"/>
-            <child link="${prefix}_rear_left_wheel_frame"/>
-            <origin xyz="${-(base_length / 2)} ${(base_width / 2)} ${wheel_connector_z}" rpy="${(wheel_connector_roll)} ${wheel_connector_pitch} ${wheel_connector_yaw}"/>
-        </joint>
-
-        <!-- Rear Right -->
-        <joint name="${prefix}_rear_right_wheel_joint" type="fixed">
-            <parent link="${prefix}_base_link"/>
-            <child link="${prefix}_rear_right_wheel_frame"/>
-            <origin xyz="${-(base_length / 2)} ${-(base_width / 2)} ${wheel_connector_z}" rpy="${-(wheel_connector_roll)} ${wheel_connector_pitch} ${wheel_connector_yaw}"/>
-        </joint>
-
-        <!-- Front Left -->
-        <joint name="${prefix}_front_left_wheel_joint" type="fixed">
-            <parent link="${prefix}_base_link"/>
-            <child link="${prefix}_front_left_wheel_frame"/>
-            <origin xyz="${(base_length / 2)} ${(base_width / 2)} ${wheel_connector_z}" rpy="${(wheel_connector_roll)} ${wheel_connector_pitch} ${wheel_connector_yaw}"/>
-        </joint>
-
-        <!-- Front Right -->
-        <joint name="${prefix}_front_right_wheel_joint" type="fixed">
-            <parent link="${prefix}_base_link"/>
-            <child link="${prefix}_front_right_wheel_frame"/>
-            <origin xyz="${(base_length / 2)} ${-(base_width / 2)} ${wheel_connector_z}" rpy="${-(wheel_connector_roll)} ${wheel_connector_pitch} ${wheel_connector_yaw}"/>
-        </joint>
-
-
+    <!-- Empty frames for wheels -->
+    <xacro:macro name="empty_frame_link" params="link_name">
+      <link name="${link_name}">
+        <inertial>
+          <mass value="0.001"/>
+          <origin xyz="0 0 0" rpy="0 0 0"/>
+          <inertia ixx="0.00001" ixy="0" ixz="0" iyy="0.00001" iyz="0" izz="0.00001"/>
+        </inertial>
+      </link>
     </xacro:macro>
 
+    <xacro:empty_frame_link link_name="${prefix}_rear_left_wheel_frame"/>
+    <xacro:empty_frame_link link_name="${prefix}_rear_right_wheel_frame"/>
+    <xacro:empty_frame_link link_name="${prefix}_front_left_wheel_frame"/>
+    <xacro:empty_frame_link link_name="${prefix}_front_right_wheel_frame"/>
+
+    <!-- Fixed joints -->
+    <joint name="${prefix}_base_link_joint" type="fixed">
+      <parent link="${prefix}_base_footprint"/>
+      <child link="${prefix}_base_link"/>
+      <origin xyz="0 0 0.2" rpy="0 0 0"/>
+    </joint>
+
+    <joint name="${prefix}_rear_left_wheel_joint" type="fixed">
+      <parent link="${prefix}_base_link"/>
+      <child link="${prefix}_rear_left_wheel_frame"/>
+      <origin xyz="${-(base_length / 2)} ${(base_width / 2)} ${wheel_connector_z}" rpy="${wheel_connector_roll} ${wheel_connector_pitch} ${wheel_connector_yaw}"/>
+    </joint>
+
+    <joint name="${prefix}_rear_right_wheel_joint" type="fixed">
+      <parent link="${prefix}_base_link"/>
+      <child link="${prefix}_rear_right_wheel_frame"/>
+      <origin xyz="${-(base_length / 2)} ${-(base_width / 2)} ${wheel_connector_z}" rpy="${-wheel_connector_roll} ${wheel_connector_pitch} ${wheel_connector_yaw}"/>
+    </joint>
+
+    <joint name="${prefix}_front_left_wheel_joint" type="fixed">
+      <parent link="${prefix}_base_link"/>
+      <child link="${prefix}_front_left_wheel_frame"/>
+      <origin xyz="${(base_length / 2)} ${(base_width / 2)} ${wheel_connector_z}" rpy="${wheel_connector_roll} ${wheel_connector_pitch} ${wheel_connector_yaw}"/>
+    </joint>
+
+    <joint name="${prefix}_front_right_wheel_joint" type="fixed">
+      <parent link="${prefix}_base_link"/>
+      <child link="${prefix}_front_right_wheel_frame"/>
+      <origin xyz="${(base_length / 2)} ${-(base_width / 2)} ${wheel_connector_z}" rpy="${-wheel_connector_roll} ${wheel_connector_pitch} ${wheel_connector_yaw}"/>
+    </joint>
+
+  </xacro:macro>
 </robot>

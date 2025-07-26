@@ -1,13 +1,26 @@
 <?xml version="1.0"?>
 <robot name="home_base"
     xmlns:xacro="http://ros.org/wiki/xacro">
+    
+    <!-- Launch arguments -->
+    <xacro:arg name="use_sim_time" default="false"/>
+    <xacro:arg name="robot_type" default="real"/>
+    <xacro:arg name="prefix" default="home_base"/>
+    
     <!-- Properties and Macros -->
     <xacro:property name="name" default="home_base"/>
-    <xacro:property name="prefix" default="home_base"/>
+    <xacro:property name="prefix" value="$(arg prefix)"/>
+    <xacro:property name="use_sim_time" value="$(arg use_sim_time)"/>
 
     <!-- Include base description -->
     <xacro:include filename="$(find home_custom_base_description)/urdf/inc/base.xacro"/>
     <xacro:include filename="$(find home_custom_base_description)/urdf/inc/wheel.xacro"/>
+    
+    <!-- Conditionally include simulation files -->
+    <xacro:if value="${use_sim_time}">
+        <xacro:include filename="$(find home_custom_base_simulation)/urdf/home_base_ros2_control.xacro"/>
+        <xacro:include filename="$(find home_custom_base_simulation)/urdf/home_base_gazebo.xacro"/>
+    </xacro:if>
 
     <!-- Define base-->
     <xacro:home_base_description name="${name}" prefix="${prefix}" />
@@ -28,5 +41,14 @@
     <xacro:home_base_wheel wheel_orientation="right" wheel_type="mecanum" parent_link="${right_rear_parent_link}" prefix="home_base_rear_right" x_offset="${connector_x_offset}" y_offset="${connector_y_offset}" z_offset="${connector_z_offset}" roll_offset="0.0" pitch_offset="0.0" yaw_offset="0.0" scale="0.001" axis_x="0" axis_y="0" axis_z="1" />
     <xacro:home_base_wheel wheel_orientation="right" wheel_type="mecanum" parent_link="${right_front_parent_link}" prefix="home_base_front_right" x_offset="${connector_x_offset}" y_offset="${connector_y_offset}" z_offset="${connector_z_offset}" roll_offset="0.0" pitch_offset="0.0" yaw_offset="0.0" scale="0.001" axis_x="0" axis_y="0" axis_z="1" />
     <xacro:home_base_wheel wheel_orientation="left" wheel_type="mecanum" parent_link="${left_front_parent_link}" prefix="home_base_front_left" x_offset="${connector_x_offset}" y_offset="${connector_y_offset}" z_offset="${connector_z_offset}" roll_offset="0.0" pitch_offset="0.0" yaw_offset="0.0" scale="0.001" axis_x="0" axis_y="0" axis_z="1" />
+
+    <!-- Conditionally add simulation components -->
+    <xacro:if value="${use_sim_time}">
+        <!-- Add ROS2 Control -->
+        <xacro:home_base_ros2_control name="${name}" prefix="${prefix}" use_sim_time="${use_sim_time}"/>
+        
+        <!-- Add Gazebo simulation properties -->
+        <xacro:home_base_gazebo_sensors prefix="${prefix}"/>
+    </xacro:if>
 
 </robot>
