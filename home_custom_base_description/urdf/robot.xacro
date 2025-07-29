@@ -18,8 +18,8 @@
     
     <!-- Conditionally include simulation files -->
     <xacro:if value="${use_sim_time}">
-        <xacro:include filename="$(find home_custom_base_simulation)/urdf/home_base_ros2_control.xacro"/>
-        <xacro:include filename="$(find home_custom_base_simulation)/urdf/home_base_gazebo.xacro"/>
+        <xacro:include filename="$(find home_custom_base_description)/urdf/home_base_ros2_control.xacro"/>
+        <xacro:include filename="$(find home_custom_base_description)/urdf/home_base_gazebo.xacro"/>
     </xacro:if>
 
     <!-- Define base-->
@@ -48,7 +48,7 @@
         <xacro:home_base_ros2_control name="${name}" prefix="${prefix}" use_sim_time="${use_sim_time}"/>
         
         <!-- Add Gazebo simulation properties -->
-        <xacro:home_base_gazebo_sensors prefix="${prefix}"/>
+        <!-- <xacro:home_base_gazebo_sensors prefix="${prefix}"/> -->
     </xacro:if>
 
 </robot>

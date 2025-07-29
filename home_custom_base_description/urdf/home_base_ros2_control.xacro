@@ -1,0 +1,60 @@
+<?xml version="1.0"?>
+<robot xmlns:xacro="http://ros.org/wiki/xacro">
+
+  <xacro:macro name="home_base_ros2_control" params="name prefix use_sim_time">
+    
+    <!-- ROS 2 Control Setup - only for Gazebo simulation -->
+    <xacro:if value="${use_sim_time}">
+      <ros2_control name="${name}_hardware" type="system">
+        <hardware>
+          <plugin>gz_ros2_control/GazeboSimSystem</plugin>
+        </hardware>
+        
+        <joint name="${prefix}_front_left_mecanum_left_wheel_joint">
+          <command_interface name="velocity">
+            <param name="min">-10</param>
+            <param name="max">10</param>
+          </command_interface>
+          <state_interface name="velocity"/>
+          <state_interface name="position"/>
+        </joint>
+        
+        <joint name="${prefix}_rear_left_mecanum_left_wheel_joint">
+          <command_interface name="velocity">
+            <param name="min">-10</param>
+            <param name="max">10</param>
+          </command_interface>
+          <state_interface name="velocity"/>
+          <state_interface name="position"/>
+        </joint>
+        
+        <joint name="${prefix}_front_right_mecanum_right_wheel_joint">
+          <command_interface name="velocity">
+            <param name="min">-10</param>
+            <param name="max">10</param>
+          </command_interface>
+          <state_interface name="velocity"/>
+          <state_interface name="position"/>
+        </joint>
+        
+        <joint name="${prefix}_rear_right_mecanum_right_wheel_joint">
+          <command_interface name="velocity">
+            <param name="min">-10</param>
+            <param name="max">10</param>
+          </command_interface>
+          <state_interface name="velocity"/>
+          <state_interface name="position"/>
+        </joint>
+      </ros2_control>
+
+      <!-- Gazebo ROS2 Control Plugin -->
+      <gazebo>
+        <plugin name="gz_ros2_control::GazeboSimROS2ControlPlugin" filename="libgz_ros2_control-system.so">
+          <parameters>$(find home_custom_base_simulation)/config/ros2_control_mecanum.yaml</parameters>
+        </plugin>
+      </gazebo>
+    </xacro:if>
+
+  </xacro:macro>
+
+</robot>

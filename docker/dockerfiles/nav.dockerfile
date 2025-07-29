@@ -47,7 +47,7 @@ RUN rosdep update && \
 
 
 
-ENTRYPOINT ["/entrypoint.sh"]
+# ENTRYPOINT ["/entrypoint.sh"]
 CMD ["bash"]
 
 # Source ROS 2 setup on login
