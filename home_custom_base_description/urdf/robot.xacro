@@ -3,7 +3,7 @@
     xmlns:xacro="http://ros.org/wiki/xacro">
     
     <!-- Launch arguments -->
-    <xacro:arg name="use_sim_time" default="false"/>
+    <xacro:arg name="use_sim_time" default="true"/>
     <xacro:arg name="robot_type" default="real"/>
     <xacro:arg name="prefix" default="home_base"/>
     
