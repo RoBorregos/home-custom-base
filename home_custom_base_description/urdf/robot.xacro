@@ -38,8 +38,8 @@
 
     <!-- Define wheels -->
     <xacro:home_base_wheel wheel_orientation="left" wheel_type="mecanum" parent_link="${left_rear_parent_link}" prefix="home_base_rear_left" x_offset="${connector_x_offset}" y_offset="${connector_y_offset}" z_offset="${connector_z_offset}" roll_offset="0.0" pitch_offset="0.0" yaw_offset="0.0" scale="0.001" axis_x="0" axis_y="0" axis_z="1" />
-    <xacro:home_base_wheel wheel_orientation="right" wheel_type="mecanum" parent_link="${right_rear_parent_link}" prefix="home_base_rear_right" x_offset="${connector_x_offset}" y_offset="${connector_y_offset}" z_offset="${connector_z_offset}" roll_offset="0.0" pitch_offset="0.0" yaw_offset="0.0" scale="0.001" axis_x="0" axis_y="0" axis_z="1" />
-    <xacro:home_base_wheel wheel_orientation="right" wheel_type="mecanum" parent_link="${right_front_parent_link}" prefix="home_base_front_right" x_offset="${connector_x_offset}" y_offset="${connector_y_offset}" z_offset="${connector_z_offset}" roll_offset="0.0" pitch_offset="0.0" yaw_offset="0.0" scale="0.001" axis_x="0" axis_y="0" axis_z="1" />
+    <xacro:home_base_wheel wheel_orientation="right" wheel_type="mecanum" parent_link="${right_rear_parent_link}" prefix="home_base_rear_right" x_offset="${connector_x_offset}" y_offset="${connector_y_offset}" z_offset="${-connector_z_offset}" roll_offset="0.0" pitch_offset="0.0" yaw_offset="0.0" scale="0.001" axis_x="0" axis_y="0" axis_z="1" />
+    <xacro:home_base_wheel wheel_orientation="right" wheel_type="mecanum" parent_link="${right_front_parent_link}" prefix="home_base_front_right" x_offset="${connector_x_offset}" y_offset="${connector_y_offset}" z_offset="${-connector_z_offset}" roll_offset="0.0" pitch_offset="0.0" yaw_offset="0.0" scale="0.001" axis_x="0" axis_y="0" axis_z="1" />
     <xacro:home_base_wheel wheel_orientation="left" wheel_type="mecanum" parent_link="${left_front_parent_link}" prefix="home_base_front_left" x_offset="${connector_x_offset}" y_offset="${connector_y_offset}" z_offset="${connector_z_offset}" roll_offset="0.0" pitch_offset="0.0" yaw_offset="0.0" scale="0.001" axis_x="0" axis_y="0" axis_z="1" />
 
     <!-- Conditionally add simulation components -->

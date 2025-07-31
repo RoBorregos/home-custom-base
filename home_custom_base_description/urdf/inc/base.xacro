@@ -77,28 +77,32 @@
       <origin xyz="0 0 0.2" rpy="0 0 0"/>
     </joint>
 
+    <!-- Rear Left Wheel -->
     <joint name="${prefix}_rear_left_wheel_joint" type="fixed">
       <parent link="${prefix}_base_link"/>
       <child link="${prefix}_rear_left_wheel_frame"/>
       <origin xyz="${-(base_length / 2)} ${(base_width / 2)} ${wheel_connector_z}" rpy="${wheel_connector_roll} ${wheel_connector_pitch} ${wheel_connector_yaw}"/>
     </joint>
 
+    <!-- Rear Right Wheel (adjusted yaw angle for proper rotation) -->
     <joint name="${prefix}_rear_right_wheel_joint" type="fixed">
       <parent link="${prefix}_base_link"/>
       <child link="${prefix}_rear_right_wheel_frame"/>
-      <origin xyz="${-(base_length / 2)} ${-(base_width / 2)} ${wheel_connector_z}" rpy="${-wheel_connector_roll} ${wheel_connector_pitch} ${wheel_connector_yaw}"/>
+      <origin xyz="${-(base_length / 2)} ${-(base_width / 2)} ${wheel_connector_z}" rpy="${wheel_connector_roll} ${wheel_connector_pitch} ${wheel_connector_yaw}"/>
     </joint>
 
+    <!-- Front Left Wheel -->
     <joint name="${prefix}_front_left_wheel_joint" type="fixed">
       <parent link="${prefix}_base_link"/>
       <child link="${prefix}_front_left_wheel_frame"/>
       <origin xyz="${(base_length / 2)} ${(base_width / 2)} ${wheel_connector_z}" rpy="${wheel_connector_roll} ${wheel_connector_pitch} ${wheel_connector_yaw}"/>
     </joint>
 
+    <!-- Front Right Wheel (adjusted yaw angle for proper rotation) -->
     <joint name="${prefix}_front_right_wheel_joint" type="fixed">
       <parent link="${prefix}_base_link"/>
       <child link="${prefix}_front_right_wheel_frame"/>
-      <origin xyz="${(base_length / 2)} ${-(base_width / 2)} ${wheel_connector_z}" rpy="${-wheel_connector_roll} ${wheel_connector_pitch} ${wheel_connector_yaw}"/>
+      <origin xyz="${(base_length / 2)} ${-(base_width / 2)} ${wheel_connector_z}" rpy="${wheel_connector_roll} ${wheel_connector_pitch} ${wheel_connector_yaw}"/>
     </joint>
 
   </xacro:macro>
