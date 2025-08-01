@@ -11,7 +11,7 @@
           <plugin>gz_ros2_control/GazeboSimSystem</plugin>
         </hardware>
 
-        <joint name="${prefix}_front_left_mecanum_left_wheel_joint">
+        <joint name="${prefix}_front_left_mecanum_right_wheel_joint">
           <command_interface name="velocity">
             <param name="min">-10</param>
             <param name="max">10</param>
@@ -20,7 +20,7 @@
           <state_interface name="position"/>
         </joint>
 
-        <joint name="${prefix}_rear_left_mecanum_right_wheel_joint">
+        <joint name="${prefix}_rear_left_mecanum_left_wheel_joint">
           <command_interface name="velocity">
             <param name="min">-10</param>
             <param name="max">10</param>
@@ -29,7 +29,7 @@
           <state_interface name="position"/>
         </joint>
 
-        <joint name="${prefix}_front_right_mecanum_right_wheel_joint">
+        <joint name="${prefix}_front_right_mecanum_left_wheel_joint">
           <command_interface name="velocity">
             <param name="min">-10</param>
             <param name="max">10</param>
@@ -38,7 +38,7 @@
           <state_interface name="position"/>
         </joint>
 
-        <joint name="${prefix}_rear_right_mecanum_left_wheel_joint">
+        <joint name="${prefix}_rear_right_mecanum_right_wheel_joint">
           <command_interface name="velocity">
             <param name="min">-10</param>
             <param name="max">10</param>
