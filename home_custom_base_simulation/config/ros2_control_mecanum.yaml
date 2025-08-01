@@ -33,8 +33,8 @@ mecanum_controller:
     
     front_left_wheel_command_joint_name: home_base_front_left_mecanum_left_wheel_joint
     front_right_wheel_command_joint_name: home_base_front_right_mecanum_right_wheel_joint
-    rear_left_wheel_command_joint_name: home_base_rear_left_mecanum_left_wheel_joint
-    rear_right_wheel_command_joint_name: home_base_rear_right_mecanum_right_wheel_joint
+    rear_left_wheel_command_joint_name: home_base_rear_left_mecanum_right_wheel_joint
+    rear_right_wheel_command_joint_name: home_base_rear_right_mecanum_left_wheel_joint
 
     kinematics:
       base_frame_offset: { x: 0.0, y: 0.0, theta: 0.0 }
