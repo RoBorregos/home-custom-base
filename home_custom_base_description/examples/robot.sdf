@@ -54,9 +54,8 @@
 
     <model name='home_base'
       xmlns:ignition="http://ignitionrobotics.org/schema">
-      <pose>0 0 0.325 0 -0 0</pose>
+      <pose>0 0 1.0 0 -0 0</pose>
       <link name='home_base_base_footprint'>
-        <pose>0 0 0.2 3.14 0 0</pose>
         <inertial>
           <mass>1.14395</mass>
           <inertia>
@@ -69,6 +68,7 @@
           </inertia>
         </inertial>
         <visual name='visual'>
+          <pose>0 0 0.25 3.14 0 0</pose>
           <geometry>
             <mesh>
               <uri>file:///ros/home_base_ws/src/home_custom_base_description/meshes/collision/body.stl</uri>
@@ -82,6 +82,7 @@
           </material>
         </visual>
         <collision name='collision'>
+          <pose>0 0 0.25 3.14 0 0</pose>
           <geometry>
             <box>
               <size>0.5 0.5 0.2</size>
@@ -106,7 +107,7 @@
         <visual name='visual'>
           <geometry>
             <mesh>
-              <uri>file:///ros/home_base_ws/src/home_custom_base_description/meshes/collision/mecanum_left.stl</uri>
+              <uri>file:///ros/home_base_ws/src/home_custom_base_description/meshes/collision/mecanum_right.stl</uri>
               <scale>0.001 0.001 0.001</scale>
             </mesh>
             <!-- <cylinder>
@@ -257,7 +258,7 @@
         <visual name='visual'>
           <geometry>
             <mesh>
-              <uri>file:///ros/home_base_ws/src/home_custom_base_description/meshes/collision/mecanum_left.stl</uri>
+              <uri>file:///ros/home_base_ws/src/home_custom_base_description/meshes/collision/mecanum_right.stl</uri>
               <scale>0.001 0.001 0.001</scale>
             </mesh>
             <!-- <cylinder>
@@ -352,7 +353,17 @@
         <max_acceleration>5</max_acceleration>
         <topic>cmd_vel</topic>
       </plugin>
+
+      <plugin filename="ignition-gazebo-joint-state-publisher-system" name="ignition::gazebo::systems::JointStatePublisher">
+        <ros>
+          <namespace>/</namespace>
+          <remapping>joint_states:=/joint_states</remapping>
+        </ros>
+      </plugin>
+
     </model>
+
+
 
     <!-- Moving Forward-->
     <plugin filename="libignition-gazebo-triggered-publisher-system.so" name="ignition::gazebo::systems::TriggeredPublisher">
