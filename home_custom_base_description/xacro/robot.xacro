@@ -1,0 +1,53 @@
+<?xml version="1.0"?>
+<robot xmlns:xacro="http://ros.org/wiki/xacro" name="home_base">
+
+  <xacro:property name="wheel_radius" value="0.08"/>
+  <xacro:property name="wheel_width" value="0.07"/>
+  <xacro:property name="body_size" value="0.5 0.5 0.2"/>
+  <xacro:property name="mesh_dir" value="file://$(find home_custom_base_description)/meshes/collision"/>
+
+  <link name="home_base_base_footprint"/>
+
+  <link name="home_base_link">
+    <visual>
+      <origin xyz="0 0 0" rpy="3.14 0 0"/>
+      <geometry>
+        <mesh filename="${mesh_dir}/body.stl" scale="0.001 0.001 0.001"/>
+      </geometry>
+      <material name="Blue"/>
+    </visual>
+  </link>
+
+  <joint name="home_base_base_link_joint" type="fixed">
+    <parent link="home_base_base_footprint"/>
+    <child link="home_base_link"/>
+    <origin xyz="0.0 0.0 0.2" rpy="0.0 0.0 0.0"/>
+  </joint>
+
+
+  <!-- Repeat for each wheel -->
+  <xacro:macro name="wheel_link" params="name xyz rpy mecanum_type">
+    <link name="${name}">
+      <visual>
+        <origin xyz="0 0 0" rpy="0 0 0"/>
+        <geometry>
+          <mesh filename="${mesh_dir}/mecanum_${mecanum_type}.stl" scale="0.001 0.001 0.001"/>
+        </geometry>
+        <material name="Gray"/>
+      </visual>
+    </link>
+    <joint name="${name}_joint" type="continuous">
+      <parent link="home_base_link"/>
+      <child link="${name}"/>
+      <origin xyz="${xyz}" rpy="${rpy}"/>
+      <axis xyz="0 0 1"/>
+    </joint>
+  </xacro:macro>
+
+  <!-- Instantiate 4 wheels -->
+  <xacro:wheel_link name="front_left_wheel" xyz="0.2 0.23 -0.12" rpy="-1.57 0 0" mecanum_type="right"/>
+  <xacro:wheel_link name="rear_left_wheel" xyz="-0.2 0.23 -0.12" rpy="-1.57 0 0" mecanum_type="left"/>
+  <xacro:wheel_link name="front_right_wheel" xyz="0.2 -0.23 -0.12" rpy="-1.57 0 0" mecanum_type="left"/>
+  <xacro:wheel_link name="rear_right_wheel" xyz="-0.2 -0.23 -0.12" rpy="-1.57 0 0" mecanum_type="right"/>
+
+</robot>
