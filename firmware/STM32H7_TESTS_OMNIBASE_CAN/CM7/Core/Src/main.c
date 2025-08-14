@@ -53,20 +53,40 @@
 
 /* Private variables ---------------------------------------------------------*/
 
+/** @brief I2C bus handle, used for BNO055 readings */
 I2C_HandleTypeDef hi2c1;
 
+/** @brief SPI port handle, used for MCP2515 CAN implementation */
 SPI_HandleTypeDef hspi1;
 
+/** @brief Timer 1 handle, CH1 (PE9) & CH2 (PE11) used in encoder mode for Encoder 1 */
 TIM_HandleTypeDef htim1;
+
+/** @brief Timer 2 handle, CH1 (PA15) & CH2 (PB3) used in encoder mode for Encoder 2 */
 TIM_HandleTypeDef htim2;
+
+/** @brief Timer 4 handle, CH1 (PD12) & CH2 (PD13) used in encoder mode for Encoder 3 */
 TIM_HandleTypeDef htim4;
+
+/** @brief Timer 5 handle, CH1 (PA0) used in PWM mode for H-Bridge_1 ENA */
 TIM_HandleTypeDef htim5;
+
+/** @brief Timer 8 handle, CH1 (PC6) & CH2 (PC7) used in encoder mode for Encoder 4 */
 TIM_HandleTypeDef htim8;
+
+/** @brief Timer 12 handle, CH1 (PE5) used in PWM mode for H-Bridge_1 ENB */
 TIM_HandleTypeDef htim12;
+
+/** @brief Timer 13 handle, currently unused */
 TIM_HandleTypeDef htim13;
+
+/** @brief Timer 14 handle, CH1 (PB14) used in PWM mode for H-Bridge_2 ENA */
 TIM_HandleTypeDef htim14;
+
+/** @brief Timer 15 handle, CH1 (PF9) used in PWM mode for H-Bridge_2 ENB */
 TIM_HandleTypeDef htim15;
 
+/** @brief uart3 handle, connected to microusb port by default, used for serial communication with computer with ros2 */
 UART_HandleTypeDef huart3;
 
 /* Definitions for defaultTask */
@@ -156,13 +176,39 @@ void StartControlTask(void *argument);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+
+/**
+ * @brief Computes the delta between two encoder counter values.
+ * @details
+ * Subtracts the previous encoder count from the current count and casts
+ * the result to a signed 16-bit integer to handle the wrap around
+ * example with 16bit encoder counters: 10 - 65530 = (int16) -16.
+ *
+ * @param[in] current Current encoder count.
+ * @param[in] previous Previous encoder count.
+ * @return Signed difference in counts.
+ */
 int16_t computeDeltaCNT(uint16_t current, uint16_t previous) {
 	int16_t delta = (int16_t)(current - previous);
-	if (delta > 32767) delta -= 65536;
-	else if (delta < -32767) delta += 65536;
 	return delta;
 }
 
+
+/**
+* @brief Sets the direction of a motor using two GPIO pins.
+* @details
+* Drives the motor direction pins based on the given `dir` value:
+* - `dir == 0`: Sets pin1 low, pin2 high.
+* - `dir == 1`: Sets pin1 high, pin2 low.
+* - `dir >= 2`: Sets both pins low (motor off/brake).
+*
+* Modifies the port's Output Data Register (`ODR`) directly.
+*
+* @param[in] port Pointer to the GPIO port structure.
+* @param[in] pin1 First GPIO pin number (0–15).
+* @param[in] pin2 Second GPIO pin number (0–15).
+* @param[in] dir Direction code (0=reverse, 1=forward, 2=off).
+*/
 void setMotorDirection(GPIO_TypeDef *port, uint16_t pin1, uint16_t pin2, uint8_t dir) {
 	if (dir < 2) {
 		dir ? (port->ODR |= (1 << pin1)) : (port->ODR &= ~(1 << pin1));
@@ -173,8 +219,23 @@ void setMotorDirection(GPIO_TypeDef *port, uint16_t pin1, uint16_t pin2, uint8_t
 	}
 }
 
-
-int computeNecessaryWheelSpeeds(double phi, double d, double r, double u[4], double phi_dot, double y_dot, double x_dot) {
+/**
+* @brief Computes wheel angular velocities for a 4-wheel omni robot.
+* @details
+* Uses robot orientation `phi`, platform radius `d`, wheel radius `r`,
+* and desired body-frame velocities (`phi_dot`, `y_dot`, `x_dot`) to
+* calculate per-wheel angular speeds `u[0..3]`.
+*
+* @param[in] phi Robot heading in radians.
+* @param[in] d Distance from robot center to wheel axis.
+* @param[in] r Wheel radius.
+* @param[out] u Array of 4 wheel angular velocities (rad/s).
+* @param[in] phi_dot Desired angular velocity about Z axis (rad/s).
+* @param[in] y_dot Desired Y velocity in body frame (m/s).
+* @param[in] x_dot Desired X velocity in body frame (m/s).
+* @return Always returns 0.
+*/
+int computeNecessaryWheelSpeedsOmni(double phi, double d, double r, double u[4], double phi_dot, double y_dot, double x_dot) {
 	u[0] = (d * phi_dot + y_dot * cos(phi) - x_dot * sin(phi)) / r;
     u[1] = (d * phi_dot - x_dot * cos(phi) - y_dot * sin(phi)) / r;
     u[2] = (d * phi_dot - y_dot * cos(phi) + x_dot * sin(phi)) / r;
@@ -183,10 +244,75 @@ int computeNecessaryWheelSpeeds(double phi, double d, double r, double u[4], dou
     return 0;
 }
 
-int globalSpeedsFromU(double phi, double d, double r, double u[4], double q_dot[3]) {
+
+/**
+* @brief Computes wheel angular velocities for a mecanum-wheel robot.
+* @details
+* Uses robot orientation `phi`, wheel offsets (`x_off`, `y_off`), wheel
+* radius `r`, and desired body-frame velocities to compute per-wheel
+* angular speeds `u[0..3]`.
+*
+* @param[in] phi Robot heading in radians.
+* @param[in] x_off Wheel X offset from robot center.
+* @param[in] y_off Wheel Y offset from robot center.
+* @param[in] r Wheel radius.
+* @param[out] u Array of 4 wheel angular velocities (rad/s).
+* @param[in] phi_dot Desired angular velocity about Z axis (rad/s).
+* @param[in] y_dot Desired Y velocity in body frame (m/s).
+* @param[in] x_dot Desired X velocity in body frame (m/s).
+* @return Always returns 0.
+*/
+int computeNecessaryWheelSpeedsMecanum(double phi, double x_off, double y_off, double r, double u[4], double phi_dot, double y_dot, double x_dot) {
+	u[0] = (x_dot*(cos(phi) + sin(phi)) - y_dot*(cos(phi) - sin(phi)) - phi_dot*(x_off + y_off)) / r;
+    u[1] = (x_dot*(cos(phi) - sin(phi)) + y_dot*(cos(phi) + sin(phi)) + phi_dot*(x_off + y_off)) / r;
+    u[2] = (x_dot*(cos(phi) + sin(phi)) - y_dot*(cos(phi) - sin(phi)) + phi_dot*(x_off + y_off)) / r;
+    u[3] = (x_dot*(cos(phi) - sin(phi)) + y_dot*(cos(phi) + sin(phi)) - phi_dot*(x_off + y_off)) / r;
+
+    return 0;
+}
+
+/**
+* @brief Computes global angular and linear velocities from omni-wheel speeds.
+* @details
+* Converts per-wheel angular velocities `u[0..3]` into global frame
+* velocities `q_dot[0]` (angular), `q_dot[1]` (X), and `q_dot[2]` (Y)
+* using robot heading `phi`, distance to wheel `d`, and wheel radius `r`.
+*
+* @param[in] phi Robot heading in radians.
+* @param[in] d Distance from robot center to wheel axis.
+* @param[in] r Wheel radius.
+* @param[in] u Array of 4 wheel angular velocities (rad/s).
+* @param[out] q_dot Array of 3 global velocities: {phi_dot, x_dot, y_dot}.
+* @return Always returns 0.
+*/
+int globalSpeedsFromUOmni(double phi, double d, double r, double u[4], double q_dot[3]) {
     q_dot[0] = (u[0] + u[1] + u[2] + u[3]) / (4 * d); // Angular velocity
     q_dot[1] = -cos(phi)*((u[1] - u[3])/2) - sin(phi)*((u[0] - u[2])/2); // X velocity
     q_dot[2] = cos(phi)*((u[0] - u[2])/2) - sin(phi)*((u[1] - u[3])/2); // Y velocity
+
+    return 0;
+}
+
+/**
+* @brief Computes global angular and linear velocities from mecanum-wheel speeds.
+* @details
+* Converts per-wheel angular velocities `u[0..3]` into global frame
+* velocities `q_dot[0]` (angular), `q_dot[1]` (X), and `q_dot[2]` (Y)
+* using robot heading `phi`, wheel offsets (`x_off`, `y_off`), and
+* wheel radius `r`.
+*
+* @param[in] phi Robot heading in radians.
+* @param[in] x_off Wheel X offset from robot center.
+* @param[in] y_off Wheel Y offset from robot center.
+* @param[in] r Wheel radius.
+* @param[in] u Array of 4 wheel angular velocities (rad/s).
+* @param[out] q_dot Array of 3 global velocities: {phi_dot, x_dot, y_dot}.
+* @return Always returns 0.
+*/
+int globalSpeedsFromUMecanum(double phi, double x_off, double y_off, double r, double u[4], double q_dot[3]) {
+    q_dot[0] = (u[1] - u[0] + u[2] - u[3]) / ((4 * (x_off + y_off)) / r); // Angular velocity
+    q_dot[1] = cos(phi)*(r/4)*(u[0] + u[1] + u[2] + u[3]) + sin(phi)*(r/4)*(u[0] - u[1] + u[2] - u[3]); // X velocity
+    q_dot[2] = sin(phi)*(r/4)*(u[0] + u[1] + u[2] + u[3]) - cos(phi)*(r/4)*(u[0] - u[1] + u[2] - u[3]); // X velocity
 
     return 0;
 }
@@ -1281,16 +1407,39 @@ void StartDefaultTask(void *argument)
   /* USER CODE END 5 */
 }
 
-/* USER CODE BEGIN Header_start_UART_RX_Task */
+
+
+
+
+
+
+
+/** @brief circular receive buffer size used in HAL_UART_RxCpltCallback, and UART_RX_Task */
+#define RX_BUF_SIZE 256
+
+/** @brief circular receive buffer used in HAL_UART_RxCpltCallback and UART_RX_Task */
+static uint8_t rx_buf[RX_BUF_SIZE];
+
+/** @brief head index to read bytes out of circular receive buffer used in HAL_UART_RxCpltCallback and UART_RX_Task */
+static volatile size_t rx_head = 0;
+
+/** @brief tail index to write bytes into circular receive buffer used in HAL_UART_RxCpltCallback and UART_RX_Task */
+static volatile size_t rx_tail = 0;
+
+/** @brief temporary char receive buffer in HAL_UART_RxCpltCallback (called every UART3 interrupt) necessary for UART_RX_Task */
+static uint8_t rx_char;
 
 /**
-* @brief Function implementing the UART_RX_Task thread.
-* @param argument: Not used
-* @retval None
-*/
-
-
-/* RECEIVE FUNCTION */
+ * @brief UART receive complete interrupt callback.
+ * @details
+ * Called automatically by HAL when a byte is received through UART
+ * configured with interrupt mode. If the interrupt source is USART3,
+ * the received byte is stored in the circular receive buffer (`rx_buf`)
+ * at the current tail position, and the tail index is advanced with
+ * wrap-around. The UART is then re-armed to receive the next byte.
+ *
+ * @param[in] huart Pointer to the UART handle that triggered the interrupt.
+ */
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
 {
     if (huart->Instance == USART3) {
@@ -1303,15 +1452,22 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
     }
 }
 
+/* USER CODE BEGIN Header_start_UART_RX_Task */
 
+/**
+* @brief Function implementing the UART_RX_Task thread.
+* @details
+* This task receives UART packages using interrupts, assembles them into lines,
+* and parses each complete line into motion control variables for the InputData
+* struct instance and PID gain settings in the PIDConfig struct instance. The
+* received lines must contain 30 space-separated numbers in the expected order.
+* Successfully parsed values are sent to other tasks through determined queues.
+* If parsing fails or a buffer overflow occurs, the line is discarded.
+* The task runs continuously with a 5ms (arbitrary) delay to allow other tasks to run.
+* @param argument: Not used
+* @retval None
+*/
 
-
-
-#define RX_BUF_SIZE 256
-static uint8_t rx_buf[RX_BUF_SIZE];   // Ring buffer storage
-static volatile size_t rx_head = 0;
-static volatile size_t rx_tail = 0;
-static uint8_t rx_char;               // Temporary char buffer
 /* USER CODE END Header_start_UART_RX_Task */
 void start_UART_RX_Task(void *argument)
 {
@@ -1320,7 +1476,7 @@ void start_UART_RX_Task(void *argument)
 
 	char line_buf[RX_BUF_SIZE] = {0};
 	uint16_t line_index = 0;
-	InputData data = {0,0,0,1,1};
+	InputData data = {0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0f,0.0f,0.0f};
 	PIDConfig kpids = {
 		.x_pid = {0.0f, 0.0f, 0.0f},
 		.y_pid = {0.0f, 0.0f, 0.0f},
@@ -1392,9 +1548,22 @@ void start_UART_RX_Task(void *argument)
   /* USER CODE END start_UART_RX_Task */
 }
 
+
 /* USER CODE BEGIN Header_Start_UART_TX_Task */
 /**
-* @brief Function implementing the UART_TX_Task thread.
+* @brief UART_TX_Task task that formats and transmits a telemetry line over UART.
+* @details
+* Initializes local state (IMU, encoders, errors, time, odometry, control outputs)
+* and PID gains, then runs a periodic loop that:
+*  1) Reads the latest inputs from message queues
+*     (UART_QueueHandle = received desired setpoints, kpids_UART_TX_QueueHandle = received PID gains,
+*      CtrlTsk_QueueHandle = telemetry). if a queue times out, previous values are kept.
+*  2) Prints a single line with comma-separated values in the format variable=value, printf function
+*     is retargeted to UART to send the ~60 variables:
+*     desired setpoints, IMU angles, encoder counts & wheel speeds, inertial velocities,
+*     odometry pose & errors, per-wheel control errors, controller outputs (ẋ, ẏ, φ̇, u[0..3]),
+*     timestamps, PWM duty cycles, and PID gains for x, y, φ, and each wheel.
+*  3) Has ~10ms osDelay to target ~100 Hz telemetry
 * @param argument: Not used
 * @retval None
 */
@@ -1402,7 +1571,7 @@ void start_UART_RX_Task(void *argument)
 void Start_UART_TX_Task(void *argument)
 {
   /* USER CODE BEGIN Start_UART_TX_Task */
-	  InputData data = {0,0,0,1,1};
+	  InputData data = {0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0f,0.0f,0.0f};
 	  CtrlTsk_Data CtrlTsk_data;
 	  IMUData      *imu      = &CtrlTsk_data.imu;
 	  EncoderData  *enc      = &CtrlTsk_data.encoders;
@@ -1500,8 +1669,36 @@ void Start_UART_TX_Task(void *argument)
 
 /* USER CODE BEGIN Header_StartControlTask */
 /**
-* @brief Function implementing the ControlTask thread.
-* @param argument: Not used
+* @brief ControlTask with control loop for a 4‑wheel omni base (read→compute→actuate→publish).
+* @details
+* Runs a periodic feedback loop that:
+*  1) **Sensing:** Reads encoder counters (TIM 1/4/8/2), computes delta counts with wrap‑around
+*     via `computeDeltaCNT()`, updates per‑wheel angles, and computes wheel speeds (RPM)
+*     with a first‑order low‑pass filter (`alpha = dt/(tau+dt)`). Time step `dt` is derived
+*     from CMSIS tick deltas (`osKernelGetTickCount()`). Tick Hz set to 1kHz in FreeRTOSConfig.h
+*  2) **Inputs:** Receives desired motion/pose (`UART2CtrlTsk_QueueHandle`) and PID gains
+*     (`UART2KPIDs_QueueHandle`). If a queue times out, previous values are retained.
+*  3) **Outer control (pose → wheel targets):**
+*     - **Pose mode** (`velocity_ctrl_mode == false`): computes `x_dot`, `y_dot`, `phi_dot`
+*       with PID (per‑axis I‑sum and D on error; small deadbands on |err|), then calls
+*       `computeNecessaryWheelSpeedsMecanum(phi, x_off, y_off, r, u[4], phi_dot, y_dot, x_dot)`
+*       to map body‑frame velocities to wheel targets.
+*     - **Velocity mode** (`velocity_ctrl_mode == true`): uses `u[0..3]` directly from UART.
+*  4) **Inner control (wheel speed → PWM):** Per wheel PID on `u[i] − ω[i]` with integral
+*     anti‑windup clamp, small‑error I reset (`|u_err| < u_err_trshld`), sign‑based direction,
+*     dead‑zone compensation near zero, and saturation to `[−max_duty, +max_duty]`. Updates
+*     GPIO H‑bridge directions and PWM compare registers:
+*     `TIM 5/12/14/15` channels.
+*  5) **Odometry:** Converts measured wheel speeds to global rates with
+*     `globalSpeedsFromUMecanum(phi, x_off, y_off, r, u[4], q_dot[3])`, then integrates
+*     `q_dot` to update `odom.{phi, x_pos, y_pos}` and wraps `phi ∈ [−π, π]`.
+*  6) **Publish:** Sends the `CtrlTsk_Data` to UART_TX_Tsak through `CtrlTsk_QueueHandle`
+*     for telemetry/monitoring.
+*
+* Constants define encoder resolution (`R_counts`), degrees/radians per count, PID thresholds,
+* PWM limits, and filter constant `tau`. Supports a lightweight plant **simulation mode**
+* (when `simulation_on == true`) that drives ω toward `u` with a first‑order model.
+*
 * @retval None
 */
 /* USER CODE END Header_StartControlTask */
@@ -1555,6 +1752,13 @@ void StartControlTask(void *argument)
   TimeState    *ts       = &CtrlTsk_data.time;
   OdomData     *odom     = &CtrlTsk_data.odom;
   CtrlOutData  *ctrl_out = &CtrlTsk_data.ctrl;
+
+  Errors  prevErr      = {
+	.err_phi = 0.0,
+    .err_x = 0.0,
+	.err_y = 0.0,
+	.u_errs = {0.0,0.0,0.0,0.0}
+  };
 
   PIDConfig kpids = {
 	.x_pid = {0.0f, 0.0f, 0.0f},
@@ -1689,6 +1893,10 @@ void StartControlTask(void *argument)
 
 /*------------------------------------------------------------------------*/
 /************************** 3. Compute errors *****************************/
+	prevErr->err_x = err->err_x;
+	prevErr->err_y = err->err_y;
+	prevErr->err_phi = err->err_phi;
+
 	err->err_x = data.x_desired - odom->x_pos;
 	err->err_y = data.y_desired - odom->y_pos;
 	//phi_desired = atan2(Err_y, Err_x); /*<-- Unnecessary? ony for diff drive?*/
@@ -1705,13 +1913,13 @@ void StartControlTask(void *argument)
 
 		if (abs(err->err_x) > xTrshld){
 			sumKI_x += err->err_x * ts->delta;
-			ctrl_out->x_dot = xPID_K->Kp*err->err_x + xPID_K->Ki*sumKI_x + xPID_K->Kd * (err->err_x / ts->delta);
+			ctrl_out->x_dot = xPID_K->Kp*err->err_x + xPID_K->Ki*sumKI_x + xPID_K->Kd * ((err->err_x - prevErr->err_x)/ ts->delta);
 			ctrl_out->phi_dot = 0;
 		}
 
 		if (abs(err->err_y) > yTrshld){
 			sumKI_y += err->err_y * ts->delta;
-			ctrl_out->y_dot = yPID_K->Kp*err->err_y + yPID_K->Ki*sumKI_y + yPID_K->Kd * (err->err_y / ts->delta);
+			ctrl_out->y_dot = yPID_K->Kp*err->err_y + yPID_K->Ki*sumKI_y + yPID_K->Kd * ((err->err_y - prevErr->err_y) / ts->delta);
 			ctrl_out->phi_dot = 0;
 		}
 
@@ -1721,7 +1929,7 @@ void StartControlTask(void *argument)
 
 			if (abs(err->err_phi) > phiTrshld){
 				sumKI_phi += err->err_phi * ts->delta;
-				ctrl_out->phi_dot = phiPID_K->Kp*err->err_phi + phiPID_K->Ki*sumKI_phi + phiPID_K->Kd * (err->err_phi / ts->delta);
+				ctrl_out->phi_dot = phiPID_K->Kp*err->err_phi + phiPID_K->Ki*sumKI_phi + phiPID_K->Kd * ((err->err_phi - prevErr->err_phi) / ts->delta);
 			}
 		}
 
@@ -1737,7 +1945,7 @@ void StartControlTask(void *argument)
 	//	       0.0, 1.0, 1.0, 0.0, 3.0, 6.0);
 
 	//	computeNecessaryWheelSpeeds(0.0, data.d, data.r, ctrl_out->u, 0.0, 3.0, 6.0);
-		computeNecessaryWheelSpeeds(odom->phi, data.d, data.r, ctrl_out->u, ctrl_out->phi_dot, ctrl_out->y_dot, ctrl_out->x_dot);
+		computeNecessaryWheelSpeedsMecanum(odom->phi, data.d, data.r, ctrl_out->u, ctrl_out->phi_dot, ctrl_out->y_dot, ctrl_out->x_dot);
 
 	}
 	else {
@@ -1803,7 +2011,7 @@ void StartControlTask(void *argument)
 /*------------------------------------------------------------------------*/
 /***************************** 7. ODOMETRY ********************************/
 
-	globalSpeedsFromU(odom->phi, data.d, data.r, enc->omegaVals, odom->q_dot); // q_dot = {phi_dot, x_dot, y_dot}
+	globalSpeedsFromUMecanum(odom->phi, data.d, data.r, enc->omegaVals, odom->q_dot); // q_dot = {phi_dot, x_dot, y_dot}
 //	globalSpeedsFromU(odom->phi, data.d, data.r, ctrl_out->u, odom->q_dot); // q_dot = {phi_dot, x_dot, y_dot}
 
 	odom->phi    += odom->q_dot[0] * dt;         // Integrated angular velocity
