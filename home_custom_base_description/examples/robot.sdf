@@ -71,7 +71,7 @@
           <pose>0 0 0.25 3.14 0 0</pose>
           <geometry>
             <mesh>
-              <uri>file:///ros/home_base_ws/src/home_custom_base_description/meshes/collision/body.stl</uri>
+              <uri>file:///workspace/home-custom-base/home_custom_base_description/meshes/collision/body.stl</uri>
               <scale>0.001 0.001 0.001</scale>
             </mesh>
           </geometry>
@@ -107,7 +107,7 @@
         <visual name='visual'>
           <geometry>
             <mesh>
-              <uri>file:///ros/home_base_ws/src/home_custom_base_description/meshes/collision/mecanum_right.stl</uri>
+              <uri>file:///workspace/home-custom-base/home_custom_base_description/meshes/collision/mecanum_right.stl</uri>
               <scale>0.001 0.001 0.001</scale>
             </mesh>
             <!-- <cylinder>
@@ -160,7 +160,7 @@
         <visual name='visual'>
           <geometry>
             <mesh>
-              <uri>file:///ros/home_base_ws/src/home_custom_base_description/meshes/collision/mecanum_left.stl</uri>
+              <uri>file:///workspace/home-custom-base/home_custom_base_description/meshes/collision/mecanum_left.stl</uri>
               <scale>0.001 0.001 0.001</scale>
             </mesh>
             <!-- <cylinder>
@@ -209,7 +209,7 @@
         <visual name='visual'>
           <geometry>
             <mesh>
-              <uri>file:///ros/home_base_ws/src/home_custom_base_description/meshes/collision/mecanum_left.stl</uri>
+              <uri>file:///workspace/home-custom-base/home_custom_base_description/meshes/collision/mecanum_left.stl</uri>
               <scale>0.001 0.001 0.001</scale>
             </mesh>
             <!-- <cylinder>
@@ -258,7 +258,7 @@
         <visual name='visual'>
           <geometry>
             <mesh>
-              <uri>file:///ros/home_base_ws/src/home_custom_base_description/meshes/collision/mecanum_right.stl</uri>
+              <uri>file:///workspace/home-custom-base/home_custom_base_description/meshes/collision/mecanum_right.stl</uri>
               <scale>0.001 0.001 0.001</scale>
             </mesh>
             <!-- <cylinder>

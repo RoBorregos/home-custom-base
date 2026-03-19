@@ -55,7 +55,7 @@ def generate_launch_description():
     )
 
     gz_spawn_entity = Node(
-        package='ros_gz_sim',
+        package='ros_ign_gazebo',
         executable='create',
         output='screen',
         arguments=['-topic', 'robot_description',
@@ -79,9 +79,9 @@ def generate_launch_description():
 
     # Bridge
     bridge = Node(
-        package='ros_gz_bridge',
+        package='ros_ign_bridge',
         executable='parameter_bridge',
-        arguments=['/clock@rosgraph_msgs/msg/Clock[gz.msgs.Clock'],
+        arguments=['/clock@rosgraph_msgs/msg/Clock[ignition.msgs.Clock'],
         output='screen'
     )
 
@@ -89,10 +89,10 @@ def generate_launch_description():
         # Launch gazebo environment
         IncludeLaunchDescription(
             PythonLaunchDescriptionSource(
-                [PathJoinSubstitution([FindPackageShare('ros_gz_sim'),
+                [PathJoinSubstitution([FindPackageShare('ros_ign_gazebo'),
                                        'launch',
-                                       'gz_sim.launch.py'])]),
-            launch_arguments=[('gz_args', [' -r -v 1 empty.sdf'])]),
+                                       'ign_gazebo.launch.py'])]),
+            launch_arguments=[('ign_args', [' -r -v 1 empty.sdf'])]),
         RegisterEventHandler(
             event_handler=OnProcessExit(
                 target_action=gz_spawn_entity,

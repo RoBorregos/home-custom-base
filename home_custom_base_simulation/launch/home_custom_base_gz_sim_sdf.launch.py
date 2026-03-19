@@ -36,8 +36,7 @@ def generate_launch_description():
 
     # Generate robot_description from Xacro
     robot_description_content = Command([
-        PathJoinSubstitution([FindExecutable(name='xacro')]),
-        ' ',
+        'xacro ',
         PathJoinSubstitution([
             FindPackageShare('home_custom_base_description'),
             'xacro',
@@ -81,12 +80,10 @@ def generate_launch_description():
     gazebo_launch = ExecuteProcess(
         cmd=[
             'ign', 'gazebo', sdf_path,
-            '--gui-config', '/usr/share/ign-gazebo/gui.config',
-            '-r'  # this means "run immediately"
+            '-r'  # run immediately
         ],
         output='screen'
     )
-
 
     # Start joint state bridge
     joint_state_bridge = Node(
@@ -101,8 +98,7 @@ def generate_launch_description():
         output='screen'
     )
 
-    # You can add more bridges for e.g., /cmd_vel, /laser_scan, etc.
-    # Example for cmd_vel:
+    # cmd_vel bridge
     cmd_vel_bridge = Node(
         package='ros_ign_bridge',
         executable='parameter_bridge',
