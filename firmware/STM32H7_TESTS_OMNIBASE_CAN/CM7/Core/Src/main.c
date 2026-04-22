@@ -53,40 +53,22 @@
 
 /* Private variables ---------------------------------------------------------*/
 
-/** @brief I2C bus handle, used for BNO055 readings */
+FDCAN_HandleTypeDef hfdcan1;
+
 I2C_HandleTypeDef hi2c1;
 
-/** @brief SPI port handle, used for MCP2515 CAN implementation */
 SPI_HandleTypeDef hspi1;
 
-/** @brief Timer 1 handle, CH1 (PE9) & CH2 (PE11) used in encoder mode for Encoder 1 */
 TIM_HandleTypeDef htim1;
-
-/** @brief Timer 2 handle, CH1 (PA15) & CH2 (PB3) used in encoder mode for Encoder 2 */
 TIM_HandleTypeDef htim2;
-
-/** @brief Timer 4 handle, CH1 (PD12) & CH2 (PD13) used in encoder mode for Encoder 3 */
 TIM_HandleTypeDef htim4;
-
-/** @brief Timer 5 handle, CH1 (PA0) used in PWM mode for H-Bridge_1 ENA */
 TIM_HandleTypeDef htim5;
-
-/** @brief Timer 8 handle, CH1 (PC6) & CH2 (PC7) used in encoder mode for Encoder 4 */
 TIM_HandleTypeDef htim8;
-
-/** @brief Timer 12 handle, CH1 (PE5) used in PWM mode for H-Bridge_1 ENB */
 TIM_HandleTypeDef htim12;
-
-/** @brief Timer 13 handle, currently unused */
 TIM_HandleTypeDef htim13;
-
-/** @brief Timer 14 handle, CH1 (PB14) used in PWM mode for H-Bridge_2 ENA */
 TIM_HandleTypeDef htim14;
-
-/** @brief Timer 15 handle, CH1 (PF9) used in PWM mode for H-Bridge_2 ENB */
 TIM_HandleTypeDef htim15;
 
-/** @brief uart3 handle, connected to microusb port by default, used for serial communication with computer with ros2 */
 UART_HandleTypeDef huart3;
 
 /* Definitions for defaultTask */
@@ -165,6 +147,7 @@ static void MX_TIM14_Init(void);
 static void MX_TIM15_Init(void);
 static void MX_I2C1_Init(void);
 static void MX_SPI1_Init(void);
+static void MX_FDCAN1_Init(void);
 void StartDefaultTask(void *argument);
 void start_UART_RX_Task(void *argument);
 void Start_UART_TX_Task(void *argument);
@@ -409,6 +392,7 @@ Error_Handler();
   MX_TIM15_Init();
   MX_I2C1_Init();
   MX_SPI1_Init();
+  MX_FDCAN1_Init();
   /* USER CODE BEGIN 2 */
 
   uint8_t allOK = 1;
@@ -563,7 +547,7 @@ void SystemClock_Config(void)
   RCC_OscInitStruct.PLL.PLLM = 2;
   RCC_OscInitStruct.PLL.PLLN = 240;
   RCC_OscInitStruct.PLL.PLLP = 2;
-  RCC_OscInitStruct.PLL.PLLQ = 8;
+  RCC_OscInitStruct.PLL.PLLQ = 24;
   RCC_OscInitStruct.PLL.PLLR = 2;
   RCC_OscInitStruct.PLL.PLLRGE = RCC_PLL1VCIRANGE_2;
   RCC_OscInitStruct.PLL.PLLVCOSEL = RCC_PLL1VCOWIDE;
@@ -608,6 +592,59 @@ void PeriphCommonClock_Config(void)
   {
     Error_Handler();
   }
+}
+
+/**
+  * @brief FDCAN1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_FDCAN1_Init(void)
+{
+
+  /* USER CODE BEGIN FDCAN1_Init 0 */
+
+  /* USER CODE END FDCAN1_Init 0 */
+
+  /* USER CODE BEGIN FDCAN1_Init 1 */
+
+  /* USER CODE END FDCAN1_Init 1 */
+  hfdcan1.Instance = FDCAN1;
+  hfdcan1.Init.FrameFormat = FDCAN_FRAME_CLASSIC;
+  hfdcan1.Init.Mode = FDCAN_MODE_NORMAL;
+  hfdcan1.Init.AutoRetransmission = DISABLE;
+  hfdcan1.Init.TransmitPause = DISABLE;
+  hfdcan1.Init.ProtocolException = DISABLE;
+  hfdcan1.Init.NominalPrescaler = 2;
+  hfdcan1.Init.NominalSyncJumpWidth = 8;
+  hfdcan1.Init.NominalTimeSeg1 = 31;
+  hfdcan1.Init.NominalTimeSeg2 = 8;
+  hfdcan1.Init.DataPrescaler = 1;
+  hfdcan1.Init.DataSyncJumpWidth = 1;
+  hfdcan1.Init.DataTimeSeg1 = 1;
+  hfdcan1.Init.DataTimeSeg2 = 1;
+  hfdcan1.Init.MessageRAMOffset = 0;
+  hfdcan1.Init.StdFiltersNbr = 1;
+  hfdcan1.Init.ExtFiltersNbr = 0;
+  hfdcan1.Init.RxFifo0ElmtsNbr = 1;
+  hfdcan1.Init.RxFifo0ElmtSize = FDCAN_DATA_BYTES_8;
+  hfdcan1.Init.RxFifo1ElmtsNbr = 0;
+  hfdcan1.Init.RxFifo1ElmtSize = FDCAN_DATA_BYTES_8;
+  hfdcan1.Init.RxBuffersNbr = 0;
+  hfdcan1.Init.RxBufferSize = FDCAN_DATA_BYTES_8;
+  hfdcan1.Init.TxEventsNbr = 0;
+  hfdcan1.Init.TxBuffersNbr = 0;
+  hfdcan1.Init.TxFifoQueueElmtsNbr = 1;
+  hfdcan1.Init.TxFifoQueueMode = FDCAN_TX_FIFO_OPERATION;
+  hfdcan1.Init.TxElmtSize = FDCAN_DATA_BYTES_8;
+  if (HAL_FDCAN_Init(&hfdcan1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN FDCAN1_Init 2 */
+
+  /* USER CODE END FDCAN1_Init 2 */
+
 }
 
 /**
@@ -1407,51 +1444,6 @@ void StartDefaultTask(void *argument)
   /* USER CODE END 5 */
 }
 
-
-
-
-
-
-
-
-/** @brief circular receive buffer size used in HAL_UART_RxCpltCallback, and UART_RX_Task */
-#define RX_BUF_SIZE 256
-
-/** @brief circular receive buffer used in HAL_UART_RxCpltCallback and UART_RX_Task */
-static uint8_t rx_buf[RX_BUF_SIZE];
-
-/** @brief head index to read bytes out of circular receive buffer used in HAL_UART_RxCpltCallback and UART_RX_Task */
-static volatile size_t rx_head = 0;
-
-/** @brief tail index to write bytes into circular receive buffer used in HAL_UART_RxCpltCallback and UART_RX_Task */
-static volatile size_t rx_tail = 0;
-
-/** @brief temporary char receive buffer in HAL_UART_RxCpltCallback (called every UART3 interrupt) necessary for UART_RX_Task */
-static uint8_t rx_char;
-
-/**
- * @brief UART receive complete interrupt callback.
- * @details
- * Called automatically by HAL when a byte is received through UART
- * configured with interrupt mode. If the interrupt source is USART3,
- * the received byte is stored in the circular receive buffer (`rx_buf`)
- * at the current tail position, and the tail index is advanced with
- * wrap-around. The UART is then re-armed to receive the next byte.
- *
- * @param[in] huart Pointer to the UART handle that triggered the interrupt.
- */
-void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
-{
-    if (huart->Instance == USART3) {
-        // Store received char in ring buffer
-        rx_buf[rx_tail] = rx_char;
-        rx_tail = (rx_tail + 1) % RX_BUF_SIZE;
-
-        // Re-arm UART to receive next char
-        HAL_UART_Receive_IT(huart, &rx_char, 1);
-    }
-}
-
 /* USER CODE BEGIN Header_start_UART_RX_Task */
 
 /**
@@ -1547,7 +1539,6 @@ void start_UART_RX_Task(void *argument)
 
   /* USER CODE END start_UART_RX_Task */
 }
-
 
 /* USER CODE BEGIN Header_Start_UART_TX_Task */
 /**
@@ -1893,9 +1884,9 @@ void StartControlTask(void *argument)
 
 /*------------------------------------------------------------------------*/
 /************************** 3. Compute errors *****************************/
-	prevErr->err_x = err->err_x;
-	prevErr->err_y = err->err_y;
-	prevErr->err_phi = err->err_phi;
+	prevErr.err_x = err->err_x;
+	prevErr.err_y = err->err_y;
+	prevErr.err_phi = err->err_phi;
 
 	err->err_x = data.x_desired - odom->x_pos;
 	err->err_y = data.y_desired - odom->y_pos;
@@ -1913,13 +1904,13 @@ void StartControlTask(void *argument)
 
 		if (abs(err->err_x) > xTrshld){
 			sumKI_x += err->err_x * ts->delta;
-			ctrl_out->x_dot = xPID_K->Kp*err->err_x + xPID_K->Ki*sumKI_x + xPID_K->Kd * ((err->err_x - prevErr->err_x)/ ts->delta);
+			ctrl_out->x_dot = xPID_K->Kp*err->err_x + xPID_K->Ki*sumKI_x + xPID_K->Kd * ((err->err_x - prevErr.err_x)/ ts->delta);
 			ctrl_out->phi_dot = 0;
 		}
 
 		if (abs(err->err_y) > yTrshld){
 			sumKI_y += err->err_y * ts->delta;
-			ctrl_out->y_dot = yPID_K->Kp*err->err_y + yPID_K->Ki*sumKI_y + yPID_K->Kd * ((err->err_y - prevErr->err_y) / ts->delta);
+			ctrl_out->y_dot = yPID_K->Kp*err->err_y + yPID_K->Ki*sumKI_y + yPID_K->Kd * ((err->err_y - prevErr.err_y) / ts->delta);
 			ctrl_out->phi_dot = 0;
 		}
 
@@ -1929,7 +1920,7 @@ void StartControlTask(void *argument)
 
 			if (abs(err->err_phi) > phiTrshld){
 				sumKI_phi += err->err_phi * ts->delta;
-				ctrl_out->phi_dot = phiPID_K->Kp*err->err_phi + phiPID_K->Ki*sumKI_phi + phiPID_K->Kd * ((err->err_phi - prevErr->err_phi) / ts->delta);
+				ctrl_out->phi_dot = phiPID_K->Kp*err->err_phi + phiPID_K->Ki*sumKI_phi + phiPID_K->Kd * ((err->err_phi - prevErr.err_phi) / ts->delta);
 			}
 		}
 
@@ -1945,7 +1936,7 @@ void StartControlTask(void *argument)
 	//	       0.0, 1.0, 1.0, 0.0, 3.0, 6.0);
 
 	//	computeNecessaryWheelSpeeds(0.0, data.d, data.r, ctrl_out->u, 0.0, 3.0, 6.0);
-		computeNecessaryWheelSpeedsMecanum(odom->phi, data.d, data.r, ctrl_out->u, ctrl_out->phi_dot, ctrl_out->y_dot, ctrl_out->x_dot);
+		computeNecessaryWheelSpeedsMecanum(odom->phi, data.x_off, data.y_off, data.r, ctrl_out->u, ctrl_out->phi_dot, ctrl_out->y_dot, ctrl_out->x_dot);
 
 	}
 	else {
@@ -2011,7 +2002,7 @@ void StartControlTask(void *argument)
 /*------------------------------------------------------------------------*/
 /***************************** 7. ODOMETRY ********************************/
 
-	globalSpeedsFromUMecanum(odom->phi, data.d, data.r, enc->omegaVals, odom->q_dot); // q_dot = {phi_dot, x_dot, y_dot}
+	globalSpeedsFromUMecanum(odom->phi, data.x_off, data.y_off, data.r, enc->omegaVals, odom->q_dot); // q_dot = {phi_dot, x_dot, y_dot}
 //	globalSpeedsFromU(odom->phi, data.d, data.r, ctrl_out->u, odom->q_dot); // q_dot = {phi_dot, x_dot, y_dot}
 
 	odom->phi    += odom->q_dot[0] * dt;         // Integrated angular velocity
