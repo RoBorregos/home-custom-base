@@ -150,15 +150,35 @@ typedef struct {
 } CtrlTsk_Data;
 
 typedef enum {
-    ODRIVE_CMD_NONE = 0x00,
-    ODRIVE_CMD_SET_VEL = 0x01,
-    ODRIVE_CMD_SET_STATE = 0x02,
-    ODRIVE_CMD_CLEAR_ERRORS = 0x03,
+    /* Runtime control commands */
+    ODRIVE_CMD_NONE                = 0x00,
+    ODRIVE_CMD_SET_VEL             = 0x01,
+    ODRIVE_CMD_SET_STATE           = 0x02,
+    ODRIVE_CMD_CLEAR_ERRORS        = 0x03,
     ODRIVE_CMD_SET_CONTROLLER_MODE = 0x04,
-    ODRIVE_CMD_SET_LIMITS = 0x05,
-	ODRIVE_CMD_SET_POS = 0x06,
-	ODRIVE_CMD_STOP_ODRIVES = 0x07
+    ODRIVE_CMD_SET_LIMITS          = 0x05,
+    ODRIVE_CMD_SET_POS             = 0x06,
+    ODRIVE_CMD_STOP_ODRIVES        = 0x07,
+    /* Configuration / state-machine sub-commands */
+    ODRIVE_CFG_CLEAR_ERRORS        = 0x20,
+    ODRIVE_CFG_SET_STATE           = 0x21,
+    ODRIVE_CFG_SET_CTRL_MODE       = 0x22,
+    ODRIVE_CFG_SET_LIMITS          = 0x23,
+    ODRIVE_CFG_SET_POS_GAIN        = 0x24,
+    ODRIVE_CFG_SET_VEL_GAINS       = 0x25,
+    ODRIVE_CFG_STARTUP             = 0x26,
+    ODRIVE_CFG_REBOOT              = 0x27,
+    ODRIVE_CFG_SET_TORQUE          = 0x28,
+    ODRIVE_CFG_STOP                = 0x29,
+    ODRIVE_CFG_SET_INPUT_POS       = 0x30,
 } ODriveCmdType;
+
+typedef enum {
+    SM_BOOT    = 0,
+    SM_STARTUP = 1,
+    SM_RUNNING = 2,
+    SM_IDLE    = 3,
+} ODriveSMState;
 
 typedef enum {
     CMD_SOURCE_ROS = 1,

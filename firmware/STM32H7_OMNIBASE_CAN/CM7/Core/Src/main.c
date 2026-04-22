@@ -36,6 +36,7 @@
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
 
+
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
@@ -181,6 +182,9 @@ static void MX_FDCAN1_Init(void);
 static void MX_USART2_UART_Init(void);
 void StartDefaultTask(void *argument);
 void start_UART_RX_Task(void *argument);
+void UART_RX_ParseLine(const char *line_buf, ODriveCmdMsg *odrive_cmd,
+                       osMessageQueueId_t UART_QueueHandle,
+                       osMessageQueueId_t URX_2_CAN_QueueHandle);
 void Start_UART_TX_Task(void *argument);
 void StartControlTask(void *argument);
 void StartODriveTask(void *argument);
@@ -377,7 +381,7 @@ Error_Handler();
   MX_TIM13_Init();
   MX_TIM14_Init();
   MX_TIM15_Init();
-//  MX_I2C1_Init();
+  MX_I2C1_Init();
 //  MX_SPI1_Init();
   MX_FDCAN1_Init();
   MX_USART2_UART_Init();
@@ -1592,21 +1596,6 @@ void start_UART_RX_Task(void *argument)
 
 	ODriveCmdMsg odrive_cmd = {0};
 
-	osStatus_t qst;
-
-	uint8_t parsed;
-
-	odrive_cmd.type = ODRIVE_CMD_SET_VEL;
-	odrive_cmd.target_mask = 0x0F;
-
-	odrive_cmd.robot_twist[0] = 0.0;
-	odrive_cmd.robot_twist[1] = 0.0;
-	odrive_cmd.robot_twist[2] = 0.0;
-
-	for (int i = 0; i < 4; i++) {
-	    odrive_cmd.torque_ff[i] = 0.0f;
-	}
-
 	// Start the first interrupt reception
 	HAL_UART_Receive_IT(&huart3, &rx_char, 1);
 	/* Infinite loop */
@@ -1623,36 +1612,7 @@ void start_UART_RX_Task(void *argument)
 
 //					printf("📥 Full line received: \"%s\"\r\n", line_buf);
 
-					parsed = sscanf(line_buf, "%lf %lf %lf", &odrive_cmd.robot_twist[0], &odrive_cmd.robot_twist[1], &odrive_cmd.robot_twist[2]);
-
-					if (parsed == 3)
-					{
-						odrive_cmd.type = ODRIVE_CMD_SET_VEL;
-						odrive_cmd.target_mask = 0x0F;
-
-						for (int i = 0; i < 4; i++) {
-							odrive_cmd.torque_ff[i] = 0.0f;
-						}
-
-						qst = osMessageQueuePut(UART_QueueHandle, &odrive_cmd, 0, 0);
-						if (qst != osOK) printf("Failed to queue RX to UTX\r\n");
-
-						qst = osMessageQueuePut(URX_2_CAN_QueueHandle, &odrive_cmd, 0, 0);
-						if (qst != osOK) {
-						    printf("Failed to queue ODrive command\r\n");
-						} else {
-//						    printf("RX queued ODrive cmd: vx=%.3lf vy=%.3lf wz=%.3lf | URX_2_CAN count=%lu\r\n",
-//						           odrive_cmd.robot_twist[0],
-//						           odrive_cmd.robot_twist[1],
-//						           odrive_cmd.robot_twist[2],
-//						           osMessageQueueGetCount(URX_2_CAN_QueueHandle));
-						}
-
-					}
-					else
-					{
-						printf("Failed to parse: \"%s\"\r\n", line_buf);
-					}
+					UART_RX_ParseLine(line_buf, &odrive_cmd, UART_QueueHandle, URX_2_CAN_QueueHandle);
 				}
 
 				line_index = 0;
@@ -1819,25 +1779,7 @@ void ODrive_ProcessCommand(const ODriveCmdMsg *cmd, Axis odrives[], uint8_t num_
             y_dot   = cmd->robot_twist[1];
             phi_dot = cmd->robot_twist[2];
 
-//            computeNecessaryWheelSpeedsMecanum( odrive_odom->phi, x_offset, y_offset, radius, u, phi_dot, y_dot, x_dot ); // TESTING IF PHI IS NECESSARY (i think since twist is in robot frame it is not necessary)
             computeNecessaryWheelSpeedsMecanum( 0.0, x_offset, y_offset, radius, u, phi_dot, y_dot, x_dot );
-
-//            printf("TWIST: phi_d=%.3lf y_dot=%.3lf x_dot=%.3lf  Necessary Wheel Speeds: u0=%.3lf u1=%.3lf u2=%.3lf u3=%.3lf    TURNS/s   u0=%.3lf u1=%.3lf u2=%.3lf u3=%.3lf\r\n", phi_dot, y_dot, x_dot , u[0], u[1], u[2], u[3], u[0]/(2*PI), u[1]/(2*PI), u[2]/(2*PI), u[3]/(2*PI)	);
-
-//            float vels[4] = {0.5f, 1.2f, 1.0f, 1.25f};
-//
-//            while (HAL_FDCAN_GetTxFifoFreeLevel(&hfdcan1) == 0) osDelay(1);
-//
-//            st = Set_Input_Vel(&odrives[0], tx, (float)y_dot, 0.0f);//cmd->torque_ff[i]);
-//
-//            while (HAL_FDCAN_GetTxFifoFreeLevel(&hfdcan1) == 0) osDelay(1);
-//
-//            st = Set_Input_Vel(&odrives[1], tx, (float)x_dot, 0.0f);//cmd->torque_ff[i]);
-//
-//            while (HAL_FDCAN_GetTxFifoFreeLevel(&hfdcan1) == 0) osDelay(1);
-//
-//            st = Set_Input_Vel(&odrives[2], tx, (float)phi_dot, 0.0f);//cmd->torque_ff[i]);
-
 
             for (uint8_t i = 0; i < num_odrives; i++)
             {
@@ -1845,7 +1787,7 @@ void ODrive_ProcessCommand(const ODriveCmdMsg *cmd, Axis odrives[], uint8_t num_
 
                 while (HAL_FDCAN_GetTxFifoFreeLevel(&hfdcan1) == 0) osDelay(1);
 
-                st = Set_Input_Vel(&odrives[i], tx, wheel_sign[i] * (float)(u[i] / (2*PI)), 0.0f);
+                st = Set_Input_Vel(&odrives[i], tx, wheel_sign[i] * (float)((u[i] * odrives[i].gear_ratio) / (2*PI)), 0.0f);
 
                 if (st != HAL_OK) {
                     printf("CMD_SET_VEL failed on axis %u\r\n", i);
@@ -1934,6 +1876,159 @@ void ODrive_ProcessCommand(const ODriveCmdMsg *cmd, Axis odrives[], uint8_t num_
             break;
         }
 
+        /* ── CFG: clear errors ─────────────────────────────────────────── */
+        case ODRIVE_CFG_CLEAR_ERRORS:
+        {
+            for (uint8_t i = 0; i < num_odrives; i++) {
+                if (!(cmd->target_mask & (1 << i))) continue;
+                while (HAL_FDCAN_GetTxFifoFreeLevel(&hfdcan1) == 0) osDelay(1);
+                st = Clear_Errors(&odrives[i], tx);
+                if (st != HAL_OK) printf("CFG:Clear_Errors failed axis %u\r\n", i);
+            }
+            break;
+        }
+
+        /* ── CFG: set axis state ────────────────────────────────────────── */
+        case ODRIVE_CFG_SET_STATE:
+        {
+            for (uint8_t i = 0; i < num_odrives; i++) {
+                if (!(cmd->target_mask & (1 << i))) continue;
+                while (HAL_FDCAN_GetTxFifoFreeLevel(&hfdcan1) == 0) osDelay(1);
+                st = Set_Axis_Requested_State(&odrives[i], tx, cmd->axis_state);
+                if (st != HAL_OK) printf("CFG:SetState failed axis %u\r\n", i);
+            }
+            break;
+        }
+
+        /* ── CFG: set controller mode ───────────────────────────────────── */
+        case ODRIVE_CFG_SET_CTRL_MODE:
+        {
+            for (uint8_t i = 0; i < num_odrives; i++) {
+                if (!(cmd->target_mask & (1 << i))) continue;
+                while (HAL_FDCAN_GetTxFifoFreeLevel(&hfdcan1) == 0) osDelay(1);
+                st = Set_Controller_Modes(&odrives[i], tx,
+                         (Control_Mode)cmd->control_mode,
+                         (Input_Mode)cmd->input_mode);
+                if (st != HAL_OK) printf("CFG:SetCtrlMode failed axis %u\r\n", i);
+            }
+            *current_ctrl_mode  = (Control_Mode)cmd->control_mode;
+            *current_input_mode = (Input_Mode)cmd->input_mode;
+            break;
+        }
+
+        /* ── CFG: set vel / current limits ─────────────────────────────── */
+        case ODRIVE_CFG_SET_LIMITS:
+        {
+            for (uint8_t i = 0; i < num_odrives; i++) {
+                if (!(cmd->target_mask & (1 << i))) continue;
+                while (HAL_FDCAN_GetTxFifoFreeLevel(&hfdcan1) == 0) osDelay(1);
+                st = Set_Limits(&odrives[i], tx, cmd->vel_limit, cmd->curr_limit);
+                if (st != HAL_OK) printf("CFG:SetLimits failed axis %u\r\n", i);
+            }
+            break;
+        }
+
+        /* ── CFG: set position gain ─────────────────────────────────────── */
+        case ODRIVE_CFG_SET_POS_GAIN:
+        {
+            for (uint8_t i = 0; i < num_odrives; i++) {
+                if (!(cmd->target_mask & (1 << i))) continue;
+                while (HAL_FDCAN_GetTxFifoFreeLevel(&hfdcan1) == 0) osDelay(1);
+                st = Set_Position_Gain(&odrives[i], tx, cmd->pos_gain);
+                if (st != HAL_OK) printf("CFG:SetPosGain failed axis %u\r\n", i);
+            }
+            break;
+        }
+
+        /* ── CFG: set velocity gains ────────────────────────────────────── */
+        case ODRIVE_CFG_SET_VEL_GAINS:
+        {
+            for (uint8_t i = 0; i < num_odrives; i++) {
+                if (!(cmd->target_mask & (1 << i))) continue;
+                while (HAL_FDCAN_GetTxFifoFreeLevel(&hfdcan1) == 0) osDelay(1);
+                st = Set_Vel_Gains(&odrives[i], tx, cmd->vel_gain, cmd->vel_int_gain);
+                if (st != HAL_OK) printf("CFG:SetVelGains failed axis %u\r\n", i);
+            }
+            break;
+        }
+
+        /* ── CFG: full startup sequence ─────────────────────────────────── */
+        case ODRIVE_CFG_STARTUP:
+        {
+            HAL_StatusTypeDef startup_st = ODrive_Startup(
+                odrives, num_odrives, tx,
+                (Control_Mode)cmd->control_mode,
+                (Input_Mode)cmd->input_mode,
+                cmd->axis_state);
+            if (startup_st != HAL_OK)
+                printf("CFG:Startup failed\r\n");
+            else {
+                *current_ctrl_mode  = (Control_Mode)cmd->control_mode;
+                *current_input_mode = (Input_Mode)cmd->input_mode;
+            }
+            break;
+        }
+
+        /* ── CFG: reboot ────────────────────────────────────────────────── */
+        case ODRIVE_CFG_REBOOT:
+        {
+            for (uint8_t i = 0; i < num_odrives; i++) {
+                if (!(cmd->target_mask & (1 << i))) continue;
+                while (HAL_FDCAN_GetTxFifoFreeLevel(&hfdcan1) == 0) osDelay(1);
+                st = Reboot_ODrive(&odrives[i], tx);
+                if (st != HAL_OK) printf("CFG:Reboot failed axis %u\r\n", i);
+            }
+            break;
+        }
+
+        /* ── CFG: set input torque ──────────────────────────────────────── */
+        case ODRIVE_CFG_SET_TORQUE:
+        {
+            for (uint8_t i = 0; i < num_odrives; i++) {
+                if (!(cmd->target_mask & (1 << i))) continue;
+                while (HAL_FDCAN_GetTxFifoFreeLevel(&hfdcan1) == 0) osDelay(1);
+                st = Set_Input_Torque(&odrives[i], tx, cmd->torque_ff[i]);
+                if (st != HAL_OK) printf("CFG:SetTorque failed axis %u\r\n", i);
+            }
+            break;
+        }
+
+        /* ── CFG: stop (vel=0 then IDLE) ────────────────────────────────── */
+        case ODRIVE_CFG_STOP:
+        {
+            for (uint8_t i = 0; i < num_odrives; i++) {
+                if (!(cmd->target_mask & (1 << i))) continue;
+                while (HAL_FDCAN_GetTxFifoFreeLevel(&hfdcan1) == 0) osDelay(1);
+                Set_Input_Vel(&odrives[i], tx, 0.0f, 0.0f);
+            }
+            osDelay(50);
+            for (uint8_t i = 0; i < num_odrives; i++) {
+                if (!(cmd->target_mask & (1 << i))) continue;
+                while (HAL_FDCAN_GetTxFifoFreeLevel(&hfdcan1) == 0) osDelay(1);
+                Set_Axis_Requested_State(&odrives[i], tx, IDLE);
+            }
+            break;
+        }
+
+        /* ── CFG: set input position ────────────────────────────────────── */
+        case ODRIVE_CFG_SET_INPUT_POS:
+        {
+            if (*current_ctrl_mode != POSITION_CONTROL) {
+                printf("CFG:SetInputPos rejected: not in POSITION_CONTROL\r\n");
+                break;
+            }
+            for (uint8_t i = 0; i < num_odrives; i++) {
+                if (!(cmd->target_mask & (1 << i))) continue;
+                while (HAL_FDCAN_GetTxFifoFreeLevel(&hfdcan1) == 0) osDelay(1);
+                st = Set_Input_Pos(&odrives[i], tx,
+                         cmd->input_pos_target,
+                         (int16_t)(cmd->input_pos_vel_ff * 1000.0f),
+                         (int16_t)(cmd->input_pos_trq_ff * 1000.0f));
+                if (st != HAL_OK) printf("CFG:SetInputPos failed axis %u\r\n", i);
+            }
+            break;
+        }
+
         default:
             printf("Unknown ODrive command type\r\n");
             break;
@@ -1966,7 +2061,7 @@ void ODrive_UpdateTelemetryAndOdometry(Axis odrives[], uint8_t num_odrives, ODri
         msg->updated[i] = odrives[i].UPDATED;
         odrives[i].UPDATED = 0;
 
-        u[i] = wheel_sign[i] * odrives[i].AXIS_Encoder_Vel * 2.0 * PI;
+        u[i] = wheel_sign[i] * (odrives[i].AXIS_Encoder_Vel / odrives[i].gear_ratio) * 2.0 * PI;
     }
 
     globalSpeedsFromUMecanum(*theta, x_offset, y_offset, radius, u, q_dot);
@@ -2008,180 +2103,264 @@ osStatus_t ODrive_PushLatestTelemetry(osMessageQueueId_t queue, const ODriveTele
 }
 
 
+void UART_RX_ParseLine(const char *line_buf, ODriveCmdMsg *odrive_cmd,
+                       osMessageQueueId_t UART_QueueHandle_arg,
+                       osMessageQueueId_t URX_2_CAN_QueueHandle_arg)
+{
+    int msg_type = 0;
+    osStatus_t qst;
+
+    if (sscanf(line_buf, "%d", &msg_type) != 1) {
+        printf("Parse error (no type): \"%s\"\r\n", line_buf);
+        return;
+    }
+
+    /* Type 1: control command */
+    if (msg_type == 1) {
+        double vx = 0.0, vy = 0.0, wz = 0.0;
+        int parsed = sscanf(line_buf, "%*d %lf %lf %lf", &vx, &vy, &wz);
+
+        if (parsed == 3) {
+            odrive_cmd->type           = ODRIVE_CMD_SET_VEL;
+            odrive_cmd->target_mask    = 0x0F;
+            odrive_cmd->robot_twist[0] = vx;
+            odrive_cmd->robot_twist[1] = vy;
+            odrive_cmd->robot_twist[2] = wz;
+            for (int i = 0; i < 4; i++) odrive_cmd->torque_ff[i] = 0.0f;
+
+            qst = osMessageQueuePut(UART_QueueHandle_arg, odrive_cmd, 0, 0);
+            if (qst != osOK) printf("Failed to queue ctrl to UTX\r\n");
+
+            qst = osMessageQueuePut(URX_2_CAN_QueueHandle_arg, odrive_cmd, 0, 0);
+            if (qst != osOK) printf("Failed to queue ctrl to CAN\r\n");
+        } else {
+            printf("Type-1 parse fail: \"%s\"\r\n", line_buf);
+        }
+
+    /* Type 2: configuration command */
+    } else if (msg_type == 2) {
+        int sub_type = 0;
+        unsigned int mask_u = 0x0F;
+
+        if (sscanf(line_buf, "%*d %d %x", &sub_type, &mask_u) < 2) {
+            printf("Type-2 parse fail (sub/mask): \"%s\"\r\n", line_buf);
+            return;
+        }
+
+        ODriveCmdMsg cfg_cmd = {0};
+        cfg_cmd.type        = (uint8_t)sub_type;
+        cfg_cmd.target_mask = (uint8_t)(mask_u & 0x0F);
+
+        switch ((ODriveCmdType)sub_type) {
+            case ODRIVE_CFG_SET_STATE: {
+                int state = 0;
+                sscanf(line_buf, "%*d %*d %*x %d", &state);
+                cfg_cmd.axis_state = (uint8_t)state;
+                break;
+            }
+            case ODRIVE_CFG_SET_CTRL_MODE: {
+                int cm = 0, im = 0;
+                sscanf(line_buf, "%*d %*d %*x %d %d", &cm, &im);
+                cfg_cmd.control_mode = (uint8_t)cm;
+                cfg_cmd.input_mode   = (uint8_t)im;
+                break;
+            }
+            case ODRIVE_CFG_SET_LIMITS: {
+                float vl = 0.0f, cl = 0.0f;
+                sscanf(line_buf, "%*d %*d %*x %f %f", &vl, &cl);
+                cfg_cmd.vel_limit  = vl;
+                cfg_cmd.curr_limit = cl;
+                break;
+            }
+            case ODRIVE_CFG_SET_POS_GAIN: {
+                float pg = 0.0f;
+                sscanf(line_buf, "%*d %*d %*x %f", &pg);
+                cfg_cmd.pos_gain = pg;
+                break;
+            }
+            case ODRIVE_CFG_SET_VEL_GAINS: {
+                float vg = 0.0f, vi = 0.0f;
+                sscanf(line_buf, "%*d %*d %*x %f %f", &vg, &vi);
+                cfg_cmd.vel_gain     = vg;
+                cfg_cmd.vel_int_gain = vi;
+                break;
+            }
+            case ODRIVE_CFG_STARTUP: {
+                int cm = 2, im = 1, st = 8;
+                sscanf(line_buf, "%*d %*d %*x %d %d %d", &cm, &im, &st);
+                cfg_cmd.control_mode = (uint8_t)cm;
+                cfg_cmd.input_mode   = (uint8_t)im;
+                cfg_cmd.axis_state   = (uint8_t)st;
+                break;
+            }
+            case ODRIVE_CFG_SET_TORQUE: {
+                float tq = 0.0f;
+                sscanf(line_buf, "%*d %*d %*x %f", &tq);
+                cfg_cmd.torque_ff[0] = cfg_cmd.torque_ff[1] =
+                cfg_cmd.torque_ff[2] = cfg_cmd.torque_ff[3] = tq;
+                break;
+            }
+            case ODRIVE_CFG_SET_INPUT_POS: {
+                float pos = 0.0f, vff = 0.0f, tff = 0.0f;
+                sscanf(line_buf, "%*d %*d %*x %f %f %f", &pos, &vff, &tff);
+                cfg_cmd.input_pos_target = pos;
+                cfg_cmd.input_pos_vel_ff = vff;
+                cfg_cmd.input_pos_trq_ff = tff;
+                break;
+            }
+            default:
+                break;
+        }
+
+        qst = osMessageQueuePut(URX_2_CAN_QueueHandle_arg, &cfg_cmd, 0, 0);
+        if (qst != osOK) printf("Failed to queue cfg to CAN\r\n");
+
+    } else {
+        printf("Unknown msg_type %d: \"%s\"\r\n", msg_type, line_buf);
+    }
+}
+
 /* USER CODE END Header_StartODriveTask */
+
 void StartODriveTask(void *argument)
 {
   /* USER CODE BEGIN StartODriveTask */
 
-	printf("\nODrive CAN TASK TEST\r\n");
+    printf("\nODrive Task (State Machine)\r\n");
 
-	double x = 0.0f, y = 0.0f, theta = 0.0f;
-	uint32_t now = osKernelGetTickCount();
-	uint32_t last_telem_tick = now;
-	uint32_t last_cmd_tick = now;
-	uint32_t telemetry_period = 10;
-	uint32_t delta_t = 0;
+    const uint8_t num_odrives  = 4;
+    const double  x_offset     = 0.3;
+    const double  y_offset     = 0.3;
+    const double  radius       = 0.1;
+    const double  wheel_sign[4] = { -1.0, 1.0, -1.0, 1.0 };
 
+    odrives[0].NODE_ID = 36;
+    odrives[1].NODE_ID = 34;
+    odrives[2].NODE_ID = 33;
+    odrives[3].NODE_ID = 40;
 
-	double u[4] = {0.0};
-	double q_dot[3] = {0.0};
-	Control_Mode current_ctrl_mode = VELOCITY_CONTROL;
-	Input_Mode current_input_mode = PASSTHROUGH;
+    ODriveSMState sm_state = SM_BOOT;
+    Control_Mode  current_ctrl_mode  = VELOCITY_CONTROL;
+    Input_Mode    current_input_mode = PASSTHROUGH;
 
-	uint32_t TIMEOUT_ODRIVE_CMD_MS = 500;
+    const uint32_t boot_delay_ms = 3000;
+    uint32_t boot_tick = osKernelGetTickCount();
 
-	// ROBOT DATA
-	uint8_t num_odrives = 4;
-		// Wheel offsets relative to robot center
-	double x_offset = 0.3; //m
-	double y_offset = 0.3; //m
-		// Wheel radius
-	double radius = 0.1; //m
+    double x = 0.0, y = 0.0, theta = 0.0;
+    double u[4]     = {0.0};
+    double q_dot[3] = {0.0};
+    ODriveCmdMsg  cmd         = {0};
+    ODriveTelemetryMsg telemetryMsg = {0};
+    OdomData *odrive_odom = &telemetryMsg.odom;
+    FDCAN_TXmsg tx = {0};
 
-//	ODriveCmdMsg lastCmd = {0};
-	ODriveCmdMsg cmd;
-	ODriveTelemetryMsg telemetryMsg = {0};
-	OdomData *odrive_odom = &telemetryMsg.odom;
-	osStatus_t qst;
+    uint32_t now, last_telem_tick = osKernelGetTickCount();
+    const uint32_t telemetry_period = 10;
+    osStatus_t qst;
 
-	uint8_t cmd_watchdog_triggered = 0;
-	const uint8_t all_axes_mask = (1U << num_odrives) - 1U;
+    uint8_t usingIMU = 0;
+    bno055_vector_t euler = {0,0,0,0};
+    if (usingIMU) {
+        bno055_assignI2C(&hi2c1);
+        bno055_setup();
+        bno055_setOperationModeNDOF();
+    }
 
-	odrives[0].NODE_ID = 36;
-	odrives[1].NODE_ID = 34;
-	odrives[2].NODE_ID = 33;
-	odrives[3].NODE_ID = 40;
+    osDelay(1);
 
-	FDCAN_TXmsg tx = {0};
+    for (;;)
+    {
+        now = osKernelGetTickCount();
 
-	HAL_StatusTypeDef st;
-	uint32_t startup_attempt = 0;
-	uint32_t max_startup_attempts = 20;
+        if (usingIMU) euler = bno055_getVectorEuler();
+        telemetryMsg.imu.yaw   = euler.x;
+        telemetryMsg.imu.roll  = euler.y;
+        telemetryMsg.imu.pitch = euler.z;
 
-	double wheel_sign[4] = {
-	   -1.0,   // FL
-	    1.0,   // FR
-	   -1.0,   // BL
-	    1.0    // BR
-	};
+        qst = osMessageQueueGet(URX_2_CAN_QueueHandle, &cmd, NULL, 2);
 
-	do {
-	    startup_attempt++;
-	    st = ODrive_Startup(odrives, num_odrives, &tx, VELOCITY_CONTROL, PASSTHROUGH, CLOSED_LOOP_CONTROL);
+        switch (sm_state)
+        {
+            case SM_BOOT:
+            {
+                if (qst == osOK && cmd.type == ODRIVE_CFG_STARTUP) {
+                    printf("SM: BOOT->STARTUP (cmd)\r\n");
+                    sm_state = SM_STARTUP;
+                    ODrive_ProcessCommand(&cmd, odrives, num_odrives, &tx, odrive_odom, x_offset, y_offset, radius, &current_ctrl_mode, &current_input_mode, (double*)wheel_sign, telemetryMsg.IK_computed_wheel_speeds);
+                    sm_state = SM_RUNNING;
+                }
+                else if ((now - boot_tick) >= boot_delay_ms) {
+                    printf("SM: BOOT->STARTUP (auto)\r\n");
+                    sm_state = SM_STARTUP;
+                    HAL_StatusTypeDef st = ODrive_Startup(odrives, num_odrives, &tx, VELOCITY_CONTROL, PASSTHROUGH, CLOSED_LOOP_CONTROL);
+                    if (st == HAL_OK) {
+                        current_ctrl_mode  = VELOCITY_CONTROL;
+                        current_input_mode = PASSTHROUGH;
+                        sm_state = SM_RUNNING;
+                        printf("SM: STARTUP->RUNNING\r\n");
+                    } else {
+                        printf("SM: Startup failed, retrying\r\n");
+                        sm_state = SM_BOOT;
+                        boot_tick = osKernelGetTickCount();
+                    }
+                }
+                break;
+            }
 
-	    if (st != HAL_OK) {
-	        printf("ODrive startup failed, retry %lu\r\n", startup_attempt);
-	        osDelay(100);
-	    }
+            case SM_STARTUP:
+                sm_state = SM_RUNNING;
+                break;
 
-	} while ((st != HAL_OK) && (startup_attempt < max_startup_attempts));
+            case SM_RUNNING:
+            {
+                if (qst == osOK) {
+                    if (cmd.type == ODRIVE_CFG_STOP) {
+                        printf("SM: RUNNING->IDLE (stop)\r\n");
+                        ODrive_ProcessCommand(&cmd, odrives, num_odrives, &tx, odrive_odom, x_offset, y_offset, radius, &current_ctrl_mode, &current_input_mode, (double*)wheel_sign, telemetryMsg.IK_computed_wheel_speeds);
+                        sm_state = SM_IDLE;
+                        break;
+                    }
+                    if (cmd.type == ODRIVE_CFG_REBOOT) {
+                        printf("SM: RUNNING->BOOT (reboot)\r\n");
+                        ODrive_ProcessCommand(&cmd, odrives, num_odrives, &tx, odrive_odom, x_offset, y_offset, radius, &current_ctrl_mode, &current_input_mode, (double*)wheel_sign, telemetryMsg.IK_computed_wheel_speeds);
+                        sm_state = SM_BOOT;
+                        boot_tick = osKernelGetTickCount();
+                        break;
+                    }
+                    ODrive_ProcessCommand(&cmd, odrives, num_odrives, &tx, odrive_odom, x_offset, y_offset, radius, &current_ctrl_mode, &current_input_mode, (double*)wheel_sign, telemetryMsg.IK_computed_wheel_speeds);
+                }
+                break;
+            }
 
-//	st = Set_Input_Vel(&odrives[1], &tx, 2.4, 0.0f);//cmd->torque_ff[i]);
+            case SM_IDLE:
+            {
+                if (qst == osOK && cmd.type == ODRIVE_CFG_STARTUP) {
+                    printf("SM: IDLE->STARTUP\r\n");
+                    ODrive_ProcessCommand(&cmd, odrives, num_odrives, &tx,
+                        odrive_odom, x_offset, y_offset, radius,
+                        &current_ctrl_mode, &current_input_mode,
+                        (double*)wheel_sign,
+                        telemetryMsg.IK_computed_wheel_speeds);
+                    sm_state = SM_RUNNING;
+                }
+                break;
+            }
+        }
 
-//	uint8_t usingIMU = 0;
-//	bno055_vector_t BNO055_EulerVector = {0.0,0.0,0.0,0.0};
-//	if (usingIMU) {
-//	  bno055_assignI2C(&hi2c1);
-//	  bno055_setup();
-//	  bno055_setOperationModeNDOF();
-//	  BNO055_EulerVector = bno055_getVectorEuler();
-//	}
+        uint32_t delta_t = now - last_telem_tick;
+        if (delta_t >= telemetry_period) {
+            ODrive_UpdateTelemetryAndOdometry(
+                odrives, num_odrives, &telemetryMsg, odrive_odom,
+                &x, &y, &theta,
+                x_offset, y_offset, radius,
+                u, q_dot, delta_t, (double*)wheel_sign);
 
-	osDelay(1);
+            ODrive_PushLatestTelemetry(CAN_2_UTX_QueueHandle, &telemetryMsg);
+            last_telem_tick = now;
+        }
 
-  /* Infinite loop */
-  for(;;)
-  {
-	  now = osKernelGetTickCount();
-//	  printf("ODriveTask waiting on URX_2_CAN, current count=%lu\r\n",
-//	         osMessageQueueGetCount(URX_2_CAN_QueueHandle));
-
-//	  BNO055_EulerVector = bno055_getVectorEuler();
-//	  telemetryMsg.imu.yaw = BNO055_EulerVector.x;  telemetryMsg.imu.roll = BNO055_EulerVector.y;  telemetryMsg.imu.pitch = BNO055_EulerVector.z;
-//	  printf("IMU_yaw=%.2f,IMU_roll=%.2f,IMU_pitch=%.2f", telemetryMsg.imu.yaw , telemetryMsg.imu.roll, telemetryMsg.imu.pitch);
-
-	  qst = osMessageQueueGet(URX_2_CAN_QueueHandle, &cmd, NULL, 2);
-	  if (qst == osOK) {
-//	      printf("ODriveTask got cmd: vx=%.3lf vy=%.3lf wz=%.3lf\r\n",
-//	             cmd.robot_twist[0], cmd.robot_twist[1], cmd.robot_twist[2]);
-
-	      // process command
-		  ODrive_ProcessCommand(&cmd, odrives, num_odrives, &tx, odrive_odom, x_offset, y_offset, radius, &current_ctrl_mode, &current_input_mode, wheel_sign, telemetryMsg.IK_computed_wheel_speeds);
-		  last_cmd_tick = osKernelGetTickCount();
-		  cmd_watchdog_triggered = 0;
-
-//		  // Fake odometry from received command
-//		  telemetryMsg.odom.q_dot[1] = cmd.robot_twist[0]; // vx
-//		  telemetryMsg.odom.q_dot[2] = cmd.robot_twist[1]; // vy
-//		  telemetryMsg.odom.q_dot[0] = cmd.robot_twist[2]; // wz
-//
-//		  double dt_s = 0.01; // or from delta_t
-//		  x += cmd.robot_twist[0] * dt_s;
-//		  y += cmd.robot_twist[1] * dt_s;
-//		  theta += cmd.robot_twist[2] * dt_s;
-//
-//		  telemetryMsg.odom.x_pos = x;
-//		  telemetryMsg.odom.y_pos = y;
-//		  telemetryMsg.odom.phi   = theta;
-//
-//		  // Fake axis data so TX has something visible
-//		  for (int i = 0; i < 4; i++) {
-//			  telemetryMsg.node_id[i] = 33 + i;
-//			  telemetryMsg.axis_error[i] = 0;
-//			  telemetryMsg.axis_state[i] = CLOSED_LOOP_CONTROL;
-//			  telemetryMsg.controller_status[i] = VELOCITY_CONTROL;
-//			  telemetryMsg.pos_est[i] += 0.1f;
-//			  telemetryMsg.vel_est[i] = (float)cmd.robot_twist[0];
-//			  telemetryMsg.encoder_shadow[i] += 1;
-//			  telemetryMsg.encoder_cpr[i] = 8192;
-//			  telemetryMsg.bus_voltage[i] = 24.0f;
-//			  telemetryMsg.bus_current[i] = 0.5f;
-//			  telemetryMsg.iq_setpoint[i] = 0.1f;
-//			  telemetryMsg.iq_measured[i] = 0.1f;
-//			  telemetryMsg.updated[i] = 1;
-//		  }
-//
-//		  telemetryMsg.timestamp_ms = osKernelGetTickCount();
-//
-//		  qst = ODrive_PushLatestTelemetry(CAN_2_UTX_QueueHandle, &telemetryMsg);
-//		  if (qst != osOK) {
-//			  printf("Failed to push latest telemetry\r\n");
-//		  }
-
-	  } else {
-//		  printf("ODriveTask get failed: %d\r\n", qst);
-	  }
-
-//	  // WATCHDOG that sends 0 to all motors if no command is sent after (CMD_TIMEOUT_MS) ms
-//	  if (((now - last_cmd_tick) >= TIMEOUT_ODRIVE_CMD_MS) && (cmd_watchdog_triggered == 0))
-//	  {
-//		  printf("ODrive CMD timeout -> stopping all motors\r\n");
-//
-//		  ODriveCmdMsg watchdog_cmd = {0};
-//		  watchdog_cmd.type = ODRIVE_CMD_STOP_ODRIVES;
-//		  watchdog_cmd.target_mask = all_axes_mask;
-//
-//		  ODrive_ProcessCommand(&watchdog_cmd, odrives, num_odrives, &tx, odrive_odom, x_offset, y_offset, radius, &current_ctrl_mode, &current_input_mode);
-//
-//		  cmd_watchdog_triggered = 1;
-//	  }
-
-	  delta_t = now - last_telem_tick;
-	  if ((delta_t) >= telemetry_period)   // 10ms = 100 Hz
-	      {
-
-	          ODrive_UpdateTelemetryAndOdometry(odrives, num_odrives, &telemetryMsg, odrive_odom, &x, &y, &theta, x_offset, y_offset, radius, u, q_dot, delta_t, wheel_sign);
-
-	          qst = ODrive_PushLatestTelemetry(CAN_2_UTX_QueueHandle, &telemetryMsg);
-	          if (qst != osOK) printf("Failed to push latest telemetry\r\n");
-
-
-	          last_telem_tick = now;
-	      }
-
-
-	  osDelay(1);
-  }
+        osDelay(1);
+    }
   /* USER CODE END StartODriveTask */
 }
 

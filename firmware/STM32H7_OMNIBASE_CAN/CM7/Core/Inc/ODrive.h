@@ -47,6 +47,7 @@ typedef struct Axis
     uint8_t  AXIS_Current_State;
     uint8_t  Controller_Status;
     volatile uint8_t UPDATED;
+    uint8_t  gear_ratio;
 } Axis;
 
 /* Axis States */
