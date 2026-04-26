@@ -48,6 +48,7 @@ import threading
 import time
 from typing import List, Dict, Any
 
+from ament_index_python import get_package_share_directory
 import rclpy
 from rcl_interfaces.msg import SetParametersResult
 from rclpy.node import Node
@@ -83,7 +84,9 @@ CFG_SET_INPUT_POS = 0x30
 #  DASHBOARD HTML
 # ─────────────────────────────────────────────────────────────────────────────
 from pathlib import Path
-DASHBOARD_HTML = (Path(__file__).parent / 'dashboard.html').read_text()
+DASHBOARD_HTML = (
+    Path(get_package_share_directory('odrive_comm')) / 'assets' / 'dashboard.html'
+).read_text()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
