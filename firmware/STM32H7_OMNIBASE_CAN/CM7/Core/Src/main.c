@@ -1,8 +1,23 @@
 /* USER CODE BEGIN Header */
 /**
   ******************************************************************************
-  * @file           : main.c
-  * @brief          : Main program body
+  * @file           : main_current_bluetooth.c
+  * @brief          : main.c + BT_RX_Task (ESP32/Bluetooth UART on USART2)
+  *
+  * HOW TO TEST WITHOUT ODRIVES:
+  *   Set CAN_STUB to 1 (default below).  FDCAN switches to internal-loopback
+  *   mode so CAN TX completes without needing an external node/ACK — the
+  *   ODriveTask state machine runs, queues are exercised, and the BT UART
+  *   path works normally.  Set CAN_STUB to 0 when ODrives are connected.
+  *
+  * BT PROTOCOL (USART2, 115200 baud, same as ESP32 UART):
+  *   Type-3 message from ESP32: "3 <vx> <vy> <wz> <buttons_hex>\r\n"
+  *   example: "3 0.5 0.0 0.0 00\r\n"
+  *
+  * SOURCE PRIORITY:
+  *   BT (ESP32) overrides ROS for BT_OVERRIDE_TIMEOUT_MS (500 ms).
+  *   If no BT packet arrives within that window the robot stops and ROS
+  *   regains control.  Bit 3 of the buttons field is an emergency stop.
   ******************************************************************************
   * @attention
   *
@@ -36,7 +51,6 @@
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
 
-
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
@@ -46,10 +60,32 @@
 #define HSEM_ID_0 (0U) /* HW semaphore 0*/
 #endif
 
+/* Set to 1 to run without ODrives on the CAN bus.
+   FDCAN switches to INTERNAL_LOOPBACK: TX completes without external ACK so
+   nothing blocks.  The state machine and BT/UART paths work normally.
+   Set to 0 for real hardware with ODrives connected. */
+#define CAN_STUB 0
+
+/* Set to 1 when the BNO055 IMU is physically connected on I2C1.
+   Set to 0 to skip I2C1 init and all bno055 calls (euler stays {0,0,0}). */
+#define IMU_ENABLED 1
+
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
 /* USER CODE BEGIN PM */
+
+/* Wait for a free FDCAN TX FIFO slot with a 50 ms hard timeout.
+   Without this, a dead/missing ODrive freezes the task indefinitely. */
+#define FDCAN_WAIT_TX_FREE() do { \
+    uint32_t _t0 = osKernelGetTickCount(); \
+    while (HAL_FDCAN_GetTxFifoFreeLevel(&hfdcan1) == 0) { \
+        if ((osKernelGetTickCount() - _t0) > 50u) { \
+            printf("CAN TX timeout\r\n"); break; \
+        } \
+        osDelay(1); \
+    } \
+} while (0)
 
 /* USER CODE END PM */
 
@@ -85,6 +121,13 @@ const osThreadAttr_t defaultTask_attributes = {
 osThreadId_t UART_RX_TaskHandle;
 const osThreadAttr_t UART_RX_Task_attributes = {
   .name = "UART_RX_Task",
+  .stack_size = 1024 * 4,
+  .priority = (osPriority_t) osPriorityHigh,
+};
+/* Definitions for BT_RX_Task — receives velocity commands from ESP32 via USART2 */
+osThreadId_t BT_RX_TaskHandle;
+const osThreadAttr_t BT_RX_Task_attributes = {
+  .name = "BT_RX_Task",
   .stack_size = 1024 * 4,
   .priority = (osPriority_t) osPriorityHigh,
 };
@@ -188,6 +231,7 @@ void UART_RX_ParseLine(const char *line_buf, ODriveCmdMsg *odrive_cmd,
 void Start_UART_TX_Task(void *argument);
 void StartControlTask(void *argument);
 void StartODriveTask(void *argument);
+void start_BT_RX_Task(void *argument);  /* ESP32 Bluetooth UART receiver */
 
 /* USER CODE BEGIN PFP */
 
@@ -196,38 +240,11 @@ void StartODriveTask(void *argument);
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
 
-/**
- * @brief Computes the delta between two encoder counter values.
- * @details
- * Subtracts the previous encoder count from the current count and casts
- * the result to a signed 16-bit integer to handle the wrap around
- * example with 16bit encoder counters: 10 - 65530 = (int16) -16.
- *
- * @param[in] current Current encoder count.
- * @param[in] previous Previous encoder count.
- * @return Signed difference in counts.
- */
 int16_t computeDeltaCNT(uint16_t current, uint16_t previous) {
 	int16_t delta = (int16_t)(current - previous);
 	return delta;
 }
 
-
-/**
-* @brief Sets the direction of a motor using two GPIO pins.
-* @details
-* Drives the motor direction pins based on the given `dir` value:
-* - `dir == 0`: Sets pin1 low, pin2 high.
-* - `dir == 1`: Sets pin1 high, pin2 low.
-* - `dir >= 2`: Sets both pins low (motor off/brake).
-*
-* Modifies the port's Output Data Register (`ODR`) directly.
-*
-* @param[in] port Pointer to the GPIO port structure.
-* @param[in] pin1 First GPIO pin number (0–15).
-* @param[in] pin2 Second GPIO pin number (0–15).
-* @param[in] dir Direction code (0=reverse, 1=forward, 2=off).
-*/
 void setMotorDirection(GPIO_TypeDef *port, uint16_t pin1, uint16_t pin2, uint8_t dir) {
 	if (dir < 2) {
 		dir ? (port->ODR |= (1 << pin1)) : (port->ODR &= ~(1 << pin1));
@@ -238,75 +255,22 @@ void setMotorDirection(GPIO_TypeDef *port, uint16_t pin1, uint16_t pin2, uint8_t
 	}
 }
 
-
-
-/**
-* @brief Computes wheel angular velocities for a mecanum-wheel robot.
-* @details
-* Uses robot orientation `phi`, wheel offsets (`x_off`, `y_off`), wheel
-* radius `r`, and desired body-frame velocities to compute per-wheel
-* angular speeds `u[0..3]`.
-*
-* @param[in] phi Robot heading in radians.
-* @param[in] x_off Wheel X offset from robot center.
-* @param[in] y_off Wheel Y offset from robot center.
-* @param[in] r Wheel radius.
-* @param[out] u Array of 4 wheel angular velocities (turns/s).
-* @param[in] phi_dot Desired angular velocity about Z axis (rad/s).
-* @param[in] y_dot Desired Y velocity in body frame (m/s).
-* @param[in] x_dot Desired X velocity in body frame (m/s).
-* @return Always returns 0.
-*/
 int computeNecessaryWheelSpeedsMecanum(double phi, double x_off, double y_off, double r, double u[4], double phi_dot, double y_dot, double x_dot) {
 	u[0] = (x_dot*(cos(phi) + sin(phi)) - y_dot*(cos(phi) - sin(phi)) - phi_dot*(x_off + y_off)) / r;
     u[1] = (x_dot*(cos(phi) - sin(phi)) + y_dot*(cos(phi) + sin(phi)) + phi_dot*(x_off + y_off)) / r;
     u[2] = (x_dot*(cos(phi) + sin(phi)) - y_dot*(cos(phi) - sin(phi)) + phi_dot*(x_off + y_off)) / r;
     u[3] = (x_dot*(cos(phi) - sin(phi)) + y_dot*(cos(phi) + sin(phi)) - phi_dot*(x_off + y_off)) / r;
-
     return 0;
 }
 
-
-/**
-* @brief Computes global angular and linear velocities from mecanum-wheel speeds.
-* @details
-* Converts per-wheel angular velocities `u[0..3]` into global frame
-* velocities `q_dot[0]` (angular), `q_dot[1]` (X), and `q_dot[2]` (Y)
-* using robot heading `phi`, wheel offsets (`x_off`, `y_off`), and
-* wheel radius `r`.
-*
-* @param[in] phi Robot heading in radians.
-* @param[in] x_off Wheel X offset from robot center.
-* @param[in] y_off Wheel Y offset from robot center.
-* @param[in] r Wheel radius.
-* @param[in] u Array of 4 wheel angular velocities (rad/s).
-* @param[out] q_dot Array of 3 global velocities: {phi_dot, x_dot, y_dot}.
-* @return Always returns 0.
-*/
 int globalSpeedsFromUMecanum(double phi, double x_off, double y_off, double r, double u[4], double q_dot[3]) {
-    q_dot[0] = (u[1] - u[0] + u[2] - u[3]) / ((4 * (x_off + y_off)) / r); // Angular velocity
-    q_dot[1] = cos(phi)*(r/4)*(u[0] + u[1] + u[2] + u[3]) + sin(phi)*(r/4)*(u[0] - u[1] + u[2] - u[3]); // X velocity
-    q_dot[2] = sin(phi)*(r/4)*(u[0] + u[1] + u[2] + u[3]) - cos(phi)*(r/4)*(u[0] - u[1] + u[2] - u[3]); // Y velocity
-
+    q_dot[0] = (u[1] - u[0] + u[2] - u[3]) / ((4 * (x_off + y_off)) / r);
+    q_dot[1] = cos(phi)*(r/4)*(u[0] + u[1] + u[2] + u[3]) + sin(phi)*(r/4)*(u[0] - u[1] + u[2] - u[3]);
+    q_dot[2] = sin(phi)*(r/4)*(u[0] + u[1] + u[2] + u[3]) - cos(phi)*(r/4)*(u[0] - u[1] + u[2] - u[3]);
     return 0;
 }
 
-//double checkFloatRx( uint8_t floatRx[], uint8_t floatRx_size){
-//	double receivedFloat = 0;
-//	float pi = 3.141592;
-//
-//	if (floatRx[0] == 'p' && floatRx[1] == 'i'){
-//		receivedFloat = pi;
-//	}
-//	for (int i = 0; i < floatRx_size; i++) {
-//
-//	}
-//}
-
-//const float tau = 0.05f;
-//float alpha = dt / (tau + dt);
-//filteredSpeed = alpha * measuredSpeed + (1.0f - alpha) * filteredSpeed;
-
+volatile uint8_t BT_active = 0;
 
 /* USER CODE END 0 */
 
@@ -325,7 +289,6 @@ int main(void)
 /* USER CODE END Boot_Mode_Sequence_0 */
 
 /* USER CODE BEGIN Boot_Mode_Sequence_1 */
-  /* Wait until CPU2 boots and enters in stop mode or timeout*/
   timeout = 0xFFFF;
   while((__HAL_RCC_GET_FLAG(RCC_FLAG_D2CKRDY) != RESET) && (timeout-- > 0));
   if ( timeout < 0 )
@@ -333,30 +296,20 @@ int main(void)
   Error_Handler();
   }
 /* USER CODE END Boot_Mode_Sequence_1 */
-  /* MCU Configuration--------------------------------------------------------*/
 
-  /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
   HAL_Init();
 
   /* USER CODE BEGIN Init */
   setvbuf(stdin, NULL, _IONBF, 0);
   /* USER CODE END Init */
 
-  /* Configure the system clock */
   SystemClock_Config();
-
-  /* Configure the peripherals common clocks */
   PeriphCommonClock_Config();
+
 /* USER CODE BEGIN Boot_Mode_Sequence_2 */
-/* When system initialization is finished, Cortex-M7 will release Cortex-M4 by means of
-HSEM notification */
-/*HW semaphore Clock enable*/
 __HAL_RCC_HSEM_CLK_ENABLE();
-/*Take HSEM */
 HAL_HSEM_FastTake(HSEM_ID_0);
-/*Release HSEM in order to notify the CPU2(CM4)*/
 HAL_HSEM_Release(HSEM_ID_0,0);
-/* wait until CPU2 wakes up from stop mode */
 timeout = 0xFFFF;
 while((__HAL_RCC_GET_FLAG(RCC_FLAG_D2CKRDY) == RESET) && (timeout-- > 0));
 if ( timeout < 0 )
@@ -369,7 +322,6 @@ Error_Handler();
 
   /* USER CODE END SysInit */
 
-  /* Initialize all configured peripherals */
   MX_GPIO_Init();
   MX_USART3_UART_Init();
   MX_TIM1_Init();
@@ -381,8 +333,10 @@ Error_Handler();
   MX_TIM13_Init();
   MX_TIM14_Init();
   MX_TIM15_Init();
-  MX_I2C1_Init();
 //  MX_SPI1_Init();
+#if IMU_ENABLED
+  MX_I2C1_Init();
+#endif
   MX_FDCAN1_Init();
   MX_USART2_UART_Init();
   /* USER CODE BEGIN 2 */
@@ -411,7 +365,6 @@ Error_Handler();
   	  allOK = 0;
   	  Error_Handler();
   }
-
   if (HAL_TIM_PWM_Start(&htim12, TIM_CHANNEL_1) != HAL_OK)
   {
   	  printf("tim12 fail\r\n");
@@ -437,121 +390,78 @@ Error_Handler();
 	  printf("TODO BN\r\n");
   }
 
-
   printf("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n\n\n\n\r\n");
 
   /* USER CODE END 2 */
 
-  /* Init scheduler */
   osKernelInitialize();
-  /* Create the mutex(es) */
-  /* creation of MutexUART_Data */
   MutexUART_DataHandle = osMutexNew(&MutexUART_Data_attributes);
 
   /* USER CODE BEGIN RTOS_MUTEX */
-  /* add mutexes, ... */
   /* USER CODE END RTOS_MUTEX */
 
   /* USER CODE BEGIN RTOS_SEMAPHORES */
-  /* add semaphores, ... */
   /* USER CODE END RTOS_SEMAPHORES */
 
   /* USER CODE BEGIN RTOS_TIMERS */
-  /* start timers, add new ones, ... */
   /* USER CODE END RTOS_TIMERS */
 
   /* USER CODE BEGIN RTOS_QUEUES */
-  /* add queues, ... */
-
-//  UART_QueueHandle = osMessageQueueNew (3, sizeof(InputData), &UART_Queue_attributes);
-  UART_QueueHandle = osMessageQueueNew (3, sizeof(ODriveCmdMsg), &UART_Queue_attributes);
-//  UART2CtrlTsk_QueueHandle = osMessageQueueNew (3, sizeof(InputData), &UART2CtrlTsk_Queue_attributes);
-//  CtrlTsk_QueueHandle = osMessageQueueNew (3, sizeof(CtrlTsk_Data), &CtrlTsk_Queue_attributes);
-//  UART2KPIDs_QueueHandle = osMessageQueueNew (3, sizeof(PIDConfig), &UART2KPIDs_Queue_attributes);
-//  kpids_UART_TX_QueueHandle = osMessageQueueNew (3, sizeof(PIDConfig), &kpids_UART_TX_Queue_attributes);
-  CAN_2_UTX_QueueHandle = osMessageQueueNew (3, sizeof(ODriveTelemetryMsg), &CAN_2_UTX_Queue_attributes);
-  URX_2_CAN_QueueHandle = osMessageQueueNew (3, sizeof(ODriveCmdMsg), &URX_2_CAN_Queue_attributes);
+  UART_QueueHandle     = osMessageQueueNew(3, sizeof(ODriveCmdMsg),      &UART_Queue_attributes);
+  CAN_2_UTX_QueueHandle = osMessageQueueNew(3, sizeof(ODriveTelemetryMsg), &CAN_2_UTX_Queue_attributes);
+  URX_2_CAN_QueueHandle = osMessageQueueNew(3, sizeof(ODriveCmdMsg),      &URX_2_CAN_Queue_attributes);
 
   printf("UART_QueueHandle    = %p\r\n", UART_QueueHandle);
   printf("CAN_2_UTX_QueueHandle = %p\r\n", CAN_2_UTX_QueueHandle);
   printf("URX_2_CAN_QueueHandle = %p\r\n", URX_2_CAN_QueueHandle);
 
-  if (UART_QueueHandle == NULL) {
-      printf("UART_QueueHandle creation failed\r\n");
-  }
-  if (CAN_2_UTX_QueueHandle == NULL) {
-      printf("CAN_2_UTX_QueueHandle creation failed\r\n");
-  }
-  if (URX_2_CAN_QueueHandle == NULL) {
-      printf("URX_2_CAN_QueueHandle creation failed\r\n");
-  }
+  if (UART_QueueHandle == NULL)     printf("UART_QueueHandle creation failed\r\n");
+  if (CAN_2_UTX_QueueHandle == NULL) printf("CAN_2_UTX_QueueHandle creation failed\r\n");
+  if (URX_2_CAN_QueueHandle == NULL) printf("URX_2_CAN_QueueHandle creation failed\r\n");
 
   /* USER CODE END RTOS_QUEUES */
 
-  /* Create the thread(s) */
-  /* creation of defaultTask */
-//  defaultTaskHandle = osThreadNew(StartDefaultTask, NULL, &defaultTask_attributes);
-
   /* creation of UART_RX_Task */
   UART_RX_TaskHandle = osThreadNew(start_UART_RX_Task, NULL, &UART_RX_Task_attributes);
+  if (UART_RX_TaskHandle == NULL) printf("UART_RX_Task creation FAILED\r\n");
+
+  /* creation of BT_RX_Task — ESP32 Bluetooth commands on USART2 */
+  BT_RX_TaskHandle = osThreadNew(start_BT_RX_Task, NULL, &BT_RX_Task_attributes);
+  if (BT_RX_TaskHandle == NULL) printf("BT_RX_Task creation FAILED\r\n");
 
   /* creation of UART_TX_Task */
   UART_TX_TaskHandle = osThreadNew(Start_UART_TX_Task, NULL, &UART_TX_Task_attributes);
-
-  /* creation of ControlTask */
-//  ControlTaskHandle = osThreadNew(StartControlTask, NULL, &ControlTask_attributes);
+  if (UART_TX_TaskHandle == NULL) printf("UART_TX_Task creation FAILED\r\n");
 
   /* creation of ODriveTask */
   ODriveTaskHandle = osThreadNew(StartODriveTask, NULL, &ODriveTask_attributes);
+  if (ODriveTaskHandle == NULL) printf("ODriveTask creation FAILED\r\n");
 
   /* USER CODE BEGIN RTOS_THREADS */
-
-  /* add threads, ... */
   /* USER CODE END RTOS_THREADS */
 
   /* USER CODE BEGIN RTOS_EVENTS */
-  /* add events, ... */
   /* USER CODE END RTOS_EVENTS */
 
-  /* Start scheduler */
   osKernelStart();
 
-  /* We should never get here as control is now taken by the scheduler */
-
-  /* Infinite loop */
-  /* USER CODE BEGIN WHILE */
   while (1)
   {
-
-    /* USER CODE END WHILE */
-
-    /* USER CODE BEGIN 3 */
   }
-  /* USER CODE END 3 */
 }
 
 /**
   * @brief System Clock Configuration
-  * @retval None
   */
 void SystemClock_Config(void)
 {
   RCC_OscInitTypeDef RCC_OscInitStruct = {0};
   RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
 
-  /** Supply configuration update enable
-  */
   HAL_PWREx_ConfigSupply(PWR_DIRECT_SMPS_SUPPLY);
-
-  /** Configure the main internal regulator output voltage
-  */
   __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE0);
-
   while(!__HAL_PWR_GET_FLAG(PWR_FLAG_VOSRDY)) {}
 
-  /** Initializes the RCC Oscillators according to the specified parameters
-  * in the RCC_OscInitTypeDef structure.
-  */
   RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI|RCC_OSCILLATORTYPE_HSE;
   RCC_OscInitStruct.HSEState = RCC_HSE_ON;
   RCC_OscInitStruct.HSIState = RCC_HSI_DIV1;
@@ -566,13 +476,8 @@ void SystemClock_Config(void)
   RCC_OscInitStruct.PLL.PLLRGE = RCC_PLL1VCIRANGE_2;
   RCC_OscInitStruct.PLL.PLLVCOSEL = RCC_PLL1VCOWIDE;
   RCC_OscInitStruct.PLL.PLLFRACN = 0;
-  if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
-  {
-    Error_Handler();
-  }
+  if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK) { Error_Handler(); }
 
-  /** Initializes the CPU, AHB and APB buses clocks
-  */
   RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
                               |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2
                               |RCC_CLOCKTYPE_D3PCLK1|RCC_CLOCKTYPE_D1PCLK1;
@@ -583,50 +488,43 @@ void SystemClock_Config(void)
   RCC_ClkInitStruct.APB1CLKDivider = RCC_APB1_DIV2;
   RCC_ClkInitStruct.APB2CLKDivider = RCC_APB2_DIV2;
   RCC_ClkInitStruct.APB4CLKDivider = RCC_APB4_DIV2;
-
-  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_4) != HAL_OK)
-  {
-    Error_Handler();
-  }
+  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_4) != HAL_OK) { Error_Handler(); }
 }
 
 /**
   * @brief Peripherals Common Clock Configuration
-  * @retval None
   */
 void PeriphCommonClock_Config(void)
 {
   RCC_PeriphCLKInitTypeDef PeriphClkInitStruct = {0};
-
-  /** Initializes the peripherals clock
-  */
   PeriphClkInitStruct.PeriphClockSelection = RCC_PERIPHCLK_CKPER;
   PeriphClkInitStruct.CkperClockSelection = RCC_CLKPSOURCE_HSI;
-  if (HAL_RCCEx_PeriphCLKConfig(&PeriphClkInitStruct) != HAL_OK)
-  {
-    Error_Handler();
-  }
+  if (HAL_RCCEx_PeriphCLKConfig(&PeriphClkInitStruct) != HAL_OK) { Error_Handler(); }
 }
 
 /**
   * @brief FDCAN1 Initialization Function
-  * @param None
-  * @retval None
+  * CAN_STUB=1 → INTERNAL_LOOPBACK (no external ACK needed, TX never blocks).
+  * CAN_STUB=0 → NORMAL mode for real ODrives.
   */
 static void MX_FDCAN1_Init(void)
 {
-
   /* USER CODE BEGIN FDCAN1_Init 0 */
-
   /* USER CODE END FDCAN1_Init 0 */
 
   /* USER CODE BEGIN FDCAN1_Init 1 */
-
   /* USER CODE END FDCAN1_Init 1 */
   hfdcan1.Instance = FDCAN1;
   hfdcan1.Init.FrameFormat = FDCAN_FRAME_CLASSIC;
+
+#if CAN_STUB
+  hfdcan1.Init.Mode = FDCAN_MODE_INTERNAL_LOOPBACK;
+  hfdcan1.Init.AutoRetransmission = DISABLE;
+#else
   hfdcan1.Init.Mode = FDCAN_MODE_NORMAL;
   hfdcan1.Init.AutoRetransmission = ENABLE;
+#endif
+
   hfdcan1.Init.TransmitPause = DISABLE;
   hfdcan1.Init.ProtocolException = DISABLE;
   hfdcan1.Init.NominalPrescaler = 2;
@@ -651,71 +549,49 @@ static void MX_FDCAN1_Init(void)
   hfdcan1.Init.TxFifoQueueElmtsNbr = 1;
   hfdcan1.Init.TxFifoQueueMode = FDCAN_TX_FIFO_OPERATION;
   hfdcan1.Init.TxElmtSize = FDCAN_DATA_BYTES_8;
-  if (HAL_FDCAN_Init(&hfdcan1) != HAL_OK)
-  {
-    Error_Handler();
-  }
+  if (HAL_FDCAN_Init(&hfdcan1) != HAL_OK) { Error_Handler(); }
+
   /* USER CODE BEGIN FDCAN1_Init 2 */
-  /* Configure Rx filter */
-  	sFilterConfig.IdType = FDCAN_STANDARD_ID;            // Set to Standard ID for compatibility with CANSimple
-  	sFilterConfig.FilterIndex = 0;                       // Filter index
-  	sFilterConfig.FilterType = FDCAN_FILTER_MASK;        // Filter type (Mask mode)
-  	sFilterConfig.FilterConfig = FDCAN_FILTER_TO_RXFIFO0;// Direct matching frames to FIFO 0
-  	sFilterConfig.FilterID1 = 0x000; // Receive all IDs
-  	sFilterConfig.FilterID2 = 0x000; // Receive all IDs
+  sFilterConfig.IdType = FDCAN_STANDARD_ID;
+  sFilterConfig.FilterIndex = 0;
+  sFilterConfig.FilterType = FDCAN_FILTER_MASK;
+  sFilterConfig.FilterConfig = FDCAN_FILTER_TO_RXFIFO0;
+  sFilterConfig.FilterID1 = 0x000;
+  sFilterConfig.FilterID2 = 0x000;
 
-  	/* Configure global filter to reject all non-matching frames */
-  	HAL_FDCAN_ConfigGlobalFilter(&hfdcan1,
-  	FDCAN_ACCEPT_IN_RX_FIFO0,  // Accept standard messages in FIFO0 (if needed)
-  	FDCAN_ACCEPT_IN_RX_FIFO0,  // Accept extended messages in FIFO0
-  	FDCAN_REJECT_REMOTE,        // Reject remote frames
-  	FDCAN_REJECT_REMOTE);       // Reject remote frames
+  HAL_FDCAN_ConfigGlobalFilter(&hfdcan1,
+    FDCAN_ACCEPT_IN_RX_FIFO0,
+    FDCAN_ACCEPT_IN_RX_FIFO0,
+    FDCAN_REJECT_REMOTE,
+    FDCAN_REJECT_REMOTE);
 
-  	if (HAL_FDCAN_ConfigFilter(&hfdcan1, &sFilterConfig) != HAL_OK)
-  	{
-  	   /* Filter configuration Error */
-  	   Error_Handler();
-  	}
-  	/* Start the FDCAN module */
-  	if (HAL_FDCAN_Start(&hfdcan1) != HAL_OK) {
-  		printf("start fail pipipipipi \n\r");
-  	} else {
-  		printf("start succ \n\r");
-  	}
-  	   /* Start Error */
-  	if (HAL_FDCAN_ActivateNotification(&hfdcan1, FDCAN_IT_RX_FIFO0_NEW_MESSAGE, 0) != HAL_OK) {
-  	}
-  	   /* Notification Error */
+  if (HAL_FDCAN_ConfigFilter(&hfdcan1, &sFilterConfig) != HAL_OK) { Error_Handler(); }
 
-  	/* Configure Tx buffer message */
-  	TxHeader.Identifier = 0x42E;           // Example Extended ID
-  	TxHeader.IdType = FDCAN_STANDARD_ID;     // Use Standard ID for compatibility with CANSimple
-  	TxHeader.TxFrameType = FDCAN_DATA_FRAME; // Set as a data frame
-  	TxHeader.DataLength = FDCAN_DLC_BYTES_8; // 8-byte data length
-  	TxHeader.ErrorStateIndicator = FDCAN_ESI_ACTIVE;
-  	TxHeader.BitRateSwitch = FDCAN_BRS_OFF;
-  	TxHeader.FDFormat = FDCAN_CLASSIC_CAN;   // Use classic CAN
-  	TxHeader.TxEventFifoControl = FDCAN_NO_TX_EVENTS;
-  	TxHeader.MessageMarker = 0x00;
+  if (HAL_FDCAN_Start(&hfdcan1) != HAL_OK) {
+    printf("start fail pipipipipi \n\r");
+  } else {
+    printf("start succ \n\r");
+  }
+
+  if (HAL_FDCAN_ActivateNotification(&hfdcan1, FDCAN_IT_RX_FIFO0_NEW_MESSAGE, 0) != HAL_OK) {}
+
+  TxHeader.Identifier = 0x42E;
+  TxHeader.IdType = FDCAN_STANDARD_ID;
+  TxHeader.TxFrameType = FDCAN_DATA_FRAME;
+  TxHeader.DataLength = FDCAN_DLC_BYTES_8;
+  TxHeader.ErrorStateIndicator = FDCAN_ESI_ACTIVE;
+  TxHeader.BitRateSwitch = FDCAN_BRS_OFF;
+  TxHeader.FDFormat = FDCAN_CLASSIC_CAN;
+  TxHeader.TxEventFifoControl = FDCAN_NO_TX_EVENTS;
+  TxHeader.MessageMarker = 0x00;
   /* USER CODE END FDCAN1_Init 2 */
-
 }
 
 /**
   * @brief I2C1 Initialization Function
-  * @param None
-  * @retval None
   */
 static void MX_I2C1_Init(void)
 {
-
-  /* USER CODE BEGIN I2C1_Init 0 */
-
-  /* USER CODE END I2C1_Init 0 */
-
-  /* USER CODE BEGIN I2C1_Init 1 */
-
-  /* USER CODE END I2C1_Init 1 */
   hi2c1.Instance = I2C1;
   hi2c1.Init.Timing = 0x00B03FDB;
   hi2c1.Init.OwnAddress1 = 0;
@@ -725,46 +601,16 @@ static void MX_I2C1_Init(void)
   hi2c1.Init.OwnAddress2Masks = I2C_OA2_NOMASK;
   hi2c1.Init.GeneralCallMode = I2C_GENERALCALL_DISABLE;
   hi2c1.Init.NoStretchMode = I2C_NOSTRETCH_DISABLE;
-  if (HAL_I2C_Init(&hi2c1) != HAL_OK)
-  {
-    Error_Handler();
-  }
-
-  /** Configure Analogue filter
-  */
-  if (HAL_I2CEx_ConfigAnalogFilter(&hi2c1, I2C_ANALOGFILTER_ENABLE) != HAL_OK)
-  {
-    Error_Handler();
-  }
-
-  /** Configure Digital filter
-  */
-  if (HAL_I2CEx_ConfigDigitalFilter(&hi2c1, 0) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  /* USER CODE BEGIN I2C1_Init 2 */
-
-  /* USER CODE END I2C1_Init 2 */
-
+  if (HAL_I2C_Init(&hi2c1) != HAL_OK) { Error_Handler(); }
+  if (HAL_I2CEx_ConfigAnalogFilter(&hi2c1, I2C_ANALOGFILTER_ENABLE) != HAL_OK) { Error_Handler(); }
+  if (HAL_I2CEx_ConfigDigitalFilter(&hi2c1, 0) != HAL_OK) { Error_Handler(); }
 }
 
 /**
   * @brief SPI1 Initialization Function
-  * @param None
-  * @retval None
   */
 static void MX_SPI1_Init(void)
 {
-
-  /* USER CODE BEGIN SPI1_Init 0 */
-
-  /* USER CODE END SPI1_Init 0 */
-
-  /* USER CODE BEGIN SPI1_Init 1 */
-
-  /* USER CODE END SPI1_Init 1 */
-  /* SPI1 parameter configuration*/
   hspi1.Instance = SPI1;
   hspi1.Init.Mode = SPI_MODE_MASTER;
   hspi1.Init.Direction = SPI_DIRECTION_2LINES;
@@ -787,34 +633,17 @@ static void MX_SPI1_Init(void)
   hspi1.Init.MasterReceiverAutoSusp = SPI_MASTER_RX_AUTOSUSP_DISABLE;
   hspi1.Init.MasterKeepIOState = SPI_MASTER_KEEP_IO_STATE_DISABLE;
   hspi1.Init.IOSwap = SPI_IO_SWAP_DISABLE;
-  if (HAL_SPI_Init(&hspi1) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  /* USER CODE BEGIN SPI1_Init 2 */
-
-  /* USER CODE END SPI1_Init 2 */
-
+  if (HAL_SPI_Init(&hspi1) != HAL_OK) { Error_Handler(); }
 }
 
 /**
   * @brief TIM1 Initialization Function
-  * @param None
-  * @retval None
   */
 static void MX_TIM1_Init(void)
 {
-
-  /* USER CODE BEGIN TIM1_Init 0 */
-
-  /* USER CODE END TIM1_Init 0 */
-
   TIM_Encoder_InitTypeDef sConfig = {0};
   TIM_MasterConfigTypeDef sMasterConfig = {0};
 
-  /* USER CODE BEGIN TIM1_Init 1 */
-
-  /* USER CODE END TIM1_Init 1 */
   htim1.Instance = TIM1;
   htim1.Init.Prescaler = 0;
   htim1.Init.CounterMode = TIM_COUNTERMODE_UP;
@@ -831,41 +660,21 @@ static void MX_TIM1_Init(void)
   sConfig.IC2Selection = TIM_ICSELECTION_DIRECTTI;
   sConfig.IC2Prescaler = TIM_ICPSC_DIV1;
   sConfig.IC2Filter = 0;
-  if (HAL_TIM_Encoder_Init(&htim1, &sConfig) != HAL_OK)
-  {
-    Error_Handler();
-  }
+  if (HAL_TIM_Encoder_Init(&htim1, &sConfig) != HAL_OK) { Error_Handler(); }
   sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
   sMasterConfig.MasterOutputTrigger2 = TIM_TRGO2_RESET;
   sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
-  if (HAL_TIMEx_MasterConfigSynchronization(&htim1, &sMasterConfig) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  /* USER CODE BEGIN TIM1_Init 2 */
-
-  /* USER CODE END TIM1_Init 2 */
-
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim1, &sMasterConfig) != HAL_OK) { Error_Handler(); }
 }
 
 /**
   * @brief TIM2 Initialization Function
-  * @param None
-  * @retval None
   */
 static void MX_TIM2_Init(void)
 {
-
-  /* USER CODE BEGIN TIM2_Init 0 */
-
-  /* USER CODE END TIM2_Init 0 */
-
   TIM_Encoder_InitTypeDef sConfig = {0};
   TIM_MasterConfigTypeDef sMasterConfig = {0};
 
-  /* USER CODE BEGIN TIM2_Init 1 */
-
-  /* USER CODE END TIM2_Init 1 */
   htim2.Instance = TIM2;
   htim2.Init.Prescaler = 0;
   htim2.Init.CounterMode = TIM_COUNTERMODE_UP;
@@ -881,40 +690,20 @@ static void MX_TIM2_Init(void)
   sConfig.IC2Selection = TIM_ICSELECTION_DIRECTTI;
   sConfig.IC2Prescaler = TIM_ICPSC_DIV1;
   sConfig.IC2Filter = 0;
-  if (HAL_TIM_Encoder_Init(&htim2, &sConfig) != HAL_OK)
-  {
-    Error_Handler();
-  }
+  if (HAL_TIM_Encoder_Init(&htim2, &sConfig) != HAL_OK) { Error_Handler(); }
   sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
   sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
-  if (HAL_TIMEx_MasterConfigSynchronization(&htim2, &sMasterConfig) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  /* USER CODE BEGIN TIM2_Init 2 */
-
-  /* USER CODE END TIM2_Init 2 */
-
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim2, &sMasterConfig) != HAL_OK) { Error_Handler(); }
 }
 
 /**
   * @brief TIM4 Initialization Function
-  * @param None
-  * @retval None
   */
 static void MX_TIM4_Init(void)
 {
-
-  /* USER CODE BEGIN TIM4_Init 0 */
-
-  /* USER CODE END TIM4_Init 0 */
-
   TIM_Encoder_InitTypeDef sConfig = {0};
   TIM_MasterConfigTypeDef sMasterConfig = {0};
 
-  /* USER CODE BEGIN TIM4_Init 1 */
-
-  /* USER CODE END TIM4_Init 1 */
   htim4.Instance = TIM4;
   htim4.Init.Prescaler = 0;
   htim4.Init.CounterMode = TIM_COUNTERMODE_UP;
@@ -930,89 +719,46 @@ static void MX_TIM4_Init(void)
   sConfig.IC2Selection = TIM_ICSELECTION_DIRECTTI;
   sConfig.IC2Prescaler = TIM_ICPSC_DIV1;
   sConfig.IC2Filter = 0;
-  if (HAL_TIM_Encoder_Init(&htim4, &sConfig) != HAL_OK)
-  {
-    Error_Handler();
-  }
+  if (HAL_TIM_Encoder_Init(&htim4, &sConfig) != HAL_OK) { Error_Handler(); }
   sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
   sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
-  if (HAL_TIMEx_MasterConfigSynchronization(&htim4, &sMasterConfig) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  /* USER CODE BEGIN TIM4_Init 2 */
-
-  /* USER CODE END TIM4_Init 2 */
-
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim4, &sMasterConfig) != HAL_OK) { Error_Handler(); }
 }
 
 /**
   * @brief TIM5 Initialization Function
-  * @param None
-  * @retval None
   */
 static void MX_TIM5_Init(void)
 {
-
-  /* USER CODE BEGIN TIM5_Init 0 */
-
-  /* USER CODE END TIM5_Init 0 */
-
   TIM_MasterConfigTypeDef sMasterConfig = {0};
   TIM_OC_InitTypeDef sConfigOC = {0};
 
-  /* USER CODE BEGIN TIM5_Init 1 */
-
-  /* USER CODE END TIM5_Init 1 */
   htim5.Instance = TIM5;
   htim5.Init.Prescaler = 239;
   htim5.Init.CounterMode = TIM_COUNTERMODE_UP;
   htim5.Init.Period = 19999;
   htim5.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
   htim5.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
-  if (HAL_TIM_PWM_Init(&htim5) != HAL_OK)
-  {
-    Error_Handler();
-  }
+  if (HAL_TIM_PWM_Init(&htim5) != HAL_OK) { Error_Handler(); }
   sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
   sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
-  if (HAL_TIMEx_MasterConfigSynchronization(&htim5, &sMasterConfig) != HAL_OK)
-  {
-    Error_Handler();
-  }
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim5, &sMasterConfig) != HAL_OK) { Error_Handler(); }
   sConfigOC.OCMode = TIM_OCMODE_PWM1;
   sConfigOC.Pulse = 0;
   sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
   sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
-  if (HAL_TIM_PWM_ConfigChannel(&htim5, &sConfigOC, TIM_CHANNEL_1) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  /* USER CODE BEGIN TIM5_Init 2 */
-
-  /* USER CODE END TIM5_Init 2 */
+  if (HAL_TIM_PWM_ConfigChannel(&htim5, &sConfigOC, TIM_CHANNEL_1) != HAL_OK) { Error_Handler(); }
   HAL_TIM_MspPostInit(&htim5);
-
 }
 
 /**
   * @brief TIM8 Initialization Function
-  * @param None
-  * @retval None
   */
 static void MX_TIM8_Init(void)
 {
-
-  /* USER CODE BEGIN TIM8_Init 0 */
-
-  /* USER CODE END TIM8_Init 0 */
-
   TIM_Encoder_InitTypeDef sConfig = {0};
   TIM_MasterConfigTypeDef sMasterConfig = {0};
 
-  /* USER CODE BEGIN TIM8_Init 1 */
-
-  /* USER CODE END TIM8_Init 1 */
   htim8.Instance = TIM8;
   htim8.Init.Prescaler = 0;
   htim8.Init.CounterMode = TIM_COUNTERMODE_UP;
@@ -1029,193 +775,98 @@ static void MX_TIM8_Init(void)
   sConfig.IC2Selection = TIM_ICSELECTION_DIRECTTI;
   sConfig.IC2Prescaler = TIM_ICPSC_DIV1;
   sConfig.IC2Filter = 0;
-  if (HAL_TIM_Encoder_Init(&htim8, &sConfig) != HAL_OK)
-  {
-    Error_Handler();
-  }
+  if (HAL_TIM_Encoder_Init(&htim8, &sConfig) != HAL_OK) { Error_Handler(); }
   sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
   sMasterConfig.MasterOutputTrigger2 = TIM_TRGO2_RESET;
   sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
-  if (HAL_TIMEx_MasterConfigSynchronization(&htim8, &sMasterConfig) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  /* USER CODE BEGIN TIM8_Init 2 */
-
-  /* USER CODE END TIM8_Init 2 */
-
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim8, &sMasterConfig) != HAL_OK) { Error_Handler(); }
 }
 
 /**
   * @brief TIM12 Initialization Function
-  * @param None
-  * @retval None
   */
 static void MX_TIM12_Init(void)
 {
-
-  /* USER CODE BEGIN TIM12_Init 0 */
-
-  /* USER CODE END TIM12_Init 0 */
-
   TIM_ClockConfigTypeDef sClockSourceConfig = {0};
   TIM_MasterConfigTypeDef sMasterConfig = {0};
   TIM_OC_InitTypeDef sConfigOC = {0};
 
-  /* USER CODE BEGIN TIM12_Init 1 */
-
-  /* USER CODE END TIM12_Init 1 */
   htim12.Instance = TIM12;
   htim12.Init.Prescaler = 239;
   htim12.Init.CounterMode = TIM_COUNTERMODE_UP;
   htim12.Init.Period = 19999;
   htim12.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
   htim12.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
-  if (HAL_TIM_Base_Init(&htim12) != HAL_OK)
-  {
-    Error_Handler();
-  }
+  if (HAL_TIM_Base_Init(&htim12) != HAL_OK) { Error_Handler(); }
   sClockSourceConfig.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
-  if (HAL_TIM_ConfigClockSource(&htim12, &sClockSourceConfig) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  if (HAL_TIM_PWM_Init(&htim12) != HAL_OK)
-  {
-    Error_Handler();
-  }
+  if (HAL_TIM_ConfigClockSource(&htim12, &sClockSourceConfig) != HAL_OK) { Error_Handler(); }
+  if (HAL_TIM_PWM_Init(&htim12) != HAL_OK) { Error_Handler(); }
   sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
   sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
-  if (HAL_TIMEx_MasterConfigSynchronization(&htim12, &sMasterConfig) != HAL_OK)
-  {
-    Error_Handler();
-  }
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim12, &sMasterConfig) != HAL_OK) { Error_Handler(); }
   sConfigOC.OCMode = TIM_OCMODE_PWM1;
   sConfigOC.Pulse = 0;
   sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
   sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
-  if (HAL_TIM_PWM_ConfigChannel(&htim12, &sConfigOC, TIM_CHANNEL_1) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  /* USER CODE BEGIN TIM12_Init 2 */
-
-  /* USER CODE END TIM12_Init 2 */
+  if (HAL_TIM_PWM_ConfigChannel(&htim12, &sConfigOC, TIM_CHANNEL_1) != HAL_OK) { Error_Handler(); }
   HAL_TIM_MspPostInit(&htim12);
-
 }
 
 /**
   * @brief TIM13 Initialization Function
-  * @param None
-  * @retval None
   */
 static void MX_TIM13_Init(void)
 {
-
-  /* USER CODE BEGIN TIM13_Init 0 */
-
-  /* USER CODE END TIM13_Init 0 */
-
   TIM_OC_InitTypeDef sConfigOC = {0};
 
-  /* USER CODE BEGIN TIM13_Init 1 */
-
-  /* USER CODE END TIM13_Init 1 */
   htim13.Instance = TIM13;
   htim13.Init.Prescaler = 239;
   htim13.Init.CounterMode = TIM_COUNTERMODE_UP;
   htim13.Init.Period = 65535;
   htim13.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
   htim13.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
-  if (HAL_TIM_Base_Init(&htim13) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  if (HAL_TIM_PWM_Init(&htim13) != HAL_OK)
-  {
-    Error_Handler();
-  }
+  if (HAL_TIM_Base_Init(&htim13) != HAL_OK) { Error_Handler(); }
+  if (HAL_TIM_PWM_Init(&htim13) != HAL_OK) { Error_Handler(); }
   sConfigOC.OCMode = TIM_OCMODE_PWM1;
   sConfigOC.Pulse = 0;
   sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
   sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
-  if (HAL_TIM_PWM_ConfigChannel(&htim13, &sConfigOC, TIM_CHANNEL_1) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  /* USER CODE BEGIN TIM13_Init 2 */
-
-  /* USER CODE END TIM13_Init 2 */
+  if (HAL_TIM_PWM_ConfigChannel(&htim13, &sConfigOC, TIM_CHANNEL_1) != HAL_OK) { Error_Handler(); }
   HAL_TIM_MspPostInit(&htim13);
-
 }
 
 /**
   * @brief TIM14 Initialization Function
-  * @param None
-  * @retval None
   */
 static void MX_TIM14_Init(void)
 {
-
-  /* USER CODE BEGIN TIM14_Init 0 */
-
-  /* USER CODE END TIM14_Init 0 */
-
   TIM_OC_InitTypeDef sConfigOC = {0};
 
-  /* USER CODE BEGIN TIM14_Init 1 */
-
-  /* USER CODE END TIM14_Init 1 */
   htim14.Instance = TIM14;
   htim14.Init.Prescaler = 239;
   htim14.Init.CounterMode = TIM_COUNTERMODE_UP;
   htim14.Init.Period = 19999;
   htim14.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
   htim14.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
-  if (HAL_TIM_Base_Init(&htim14) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  if (HAL_TIM_PWM_Init(&htim14) != HAL_OK)
-  {
-    Error_Handler();
-  }
+  if (HAL_TIM_Base_Init(&htim14) != HAL_OK) { Error_Handler(); }
+  if (HAL_TIM_PWM_Init(&htim14) != HAL_OK) { Error_Handler(); }
   sConfigOC.OCMode = TIM_OCMODE_PWM1;
   sConfigOC.Pulse = 0;
   sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
   sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
-  if (HAL_TIM_PWM_ConfigChannel(&htim14, &sConfigOC, TIM_CHANNEL_1) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  /* USER CODE BEGIN TIM14_Init 2 */
-
-  /* USER CODE END TIM14_Init 2 */
+  if (HAL_TIM_PWM_ConfigChannel(&htim14, &sConfigOC, TIM_CHANNEL_1) != HAL_OK) { Error_Handler(); }
   HAL_TIM_MspPostInit(&htim14);
-
 }
 
 /**
   * @brief TIM15 Initialization Function
-  * @param None
-  * @retval None
   */
 static void MX_TIM15_Init(void)
 {
-
-  /* USER CODE BEGIN TIM15_Init 0 */
-
-  /* USER CODE END TIM15_Init 0 */
-
   TIM_MasterConfigTypeDef sMasterConfig = {0};
   TIM_OC_InitTypeDef sConfigOC = {0};
   TIM_BreakDeadTimeConfigTypeDef sBreakDeadTimeConfig = {0};
 
-  /* USER CODE BEGIN TIM15_Init 1 */
-
-  /* USER CODE END TIM15_Init 1 */
   htim15.Instance = TIM15;
   htim15.Init.Prescaler = 239;
   htim15.Init.CounterMode = TIM_COUNTERMODE_UP;
@@ -1223,16 +874,10 @@ static void MX_TIM15_Init(void)
   htim15.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
   htim15.Init.RepetitionCounter = 0;
   htim15.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
-  if (HAL_TIM_PWM_Init(&htim15) != HAL_OK)
-  {
-    Error_Handler();
-  }
+  if (HAL_TIM_PWM_Init(&htim15) != HAL_OK) { Error_Handler(); }
   sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
   sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
-  if (HAL_TIMEx_MasterConfigSynchronization(&htim15, &sMasterConfig) != HAL_OK)
-  {
-    Error_Handler();
-  }
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim15, &sMasterConfig) != HAL_OK) { Error_Handler(); }
   sConfigOC.OCMode = TIM_OCMODE_PWM1;
   sConfigOC.Pulse = 0;
   sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
@@ -1240,10 +885,7 @@ static void MX_TIM15_Init(void)
   sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
   sConfigOC.OCIdleState = TIM_OCIDLESTATE_RESET;
   sConfigOC.OCNIdleState = TIM_OCNIDLESTATE_RESET;
-  if (HAL_TIM_PWM_ConfigChannel(&htim15, &sConfigOC, TIM_CHANNEL_1) != HAL_OK)
-  {
-    Error_Handler();
-  }
+  if (HAL_TIM_PWM_ConfigChannel(&htim15, &sConfigOC, TIM_CHANNEL_1) != HAL_OK) { Error_Handler(); }
   sBreakDeadTimeConfig.OffStateRunMode = TIM_OSSR_DISABLE;
   sBreakDeadTimeConfig.OffStateIDLEMode = TIM_OSSI_DISABLE;
   sBreakDeadTimeConfig.LockLevel = TIM_LOCKLEVEL_OFF;
@@ -1252,32 +894,15 @@ static void MX_TIM15_Init(void)
   sBreakDeadTimeConfig.BreakPolarity = TIM_BREAKPOLARITY_HIGH;
   sBreakDeadTimeConfig.BreakFilter = 0;
   sBreakDeadTimeConfig.AutomaticOutput = TIM_AUTOMATICOUTPUT_DISABLE;
-  if (HAL_TIMEx_ConfigBreakDeadTime(&htim15, &sBreakDeadTimeConfig) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  /* USER CODE BEGIN TIM15_Init 2 */
-
-  /* USER CODE END TIM15_Init 2 */
+  if (HAL_TIMEx_ConfigBreakDeadTime(&htim15, &sBreakDeadTimeConfig) != HAL_OK) { Error_Handler(); }
   HAL_TIM_MspPostInit(&htim15);
-
 }
 
 /**
-  * @brief USART2 Initialization Function
-  * @param None
-  * @retval None
+  * @brief USART2 Initialization Function  (ESP32 Bluetooth link)
   */
 static void MX_USART2_UART_Init(void)
 {
-
-  /* USER CODE BEGIN USART2_Init 0 */
-
-  /* USER CODE END USART2_Init 0 */
-
-  /* USER CODE BEGIN USART2_Init 1 */
-
-  /* USER CODE END USART2_Init 1 */
   huart2.Instance = USART2;
   huart2.Init.BaudRate = 115200;
   huart2.Init.WordLength = UART_WORDLENGTH_8B;
@@ -1289,43 +914,17 @@ static void MX_USART2_UART_Init(void)
   huart2.Init.OneBitSampling = UART_ONE_BIT_SAMPLE_DISABLE;
   huart2.Init.ClockPrescaler = UART_PRESCALER_DIV1;
   huart2.AdvancedInit.AdvFeatureInit = UART_ADVFEATURE_NO_INIT;
-  if (HAL_UART_Init(&huart2) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  if (HAL_UARTEx_SetTxFifoThreshold(&huart2, UART_TXFIFO_THRESHOLD_1_8) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  if (HAL_UARTEx_SetRxFifoThreshold(&huart2, UART_RXFIFO_THRESHOLD_1_8) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  if (HAL_UARTEx_DisableFifoMode(&huart2) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  /* USER CODE BEGIN USART2_Init 2 */
-
-  /* USER CODE END USART2_Init 2 */
-
+  if (HAL_UART_Init(&huart2) != HAL_OK) { Error_Handler(); }
+  if (HAL_UARTEx_SetTxFifoThreshold(&huart2, UART_TXFIFO_THRESHOLD_1_8) != HAL_OK) { Error_Handler(); }
+  if (HAL_UARTEx_SetRxFifoThreshold(&huart2, UART_RXFIFO_THRESHOLD_1_8) != HAL_OK) { Error_Handler(); }
+  if (HAL_UARTEx_DisableFifoMode(&huart2) != HAL_OK) { Error_Handler(); }
 }
 
 /**
-  * @brief USART3 Initialization Function
-  * @param None
-  * @retval None
+  * @brief USART3 Initialization Function  (ST-Link / ROS debug)
   */
 static void MX_USART3_UART_Init(void)
 {
-
-  /* USER CODE BEGIN USART3_Init 0 */
-
-  /* USER CODE END USART3_Init 0 */
-
-  /* USER CODE BEGIN USART3_Init 1 */
-
-  /* USER CODE END USART3_Init 1 */
   huart3.Instance = USART3;
   huart3.Init.BaudRate = 115200;
   huart3.Init.WordLength = UART_WORDLENGTH_8B;
@@ -1337,40 +936,21 @@ static void MX_USART3_UART_Init(void)
   huart3.Init.OneBitSampling = UART_ONE_BIT_SAMPLE_DISABLE;
   huart3.Init.ClockPrescaler = UART_PRESCALER_DIV1;
   huart3.AdvancedInit.AdvFeatureInit = UART_ADVFEATURE_NO_INIT;
-  if (HAL_UART_Init(&huart3) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  if (HAL_UARTEx_SetTxFifoThreshold(&huart3, UART_TXFIFO_THRESHOLD_1_8) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  if (HAL_UARTEx_SetRxFifoThreshold(&huart3, UART_RXFIFO_THRESHOLD_1_8) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  if (HAL_UARTEx_DisableFifoMode(&huart3) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  /* USER CODE BEGIN USART3_Init 2 */
-
-  /* USER CODE END USART3_Init 2 */
-
+  if (HAL_UART_Init(&huart3) != HAL_OK) { Error_Handler(); }
+  if (HAL_UARTEx_SetTxFifoThreshold(&huart3, UART_TXFIFO_THRESHOLD_1_8) != HAL_OK) { Error_Handler(); }
+  if (HAL_UARTEx_SetRxFifoThreshold(&huart3, UART_RXFIFO_THRESHOLD_1_8) != HAL_OK) { Error_Handler(); }
+  if (HAL_UARTEx_DisableFifoMode(&huart3) != HAL_OK) { Error_Handler(); }
 }
 
 /**
   * @brief GPIO Initialization Function
-  * @param None
-  * @retval None
   */
 static void MX_GPIO_Init(void)
 {
   /* USER CODE BEGIN MX_GPIO_Init_1 */
-   GPIO_InitTypeDef GPIO_InitStruct = {0};
+  GPIO_InitTypeDef GPIO_InitStruct = {0};
   /* USER CODE END MX_GPIO_Init_1 */
 
-  /* GPIO Ports Clock Enable */
   __HAL_RCC_GPIOE_CLK_ENABLE();
   __HAL_RCC_GPIOF_CLK_ENABLE();
   __HAL_RCC_GPIOA_CLK_ENABLE();
@@ -1379,44 +959,8 @@ static void MX_GPIO_Init(void)
   __HAL_RCC_GPIOC_CLK_ENABLE();
 
   /* USER CODE BEGIN MX_GPIO_Init_2 */
-
-   /*Configure GPIO pin Output Level */
-//   HAL_GPIO_WritePin(GPIOD, PD4_Pin|PD5_Pin|PD6_Pin|PD7_Pin, GPIO_PIN_RESET);
-//   HAL_GPIO_WritePin(GPIOE, PE2_Pin|PE4_Pin|PE3_Pin|PE6_Pin, GPIO_PIN_RESET);
-//   HAL_GPIO_WritePin(GPIOG, MCP2515_CS_Pin, GPIO_PIN_RESET);
-
-   // Declare IN1, IN2, IN3 IN4 of H Bridge, in that order
-//   GPIO_InitStruct.Pin = PD4_Pin|PD5_Pin|PD6_Pin|PD7_Pin;
-//   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
-//   GPIO_InitStruct.Pull = GPIO_NOPULL;
-//   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
-//   HAL_GPIO_Init(GPIOD, &GPIO_InitStruct);
-//
-//
-//   GPIO_InitStruct.Pin = MCP2515_CS_Pin;
-//   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
-//   GPIO_InitStruct.Pull = GPIO_NOPULL;
-//   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
-//   HAL_GPIO_Init(MCP2515_CS_GPIO_Port, &GPIO_InitStruct);
-//
-//   // Declare IN1, IN2, IN3 IN4 of H Bridge, in that order
-//   GPIO_InitStruct.Pin = PE2_Pin|PE4_Pin|PE3_Pin|PE6_Pin;
-//   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
-//   GPIO_InitStruct.Pull = GPIO_NOPULL;
-//   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
-//   HAL_GPIO_Init(GPIOE, &GPIO_InitStruct);
-
-//   GPIOD->ODR ^= (0x1UL << 4U);
-//   GPIOD->ODR ^= (0x1UL << 5U);
-//   GPIOD->ODR ^= (0x1UL << 6U);
-//   GPIOD->ODR ^= (0x1UL << 7U);
-//
-//   GPIOE->ODR ^= (0x1UL << 2U);
-//   GPIOE->ODR ^= (0x1UL << 3U);
-//   GPIOE->ODR ^= (0x1UL << 4U);
-//   GPIOE->ODR ^= (0x1UL << 6U);
-
   /* USER CODE END MX_GPIO_Init_2 */
+  (void)GPIO_InitStruct;
 }
 
 /* USER CODE BEGIN 4 */
@@ -1426,9 +970,7 @@ static Axis* Find_ODrive_By_NodeID(uint8_t node_id)
     for (int i = 0; i < ODRIVE_COUNT; i++)
     {
         if (odrives[i].NODE_ID == node_id)
-        {
             return &odrives[i];
-        }
     }
     return NULL;
 }
@@ -1444,11 +986,8 @@ void HAL_FDCAN_RxFifo0Callback(FDCAN_HandleTypeDef *hfdcan, uint32_t RxFifo0ITs)
         {
             uint8_t node_id = (uint8_t)(RxHeader.Identifier >> 5);
             Axis *target_axis = Find_ODrive_By_NodeID(node_id);
-
             if (target_axis != NULL)
-            {
                 ODrive_RX_CallBack(target_axis, &RxHeader, RxData);
-            }
         }
     }
 }
@@ -1456,184 +995,281 @@ void HAL_FDCAN_RxFifo0Callback(FDCAN_HandleTypeDef *hfdcan, uint32_t RxFifo0ITs)
 /* USER CODE END 4 */
 
 /* USER CODE BEGIN Header_StartDefaultTask */
-/**
-  * @brief  Function implementing the defaultTask thread.
-  * @param  argument: Not used
-  * @retval None
-  */
 /* USER CODE END Header_StartDefaultTask */
 void StartDefaultTask(void *argument)
 {
   /* USER CODE BEGIN 5 */
+    odrives[0].NODE_ID = 33;
+    odrives[1].NODE_ID = 34;
+    odrives[2].NODE_ID = 35;
+    odrives[3].NODE_ID = 36;
 
-	odrives[0].NODE_ID = 33;
-	odrives[1].NODE_ID = 34;
-	odrives[2].NODE_ID = 35;
-	odrives[3].NODE_ID = 36;
+    printf("\nODrive CAN TEST\r\n");
 
-	printf("\nODrive CAN TEST\r\n");
+    FDCAN_TXmsg tx = {0};
+    TxHeader.ErrorStateIndicator = FDCAN_ESI_ACTIVE;
+    TxHeader.BitRateSwitch       = FDCAN_BRS_OFF;
+    TxHeader.FDFormat            = FDCAN_CLASSIC_CAN;
+    TxHeader.TxEventFifoControl  = FDCAN_NO_TX_EVENTS;
+    TxHeader.MessageMarker       = 0;
 
-	FDCAN_TXmsg tx = {0};
+    HAL_StatusTypeDef st;
+    for (int i = 0; i < ODRIVE_COUNT; i++) {
+        FDCAN_WAIT_TX_FREE();
+        st = Set_Axis_Requested_State(&odrives[i], &tx, 8);
+        if (st != HAL_OK) printf("state fail %d \n\r", i);
+        else              printf("state succ %d \n\r", i);
+    }
+    osDelay(100);
 
-	TxHeader.ErrorStateIndicator = FDCAN_ESI_ACTIVE;
-	TxHeader.BitRateSwitch       = FDCAN_BRS_OFF;
-	TxHeader.FDFormat            = FDCAN_CLASSIC_CAN;
-	TxHeader.TxEventFifoControl  = FDCAN_NO_TX_EVENTS;
-	TxHeader.MessageMarker       = 0;
-
-	HAL_StatusTypeDef st;
-
-//	uint8_t SetState[8] = {0x08,0x00,0x00,0x00,0x00,0x00,0x00,0x00};
-	for (int i = 0; i < ODRIVE_COUNT; i++) {
-		while (HAL_FDCAN_GetTxFifoFreeLevel(&hfdcan1) == 0) {
-		  osDelay(1);
-		}
-		st = Set_Axis_Requested_State(&odrives[i], &tx, 8);
-
-		if (st != HAL_OK) {
-			printf("state fail %d \n\r", i);
-		}
-		else {
-			printf("state succ %d \n\r", i);
-		}
-	}
-
-	osDelay(100);
-
-  /* Infinite loop */
-  for(;;)
-  {
-
-	  float vels[4] = {0.5f, 1.2f, 1.0f, 1.25f};
-
-	  for (int i = 0; i < 4; i++)
-	  {
-	      while (HAL_FDCAN_GetTxFifoFreeLevel(&hfdcan1) == 0) {
-	    	  osDelay(1);
-	      }
-
-	      st = Set_Input_Vel(&odrives[i], &tx, vels[i], 0.0f);
-
-	      if (st != HAL_OK) {
-	          printf("Velocity set fail [%d], err=0x%08lX\r\n", i, hfdcan1.ErrorCode);
-	      }
-	  }
-
-
-	  for (int i = 0; i < ODRIVE_COUNT; i++) { // NOTE HEARTBEAT EXCLUDED FROM "UPDATED" FLAG
-		  if (odrives[i].UPDATED) {
-			  odrives[i].UPDATED = 0;
-
-			  printf("ODrive Node %u | Err=%lu | State=%u | Ctrl=%u | Pos=%.3f | Vel=%.3f | Shadow=%ld | CPR=%ld | Vbus=%.3f | Ibus=%.3f | IqSet=%.3f | IqMeas=%.3f\r\n",
-					 odrives[i].NODE_ID,
-					 odrives[i].AXIS_Error,
-					 odrives[i].AXIS_Current_State,
-					 odrives[i].Controller_Status,
-					 odrives[i].AXIS_Encoder_Pos,
-					 odrives[i].AXIS_Encoder_Vel,
-					 odrives[i].AXIS_Encoder_Shadow,
-					 odrives[i].AXIS_Encoder_CPR,
-					 odrives[i].AXIS_Bus_Voltage,
-					 odrives[i].AXIS_Bus_Current,
-					 odrives[i].AXIS_Iq_Setpoint,
-					 odrives[i].AXIS_Iq_Measured);
-		  }
-	  }
-
-	  osDelay(100);
-  }
+    for(;;)
+    {
+        float vels[4] = {0.5f, 1.2f, 1.0f, 1.25f};
+        for (int i = 0; i < 4; i++) {
+            FDCAN_WAIT_TX_FREE();
+            st = Set_Input_Vel(&odrives[i], &tx, vels[i], 0.0f);
+            if (st != HAL_OK)
+                printf("Velocity set fail [%d], err=0x%08lX\r\n", i, hfdcan1.ErrorCode);
+        }
+        for (int i = 0; i < ODRIVE_COUNT; i++) {
+            if (odrives[i].UPDATED) {
+                odrives[i].UPDATED = 0;
+                printf("ODrive Node %u | Err=%lu | State=%u | Ctrl=%u | Pos=%.3f | Vel=%.3f | Shadow=%ld | CPR=%ld | Vbus=%.3f | Ibus=%.3f | IqSet=%.3f | IqMeas=%.3f\r\n",
+                       odrives[i].NODE_ID, odrives[i].AXIS_Error, odrives[i].AXIS_Current_State,
+                       odrives[i].Controller_Status, odrives[i].AXIS_Encoder_Pos, odrives[i].AXIS_Encoder_Vel,
+                       odrives[i].AXIS_Encoder_Shadow, odrives[i].AXIS_Encoder_CPR,
+                       odrives[i].AXIS_Bus_Voltage, odrives[i].AXIS_Bus_Current,
+                       odrives[i].AXIS_Iq_Setpoint, odrives[i].AXIS_Iq_Measured);
+            }
+        }
+        osDelay(100);
+    }
   /* USER CODE END 5 */
 }
 
+/* ── UART ring buffers ──────────────────────────────────────────────────── */
+
 /* USER CODE BEGIN Header_start_UART_RX_Task */
-/** @brief circular receive buffer size used in HAL_UART_RxCpltCallback, and UART_RX_Task */
 #define RX_BUF_SIZE 256
+static uint8_t          rx_buf[RX_BUF_SIZE];
+static volatile size_t  rx_head = 0;
+static volatile size_t  rx_tail = 0;
+static uint8_t          rx_char;
 
-/** @brief circular receive buffer used in HAL_UART_RxCpltCallback and UART_RX_Task */
-static uint8_t rx_buf[RX_BUF_SIZE];
+/* Second ring buffer for USART2 (ESP32 / Bluetooth) */
+#define RX_BUF2_SIZE 256
+static uint8_t          rx_buf2[RX_BUF2_SIZE];
+static volatile size_t  rx_head2 = 0;
+static volatile size_t  rx_tail2 = 0;
+static uint8_t          rx_char2;
 
-/** @brief head index to read bytes out of circular receive buffer used in HAL_UART_RxCpltCallback and UART_RX_Task */
-static volatile size_t rx_head = 0;
-
-/** @brief tail index to write bytes into circular receive buffer used in HAL_UART_RxCpltCallback and UART_RX_Task */
-static volatile size_t rx_tail = 0;
-
-/** @brief temporary char receive buffer in HAL_UART_RxCpltCallback (called every UART3 interrupt) necessary for UART_RX_Task */
-static uint8_t rx_char;
+/* Dead-zone thresholds: commands below these magnitudes are treated as zero */
+#define BT_DEADZONE_LINEAR  0.05f
+#define BT_DEADZONE_ANGULAR 0.05f
 
 /**
- * @brief UART receive complete interrupt callback.
- * @details
- * Called automatically by HAL when a byte is received through UART
- * configured with interrupt mode. If the interrupt source is USART3,
- * the received byte is stored in the circular receive buffer (`rx_buf`)
- * at the current tail position, and the tail index is advanced with
- * wrap-around. The UART is then re-armed to receive the next byte.
- *
- * @param[in] huart Pointer to the UART handle that triggered the interrupt.
+ * @brief UART RX interrupt callback — handles both USART3 (ROS/debug) and
+ *        USART2 (ESP32 Bluetooth).
  */
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
 {
     if (huart->Instance == USART3) {
-        // Store received char in ring buffer
         rx_buf[rx_tail] = rx_char;
         rx_tail = (rx_tail + 1) % RX_BUF_SIZE;
-
-        // Re-arm UART to receive next char
         HAL_UART_Receive_IT(huart, &rx_char, 1);
+    } else if (huart->Instance == USART2) {
+        rx_buf2[rx_tail2] = rx_char2;
+        rx_tail2 = (rx_tail2 + 1) % RX_BUF2_SIZE;
+        HAL_UART_Receive_IT(huart, &rx_char2, 1);
     }
 }
-
 
 /* USER CODE END Header_start_UART_RX_Task */
 void start_UART_RX_Task(void *argument)
 {
   /* USER CODE BEGIN start_UART_RX_Task */
+    char line_buf[RX_BUF_SIZE] = {0};
+    uint16_t line_index = 0;
+    ODriveCmdMsg odrive_cmd = {0};
 
+    HAL_UART_Receive_IT(&huart3, &rx_char, 1);
 
-	char line_buf[RX_BUF_SIZE] = {0};
-	uint16_t line_index = 0;
+    for (;;) {
+        while (rx_head != rx_tail) {
+            uint8_t byte = rx_buf[rx_head];
+            rx_head = (rx_head + 1) % RX_BUF_SIZE;
 
-	ODriveCmdMsg odrive_cmd = {0};
-
-	// Start the first interrupt reception
-	HAL_UART_Receive_IT(&huart3, &rx_char, 1);
-	/* Infinite loop */
-	for (;;) {
-//		printf("alive2\r\n");
-		// Check if data is available
-		while (rx_head != rx_tail) {
-			uint8_t byte = rx_buf[rx_head];
-			rx_head = (rx_head + 1) % RX_BUF_SIZE;
-
-			if (byte == '\n' || byte == '\r') {
-				if (line_index > 0) {
-					line_buf[line_index] = '\0';
-
-//					printf("📥 Full line received: \"%s\"\r\n", line_buf);
-
-					UART_RX_ParseLine(line_buf, &odrive_cmd, UART_QueueHandle, URX_2_CAN_QueueHandle);
-				}
-
-				line_index = 0;
-				memset(line_buf, 0, sizeof(line_buf));
-			}
-			else if (line_index < RX_BUF_SIZE - 1)
-			{
-				line_buf[line_index++] = byte;
-			}
-			else
-			{
-				line_index = 0;
-				memset(line_buf, 0, sizeof(line_buf));
-				printf("Line buffer overflowed and reset.\r\n");
-			}
-		}
-
-		osDelay(5); // Cooperative multitasking
-	}
-
+            if (byte == '\n' || byte == '\r') {
+                if (line_index > 0) {
+                    line_buf[line_index] = '\0';
+                    UART_RX_ParseLine(line_buf, &odrive_cmd, UART_QueueHandle, URX_2_CAN_QueueHandle);
+                }
+                line_index = 0;
+                memset(line_buf, 0, sizeof(line_buf));
+            } else if (line_index < RX_BUF_SIZE - 1) {
+                line_buf[line_index++] = byte;
+            } else {
+                line_index = 0;
+                memset(line_buf, 0, sizeof(line_buf));
+                printf("Line buffer overflowed and reset.\r\n");
+            }
+        }
+        osDelay(5);
+    }
   /* USER CODE END start_UART_RX_Task */
+}
+
+/* USER CODE BEGIN Header_start_BT_RX_Task */
+/* USER CODE END Header_start_BT_RX_Task */
+/**
+ * @brief Receives velocity commands from the ESP32 via USART2 (Bluetooth).
+ *
+ * Protocol: "3 <vx> <vy> <wz> <buttons_hex>\r\n"
+ *   vx, vy, wz in m/s and rad/s (robot frame).
+ *   buttons_hex: hex bitmask — bit 3 is emergency stop.
+ *
+ * Dead-zones are applied before the command is queued so that small joystick
+ * noise does not produce creep motion.
+ */
+void start_BT_RX_Task(void *argument)
+{
+  /* USER CODE BEGIN start_BT_RX_Task */
+    char     line_buf2[RX_BUF2_SIZE] = {0};
+    uint16_t line_index2 = 0;
+    osStatus_t qst;
+
+    /* Watchdog: print "no data" every 2 s if nothing arrives on USART2 */
+    uint32_t last_rx_tick  = osKernelGetTickCount();
+    uint32_t total_bytes   = 0;
+    uint32_t BT_WATCHDOG_MS = 1000;
+
+    HAL_UART_Receive_IT(&huart2, &rx_char2, 1);
+    printf("BT_RX_Task started — waiting for USART2 data\r\n");
+
+    for (;;) {
+        uint8_t got_any = 0;
+
+        while (rx_head2 != rx_tail2) {
+            uint8_t byte = rx_buf2[rx_head2];
+            rx_head2 = (rx_head2 + 1) % RX_BUF2_SIZE;
+            got_any = 1;
+            total_bytes++;
+
+            if (byte == '\n' || byte == '\r') {
+                if (line_index2 > 0) {
+                    line_buf2[line_index2] = '\0';
+//                    printf("BT RX raw: \"%s\"\r\n", line_buf2);
+
+                    int msg_type = 0;
+                    if (sscanf(line_buf2, "%d", &msg_type) == 1 && msg_type == 3) {
+                        float vx = 0.0f, vy = 0.0f, wz = 0.0f;
+                        unsigned int buttons_u = 0;
+                        int parsed = sscanf(line_buf2, "%*d %f %f %f %x",
+                                            &vx, &vy, &wz, &buttons_u);
+                        if (parsed == 4) {
+                            uint16_t buttons = (uint16_t)(buttons_u & 0xFFFF);
+
+                            if (vx > -BT_DEADZONE_LINEAR  && vx < BT_DEADZONE_LINEAR)  vx = 0.0f;
+                            if (vy > -BT_DEADZONE_LINEAR  && vy < BT_DEADZONE_LINEAR)  vy = 0.0f;
+                            if (wz > -BT_DEADZONE_ANGULAR && wz < BT_DEADZONE_ANGULAR) wz = 0.0f;
+
+                            /*
+                             * Button 0x02 means:
+                             * ESP32 is toggling BT UART OFF.
+                             *
+                             * Release BT_active so the other UART can control again.
+                             */
+                            if (buttons & BT_UART_TOGGLE_BUTTON) {
+                                uint8_t was_bt_active = BT_active;
+
+                                BT_active = 0;
+
+                                if (was_bt_active) {
+                                    printf("BT: toggle-off received, BT_active=0\r\n");
+                                } else {
+                                    printf("BT: toggle-off received while already inactive\r\n");
+                                }
+
+                                /*
+                                 * Queue one final stop command.
+                                 * Since ESP32 sends this packet 3 times, you can either queue all 3,
+                                 * or only queue the first one when BT was previously active.
+                                 *
+                                 * I recommend only queueing if BT was active.
+                                 */
+                                if (was_bt_active) {
+                                    ODriveCmdMsg stop_cmd = {0};
+                                    stop_cmd.type           = ODRIVE_CMD_SET_VEL;
+                                    stop_cmd.target_mask    = 0x0F;
+                                    stop_cmd.source         = CMD_SOURCE_BT;
+                                    stop_cmd.buttons        = buttons;
+                                    stop_cmd.robot_twist[0] = 0.0f;
+                                    stop_cmd.robot_twist[1] = 0.0f;
+                                    stop_cmd.robot_twist[2] = 0.0f;
+
+                                    qst = osMessageQueuePut(URX_2_CAN_QueueHandle, &stop_cmd, 0, 0);
+                                    if (qst != osOK) {
+                                        printf("BT: failed to queue final stop cmd\r\n");
+                                    }
+                                }
+
+                                /*
+                                 * Important:
+                                 * Do not process this as a normal BT velocity command.
+                                 */
+                                line_index2 = 0;
+                                memset(line_buf2, 0, sizeof(line_buf2));
+                                continue;
+                            }
+
+                            /*
+                             * Normal BT command.
+                             * Any valid BT packet that does not contain 0x02 activates BT control.
+                             */
+                            BT_active = 1;
+
+                            ODriveCmdMsg bt_cmd = {0};
+                            bt_cmd.type           = ODRIVE_CMD_SET_VEL;
+                            bt_cmd.target_mask    = 0x0F;
+                            bt_cmd.source         = CMD_SOURCE_BT;
+                            bt_cmd.buttons        = buttons;
+                            bt_cmd.robot_twist[0] = vx;
+                            bt_cmd.robot_twist[1] = vy;
+                            bt_cmd.robot_twist[2] = wz;
+
+                            qst = osMessageQueuePut(URX_2_CAN_QueueHandle, &bt_cmd, 0, 0);
+                            if (qst != osOK) {
+                                printf("BT: failed to queue cmd\r\n");
+                            }
+                        } else {
+                            printf("BT: parse fail: \"%s\"\r\n", line_buf2);
+                        }
+                    } else {
+                        printf("BT: unexpected type %d in \"%s\"\r\n", msg_type, line_buf2);
+                    }
+                }
+                line_index2 = 0;
+                memset(line_buf2, 0, sizeof(line_buf2));
+            } else if (line_index2 < RX_BUF2_SIZE - 1) {
+                line_buf2[line_index2++] = byte;
+            } else {
+                line_index2 = 0;
+                memset(line_buf2, 0, sizeof(line_buf2));
+                printf("BT: line buffer overflow\r\n");
+            }
+        }
+
+        if (got_any) {
+            last_rx_tick = osKernelGetTickCount();
+        } else if ((osKernelGetTickCount() - last_rx_tick) >= BT_WATCHDOG_MS) {
+//            printf("BT: no data on USART2 for %u ms (total bytes ever: %lu)\r\n",
+//                   BT_WATCHDOG_MS, total_bytes);
+            last_rx_tick = osKernelGetTickCount();
+        }
+
+        osDelay(5);
+    }
+  /* USER CODE END start_BT_RX_Task */
 }
 
 /* USER CODE BEGIN Header_Start_UART_TX_Task */
@@ -1641,57 +1277,48 @@ void start_UART_RX_Task(void *argument)
 void Start_UART_TX_Task(void *argument)
 {
   /* USER CODE BEGIN Start_UART_TX_Task */
-	ODriveCmdMsg last_cmd = {0};
-	ODriveTelemetryMsg telemetryMsg = {0};
+    ODriveCmdMsg last_cmd = {0};
+    ODriveTelemetryMsg telemetryMsg = {0};
+    osStatus_t qst1, qst2;
 
-	osStatus_t qst1;
-	osStatus_t qst2;
+    for (;;)
+    {
+        qst1 = osMessageQueueGet(CAN_2_UTX_QueueHandle, &telemetryMsg, NULL, osWaitForever);
+        qst2 = osMessageQueueGet(UART_QueueHandle, &last_cmd, NULL, 0);
+        (void)qst1; (void)qst2;
 
-//	printf("alive\r\n");
+        printf("CMD_vx=%.3lf,CMD_vy=%.3lf,CMD_wz=%.3lf,"
+               "IMU_yaw=%.2f,IMU_roll=%.2f,IMU_pitch=%.2f,"
+               "IK_u0=%.3lf,IK_u1=%.3lf,IK_u2=%.3lf,IK_u3=%.3lf,"
+               "ODOM_phi=%.3f,ODOM_x=%.3f,ODOM_y=%.3f,"
+               "ODOM_w=%.3f,ODOM_vx=%.3f,ODOM_vy=%.3f,"
+               "N0=%u,E0=%lu,S0=%u,C0=%u,P0=%.3f,V0=%.3f,Sh0=%ld,CPR0=%ld,Vbus0=%.3f,Ibus0=%.3f,IqSet0=%.3f,IqMeas0=%.3f,U0=%u,"
+               "N1=%u,E1=%lu,S1=%u,C1=%u,P1=%.3f,V1=%.3f,Sh1=%ld,CPR1=%ld,Vbus1=%.3f,Ibus1=%.3f,IqSet1=%.3f,IqMeas1=%.3f,U1=%u,"
+               "N2=%u,E2=%lu,S2=%u,C2=%u,P2=%.3f,V2=%.3f,Sh2=%ld,CPR2=%ld,Vbus2=%.3f,Ibus2=%.3f,IqSet2=%.3f,IqMeas2=%.3f,U2=%u,"
+               "N3=%u,E3=%lu,S3=%u,C3=%u,P3=%.3f,V3=%.3f,Sh3=%ld,CPR3=%ld,Vbus3=%.3f,Ibus3=%.3f,IqSet3=%.3f,IqMeas3=%.3f,U3=%u,"
+               "BT_active=%u,BT_vx=%.3f,BT_vy=%.3f,BT_wz=%.3f\r\n",
+               last_cmd.robot_twist[0], last_cmd.robot_twist[1], last_cmd.robot_twist[2],
+               telemetryMsg.imu.yaw, telemetryMsg.imu.roll, telemetryMsg.imu.pitch,
+               telemetryMsg.IK_computed_wheel_speeds[0], telemetryMsg.IK_computed_wheel_speeds[1],
+               telemetryMsg.IK_computed_wheel_speeds[2], telemetryMsg.IK_computed_wheel_speeds[3],
+               telemetryMsg.odom.phi, telemetryMsg.odom.x_pos, telemetryMsg.odom.y_pos,
+               telemetryMsg.odom.q_dot[0], telemetryMsg.odom.q_dot[1], telemetryMsg.odom.q_dot[2],
+               telemetryMsg.node_id[0], telemetryMsg.axis_error[0], telemetryMsg.axis_state[0], telemetryMsg.controller_status[0],
+               telemetryMsg.pos_est[0], telemetryMsg.vel_est[0], telemetryMsg.encoder_shadow[0], telemetryMsg.encoder_cpr[0],
+               telemetryMsg.bus_voltage[0], telemetryMsg.bus_current[0], telemetryMsg.iq_setpoint[0], telemetryMsg.iq_measured[0], telemetryMsg.updated[0],
+               telemetryMsg.node_id[1], telemetryMsg.axis_error[1], telemetryMsg.axis_state[1], telemetryMsg.controller_status[1],
+               telemetryMsg.pos_est[1], telemetryMsg.vel_est[1], telemetryMsg.encoder_shadow[1], telemetryMsg.encoder_cpr[1],
+               telemetryMsg.bus_voltage[1], telemetryMsg.bus_current[1], telemetryMsg.iq_setpoint[1], telemetryMsg.iq_measured[1], telemetryMsg.updated[1],
+               telemetryMsg.node_id[2], telemetryMsg.axis_error[2], telemetryMsg.axis_state[2], telemetryMsg.controller_status[2],
+               telemetryMsg.pos_est[2], telemetryMsg.vel_est[2], telemetryMsg.encoder_shadow[2], telemetryMsg.encoder_cpr[2],
+               telemetryMsg.bus_voltage[2], telemetryMsg.bus_current[2], telemetryMsg.iq_setpoint[2], telemetryMsg.iq_measured[2], telemetryMsg.updated[2],
+               telemetryMsg.node_id[3], telemetryMsg.axis_error[3], telemetryMsg.axis_state[3], telemetryMsg.controller_status[3],
+               telemetryMsg.pos_est[3], telemetryMsg.vel_est[3], telemetryMsg.encoder_shadow[3], telemetryMsg.encoder_cpr[3],
+               telemetryMsg.bus_voltage[3], telemetryMsg.bus_current[3], telemetryMsg.iq_setpoint[3], telemetryMsg.iq_measured[3], telemetryMsg.updated[3],
+               telemetryMsg.bt_active, telemetryMsg.bt_vx, telemetryMsg.bt_vy, telemetryMsg.bt_wz);
 
-
-  /* Infinite loop */
-	for (;;)
-	{
-//		printf("alive tx");
-		qst1 = osMessageQueueGet(CAN_2_UTX_QueueHandle, &telemetryMsg, NULL, osWaitForever);
-//		if (qst1 != osOK) printf("qst1 failed: %d\r\n", qst1);
-
-		qst2 = osMessageQueueGet(UART_QueueHandle, &last_cmd, NULL, 0);
-//		if (qst2 != osOK) printf("qst2 failed: %d\r\n", qst2);
-		printf("CMD_vx=%.3lf,CMD_vy=%.3lf,CMD_wz=%.3lf,"
-			   "IMU_yaw=%.2f,IMU_roll=%.2f,IMU_pitch=%.2f,"
-			   "IK_u0=%.3lf,IK_u1=%.3lf,IK_u2=%.3lf,IK_u3=%.3lf,"
-			   "ODOM_phi=%.3f,ODOM_x=%.3f,ODOM_y=%.3f,"
-			   "ODOM_w=%.3f,ODOM_vx=%.3f,ODOM_vy=%.3f,"
-			   "N0=%u,E0=%lu,S0=%u,C0=%u,P0=%.3f,V0=%.3f,Sh0=%ld,CPR0=%ld,Vbus0=%.3f,Ibus0=%.3f,IqSet0=%.3f,IqMeas0=%.3f,U0=%u,"
-			   "N1=%u,E1=%lu,S1=%u,C1=%u,P1=%.3f,V1=%.3f,Sh1=%ld,CPR1=%ld,Vbus1=%.3f,Ibus1=%.3f,IqSet1=%.3f,IqMeas1=%.3f,U1=%u,"
-			   "N2=%u,E2=%lu,S2=%u,C2=%u,P2=%.3f,V2=%.3f,Sh2=%ld,CPR2=%ld,Vbus2=%.3f,Ibus2=%.3f,IqSet2=%.3f,IqMeas2=%.3f,U2=%u,"
-			   "N3=%u,E3=%lu,S3=%u,C3=%u,P3=%.3f,V3=%.3f,Sh3=%ld,CPR3=%ld,Vbus3=%.3f,Ibus3=%.3f,IqSet3=%.3f,IqMeas3=%.3f,U3=%u\r\n",
-			   last_cmd.robot_twist[0], last_cmd.robot_twist[1], last_cmd.robot_twist[2],
-			   telemetryMsg.imu.yaw, telemetryMsg.imu.roll, telemetryMsg.imu.pitch,
-			   telemetryMsg.IK_computed_wheel_speeds[0], telemetryMsg.IK_computed_wheel_speeds[1], telemetryMsg.IK_computed_wheel_speeds[2],telemetryMsg.IK_computed_wheel_speeds[3],
-			   telemetryMsg.odom.phi, telemetryMsg.odom.x_pos, telemetryMsg.odom.y_pos,
-			   telemetryMsg.odom.q_dot[0], telemetryMsg.odom.q_dot[1], telemetryMsg.odom.q_dot[2],
-
-			   telemetryMsg.node_id[0], telemetryMsg.axis_error[0], telemetryMsg.axis_state[0], telemetryMsg.controller_status[0],
-			   telemetryMsg.pos_est[0], telemetryMsg.vel_est[0], telemetryMsg.encoder_shadow[0], telemetryMsg.encoder_cpr[0],
-			   telemetryMsg.bus_voltage[0], telemetryMsg.bus_current[0], telemetryMsg.iq_setpoint[0], telemetryMsg.iq_measured[0], telemetryMsg.updated[0],
-
-			   telemetryMsg.node_id[1], telemetryMsg.axis_error[1], telemetryMsg.axis_state[1], telemetryMsg.controller_status[1],
-			   telemetryMsg.pos_est[1], telemetryMsg.vel_est[1], telemetryMsg.encoder_shadow[1], telemetryMsg.encoder_cpr[1],
-			   telemetryMsg.bus_voltage[1], telemetryMsg.bus_current[1], telemetryMsg.iq_setpoint[1], telemetryMsg.iq_measured[1], telemetryMsg.updated[1],
-
-			   telemetryMsg.node_id[2], telemetryMsg.axis_error[2], telemetryMsg.axis_state[2], telemetryMsg.controller_status[2],
-			   telemetryMsg.pos_est[2], telemetryMsg.vel_est[2], telemetryMsg.encoder_shadow[2], telemetryMsg.encoder_cpr[2],
-			   telemetryMsg.bus_voltage[2], telemetryMsg.bus_current[2], telemetryMsg.iq_setpoint[2], telemetryMsg.iq_measured[2], telemetryMsg.updated[2],
-
-			   telemetryMsg.node_id[3], telemetryMsg.axis_error[3], telemetryMsg.axis_state[3], telemetryMsg.controller_status[3],
-			   telemetryMsg.pos_est[3], telemetryMsg.vel_est[3], telemetryMsg.encoder_shadow[3], telemetryMsg.encoder_cpr[3],
-			   telemetryMsg.bus_voltage[3], telemetryMsg.bus_current[3], telemetryMsg.iq_setpoint[3], telemetryMsg.iq_measured[3], telemetryMsg.updated[3]);
-
-		osDelay(10);
-	}
+        osDelay(10);
+    }
   /* USER CODE END Start_UART_TX_Task */
 }
 
@@ -1700,71 +1327,43 @@ void Start_UART_TX_Task(void *argument)
 void StartControlTask(void *argument)
 {
   /* USER CODE BEGIN StartControlTask */
-
-
-  /* Infinite loop */
-  for(;;)
-  {
-
-    osDelay(10);
-
-  }
-
+    for(;;) { osDelay(10); }
   /* USER CODE END StartControlTask */
 }
 
 /* USER CODE BEGIN Header_StartODriveTask */
-/**
-* @brief Function implementing the ODriveTask thread.
-* @param argument: Not used
-* @retval None
-*/
 
-HAL_StatusTypeDef ODrive_Startup(Axis odrives[], uint8_t num_odrives, FDCAN_TXmsg *msg, Control_Mode control_mode, Input_Mode input_mode, uint8_t requested_state)
+HAL_StatusTypeDef ODrive_Startup(Axis odrives[], uint8_t num_odrives, FDCAN_TXmsg *msg,
+                                  Control_Mode control_mode, Input_Mode input_mode,
+                                  uint8_t requested_state)
 {
     HAL_StatusTypeDef st;
-
     for (uint8_t i = 0; i < num_odrives; i++)
     {
-    	while (HAL_FDCAN_GetTxFifoFreeLevel(&hfdcan1) == 0) osDelay(1);
+        FDCAN_WAIT_TX_FREE();
         st = Clear_Errors(&odrives[i], msg);
-        if (st != HAL_OK) {
-            printf("ODrive startup failed: axis %u Clear_Errors\r\n", i);
-            return st;
-        }
+        if (st != HAL_OK) { printf("ODrive startup failed: axis %u Clear_Errors\r\n", i); return st; }
 
-        while (HAL_FDCAN_GetTxFifoFreeLevel(&hfdcan1) == 0) osDelay(1);
+        FDCAN_WAIT_TX_FREE();
         st = Set_Controller_Modes(&odrives[i], msg, control_mode, input_mode);
-        if (st != HAL_OK) {
-            printf("ODrive startup failed: axis %u Set_Controller_Modes\r\n", i);
-            return st;
-        }
+        if (st != HAL_OK) { printf("ODrive startup failed: axis %u Set_Controller_Modes\r\n", i); return st; }
 
-        while (HAL_FDCAN_GetTxFifoFreeLevel(&hfdcan1) == 0) osDelay(1);
+        FDCAN_WAIT_TX_FREE();
         st = Set_Axis_Requested_State(&odrives[i], msg, requested_state);
-        if (st != HAL_OK) {
-            printf("ODrive startup failed: axis %u Set_Axis_Requested_State\r\n", i);
-            return st;
-        }
+        if (st != HAL_OK) { printf("ODrive startup failed: axis %u Set_Axis_Requested_State\r\n", i); return st; }
     }
-
     return HAL_OK;
 }
 
 
-void ODrive_ProcessCommand(const ODriveCmdMsg *cmd, Axis odrives[], uint8_t num_odrives, FDCAN_TXmsg *tx, OdomData *odrive_odom, double x_offset, double y_offset, double radius, Control_Mode *current_ctrl_mode, Input_Mode *current_input_mode, double wheel_sign[], double u[]) {
-
-	// TO DO:
-//	- check if necessary/useful to add a helper with a timeout that substitutes potentially blocking:
-//		while (HAL_FDCAN_GetTxFifoFreeLevel(&hfdcan1) == 0) {
-//			osDelay(1);
-//		}
-//	- check if input and ctrl modes variables are necessary or make sense, they are updated even if not all are succ, check other possible cases
-
-	HAL_StatusTypeDef st;
-    double x_dot = 0.0;
-    double y_dot = 0.0;
-    double phi_dot = 0.0;
+void ODrive_ProcessCommand(const ODriveCmdMsg *cmd, Axis odrives[], uint8_t num_odrives,
+                           FDCAN_TXmsg *tx, OdomData *odrive_odom,
+                           double x_offset, double y_offset, double radius,
+                           Control_Mode *current_ctrl_mode, Input_Mode *current_input_mode,
+                           double wheel_sign[], double u[])
+{
+    HAL_StatusTypeDef st;
+    double x_dot = 0.0, y_dot = 0.0, phi_dot = 0.0;
 
     switch (cmd->type)
     {
@@ -1774,77 +1373,51 @@ void ODrive_ProcessCommand(const ODriveCmdMsg *cmd, Axis odrives[], uint8_t num_
                 printf("CMD_SET_VEL rejected: not in VELOCITY_CONTROL\r\n");
                 break;
             }
-
             x_dot   = cmd->robot_twist[0];
             y_dot   = cmd->robot_twist[1];
             phi_dot = cmd->robot_twist[2];
-
-            computeNecessaryWheelSpeedsMecanum( 0.0, x_offset, y_offset, radius, u, phi_dot, y_dot, x_dot );
-
-            for (uint8_t i = 0; i < num_odrives; i++)
-            {
+            computeNecessaryWheelSpeedsMecanum(0.0, x_offset, y_offset, radius, u, phi_dot, y_dot, x_dot);
+            for (uint8_t i = 0; i < num_odrives; i++) {
                 if (!(cmd->target_mask & (1 << i))) continue;
-
-                while (HAL_FDCAN_GetTxFifoFreeLevel(&hfdcan1) == 0) osDelay(1);
-
-                st = Set_Input_Vel(&odrives[i], tx, wheel_sign[i] * (float)((u[i] * odrives[i].gear_ratio) / (2*PI)), 0.0f);
-
-                if (st != HAL_OK) {
-                    printf("CMD_SET_VEL failed on axis %u\r\n", i);
-                }
+                FDCAN_WAIT_TX_FREE();
+                st = Set_Input_Vel(&odrives[i], tx,
+                         wheel_sign[i] * (float)((u[i] * odrives[i].gear_ratio) / (2*PI)), 0.0f);
+                if (st != HAL_OK) printf("CMD_SET_VEL failed on axis %u\r\n", i);
             }
             break;
         }
 
         case ODRIVE_CMD_CLEAR_ERRORS:
         {
-            for (uint8_t i = 0; i < num_odrives; i++)
-            {
+            for (uint8_t i = 0; i < num_odrives; i++) {
                 if (!(cmd->target_mask & (1 << i))) continue;
-
-                while (HAL_FDCAN_GetTxFifoFreeLevel(&hfdcan1) == 0) {
-                    osDelay(1);
-                }
-
+                FDCAN_WAIT_TX_FREE();
                 st = Clear_Errors(&odrives[i], tx);
-                if (st != HAL_OK) {
-                    printf("Clear_Errors failed axis %u\r\n", i);
-                }
+                if (st != HAL_OK) printf("Clear_Errors failed axis %u\r\n", i);
             }
             break;
         }
 
         case ODRIVE_CMD_SET_STATE:
         {
-            for (uint8_t i = 0; i < num_odrives; i++)
-            {
+            for (uint8_t i = 0; i < num_odrives; i++) {
                 if (!(cmd->target_mask & (1 << i))) continue;
-
-                while (HAL_FDCAN_GetTxFifoFreeLevel(&hfdcan1) == 0) {
-                    osDelay(1);
-                }
-
+                FDCAN_WAIT_TX_FREE();
                 st = Set_Axis_Requested_State(&odrives[i], tx, cmd->axis_state);
-                if (st != HAL_OK) {
-                    printf("Set_State failed axis %u\r\n", i);
-                }
+                if (st != HAL_OK) printf("Set_State failed axis %u\r\n", i);
             }
             break;
         }
 
         case ODRIVE_CMD_SET_CONTROLLER_MODE:
         {
-            for (uint8_t i = 0; i < num_odrives; i++)
-            {
+            for (uint8_t i = 0; i < num_odrives; i++) {
                 if (!(cmd->target_mask & (1 << i))) continue;
-
-                while (HAL_FDCAN_GetTxFifoFreeLevel(&hfdcan1) == 0) osDelay(1);
-
-                st = Set_Controller_Modes( &odrives[i], tx, (Control_Mode)cmd->control_mode, (Input_Mode)cmd->input_mode );
-
+                FDCAN_WAIT_TX_FREE();
+                st = Set_Controller_Modes(&odrives[i], tx,
+                         (Control_Mode)cmd->control_mode, (Input_Mode)cmd->input_mode);
                 if (st != HAL_OK) printf("Set_Controller_Mode failed axis %u\r\n", i);
             }
-
             *current_ctrl_mode  = (Control_Mode)cmd->control_mode;
             *current_input_mode = (Input_Mode)cmd->input_mode;
             break;
@@ -1852,63 +1425,50 @@ void ODrive_ProcessCommand(const ODriveCmdMsg *cmd, Axis odrives[], uint8_t num_
 
         case ODRIVE_CMD_STOP_ODRIVES:
         {
-            for (uint8_t i = 0; i < num_odrives; i++)
-            {
+            for (uint8_t i = 0; i < num_odrives; i++) {
                 if (!(cmd->target_mask & (1 << i))) continue;
-
-                while (HAL_FDCAN_GetTxFifoFreeLevel(&hfdcan1) == 0) osDelay(1);
-
+                FDCAN_WAIT_TX_FREE();
                 st = Set_Input_Vel(&odrives[i], tx, 0.0f, 0.0f);
                 if (st != HAL_OK) printf("STOP_ODRIVES vel 0 failed on axis %u\r\n", i);
-
             }
-
-            for (uint8_t i = 0; i < num_odrives; i++)
-            {
+            for (uint8_t i = 0; i < num_odrives; i++) {
                 if (!(cmd->target_mask & (1 << i))) continue;
-
-                while (HAL_FDCAN_GetTxFifoFreeLevel(&hfdcan1) == 0) osDelay(1);
-
+                FDCAN_WAIT_TX_FREE();
                 st = Set_Axis_Requested_State(&odrives[i], tx, IDLE);
                 if (st != HAL_OK) printf("STOP_ODRIVES idle failed on axis %u\r\n", i);
-
             }
             break;
         }
 
-        /* ── CFG: clear errors ─────────────────────────────────────────── */
         case ODRIVE_CFG_CLEAR_ERRORS:
         {
             for (uint8_t i = 0; i < num_odrives; i++) {
                 if (!(cmd->target_mask & (1 << i))) continue;
-                while (HAL_FDCAN_GetTxFifoFreeLevel(&hfdcan1) == 0) osDelay(1);
+                FDCAN_WAIT_TX_FREE();
                 st = Clear_Errors(&odrives[i], tx);
                 if (st != HAL_OK) printf("CFG:Clear_Errors failed axis %u\r\n", i);
             }
             break;
         }
 
-        /* ── CFG: set axis state ────────────────────────────────────────── */
         case ODRIVE_CFG_SET_STATE:
         {
             for (uint8_t i = 0; i < num_odrives; i++) {
                 if (!(cmd->target_mask & (1 << i))) continue;
-                while (HAL_FDCAN_GetTxFifoFreeLevel(&hfdcan1) == 0) osDelay(1);
+                FDCAN_WAIT_TX_FREE();
                 st = Set_Axis_Requested_State(&odrives[i], tx, cmd->axis_state);
                 if (st != HAL_OK) printf("CFG:SetState failed axis %u\r\n", i);
             }
             break;
         }
 
-        /* ── CFG: set controller mode ───────────────────────────────────── */
         case ODRIVE_CFG_SET_CTRL_MODE:
         {
             for (uint8_t i = 0; i < num_odrives; i++) {
                 if (!(cmd->target_mask & (1 << i))) continue;
-                while (HAL_FDCAN_GetTxFifoFreeLevel(&hfdcan1) == 0) osDelay(1);
+                FDCAN_WAIT_TX_FREE();
                 st = Set_Controller_Modes(&odrives[i], tx,
-                         (Control_Mode)cmd->control_mode,
-                         (Input_Mode)cmd->input_mode);
+                         (Control_Mode)cmd->control_mode, (Input_Mode)cmd->input_mode);
                 if (st != HAL_OK) printf("CFG:SetCtrlMode failed axis %u\r\n", i);
             }
             *current_ctrl_mode  = (Control_Mode)cmd->control_mode;
@@ -1916,43 +1476,39 @@ void ODrive_ProcessCommand(const ODriveCmdMsg *cmd, Axis odrives[], uint8_t num_
             break;
         }
 
-        /* ── CFG: set vel / current limits ─────────────────────────────── */
         case ODRIVE_CFG_SET_LIMITS:
         {
             for (uint8_t i = 0; i < num_odrives; i++) {
                 if (!(cmd->target_mask & (1 << i))) continue;
-                while (HAL_FDCAN_GetTxFifoFreeLevel(&hfdcan1) == 0) osDelay(1);
+                FDCAN_WAIT_TX_FREE();
                 st = Set_Limits(&odrives[i], tx, cmd->vel_limit, cmd->curr_limit);
                 if (st != HAL_OK) printf("CFG:SetLimits failed axis %u\r\n", i);
             }
             break;
         }
 
-        /* ── CFG: set position gain ─────────────────────────────────────── */
         case ODRIVE_CFG_SET_POS_GAIN:
         {
             for (uint8_t i = 0; i < num_odrives; i++) {
                 if (!(cmd->target_mask & (1 << i))) continue;
-                while (HAL_FDCAN_GetTxFifoFreeLevel(&hfdcan1) == 0) osDelay(1);
+                FDCAN_WAIT_TX_FREE();
                 st = Set_Position_Gain(&odrives[i], tx, cmd->pos_gain);
                 if (st != HAL_OK) printf("CFG:SetPosGain failed axis %u\r\n", i);
             }
             break;
         }
 
-        /* ── CFG: set velocity gains ────────────────────────────────────── */
         case ODRIVE_CFG_SET_VEL_GAINS:
         {
             for (uint8_t i = 0; i < num_odrives; i++) {
                 if (!(cmd->target_mask & (1 << i))) continue;
-                while (HAL_FDCAN_GetTxFifoFreeLevel(&hfdcan1) == 0) osDelay(1);
+                FDCAN_WAIT_TX_FREE();
                 st = Set_Vel_Gains(&odrives[i], tx, cmd->vel_gain, cmd->vel_int_gain);
                 if (st != HAL_OK) printf("CFG:SetVelGains failed axis %u\r\n", i);
             }
             break;
         }
 
-        /* ── CFG: full startup sequence ─────────────────────────────────── */
         case ODRIVE_CFG_STARTUP:
         {
             HAL_StatusTypeDef startup_st = ODrive_Startup(
@@ -1969,48 +1525,44 @@ void ODrive_ProcessCommand(const ODriveCmdMsg *cmd, Axis odrives[], uint8_t num_
             break;
         }
 
-        /* ── CFG: reboot ────────────────────────────────────────────────── */
         case ODRIVE_CFG_REBOOT:
         {
             for (uint8_t i = 0; i < num_odrives; i++) {
                 if (!(cmd->target_mask & (1 << i))) continue;
-                while (HAL_FDCAN_GetTxFifoFreeLevel(&hfdcan1) == 0) osDelay(1);
+                FDCAN_WAIT_TX_FREE();
                 st = Reboot_ODrive(&odrives[i], tx);
                 if (st != HAL_OK) printf("CFG:Reboot failed axis %u\r\n", i);
             }
             break;
         }
 
-        /* ── CFG: set input torque ──────────────────────────────────────── */
         case ODRIVE_CFG_SET_TORQUE:
         {
             for (uint8_t i = 0; i < num_odrives; i++) {
                 if (!(cmd->target_mask & (1 << i))) continue;
-                while (HAL_FDCAN_GetTxFifoFreeLevel(&hfdcan1) == 0) osDelay(1);
+                FDCAN_WAIT_TX_FREE();
                 st = Set_Input_Torque(&odrives[i], tx, cmd->torque_ff[i]);
                 if (st != HAL_OK) printf("CFG:SetTorque failed axis %u\r\n", i);
             }
             break;
         }
 
-        /* ── CFG: stop (vel=0 then IDLE) ────────────────────────────────── */
         case ODRIVE_CFG_STOP:
         {
             for (uint8_t i = 0; i < num_odrives; i++) {
                 if (!(cmd->target_mask & (1 << i))) continue;
-                while (HAL_FDCAN_GetTxFifoFreeLevel(&hfdcan1) == 0) osDelay(1);
+                FDCAN_WAIT_TX_FREE();
                 Set_Input_Vel(&odrives[i], tx, 0.0f, 0.0f);
             }
             osDelay(50);
             for (uint8_t i = 0; i < num_odrives; i++) {
                 if (!(cmd->target_mask & (1 << i))) continue;
-                while (HAL_FDCAN_GetTxFifoFreeLevel(&hfdcan1) == 0) osDelay(1);
+                FDCAN_WAIT_TX_FREE();
                 Set_Axis_Requested_State(&odrives[i], tx, IDLE);
             }
             break;
         }
 
-        /* ── CFG: set input position ────────────────────────────────────── */
         case ODRIVE_CFG_SET_INPUT_POS:
         {
             if (*current_ctrl_mode != POSITION_CONTROL) {
@@ -2019,7 +1571,7 @@ void ODrive_ProcessCommand(const ODriveCmdMsg *cmd, Axis odrives[], uint8_t num_
             }
             for (uint8_t i = 0; i < num_odrives; i++) {
                 if (!(cmd->target_mask & (1 << i))) continue;
-                while (HAL_FDCAN_GetTxFifoFreeLevel(&hfdcan1) == 0) osDelay(1);
+                FDCAN_WAIT_TX_FREE();
                 st = Set_Input_Pos(&odrives[i], tx,
                          cmd->input_pos_target,
                          (int16_t)(cmd->input_pos_vel_ff * 1000.0f),
@@ -2036,50 +1588,51 @@ void ODrive_ProcessCommand(const ODriveCmdMsg *cmd, Axis odrives[], uint8_t num_
 }
 
 
-void ODrive_UpdateTelemetryAndOdometry(Axis odrives[], uint8_t num_odrives, ODriveTelemetryMsg *msg, OdomData *odom, double *x, double *y, double *theta, double x_offset, double y_offset, double radius, double u[4], double q_dot[3], uint32_t dt, double wheel_sign[]) {
-
+void ODrive_UpdateTelemetryAndOdometry(Axis odrives[], uint8_t num_odrives,
+                                       ODriveTelemetryMsg *msg, OdomData *odom,
+                                       double *x, double *y, double *theta,
+                                       double x_offset, double y_offset, double radius,
+                                       double u[4], double q_dot[3], uint32_t dt,
+                                       double wheel_sign[])
+{
     for (uint8_t i = 0; i < num_odrives; i++)
     {
-        msg->node_id[i] = odrives[i].NODE_ID;
+        msg->node_id[i]            = odrives[i].NODE_ID;
+        msg->axis_error[i]         = odrives[i].AXIS_Error;
+        msg->axis_state[i]         = odrives[i].AXIS_Current_State;
+        msg->controller_status[i]  = odrives[i].Controller_Status;
+        msg->pos_est[i]            = odrives[i].AXIS_Encoder_Pos;
+        msg->vel_est[i]            = odrives[i].AXIS_Encoder_Vel;
+        msg->encoder_shadow[i]     = odrives[i].AXIS_Encoder_Shadow;
+        msg->encoder_cpr[i]        = odrives[i].AXIS_Encoder_CPR;
+        msg->bus_voltage[i]        = odrives[i].AXIS_Bus_Voltage;
+        msg->bus_current[i]        = odrives[i].AXIS_Bus_Current;
+        msg->iq_setpoint[i]        = odrives[i].AXIS_Iq_Setpoint;
+        msg->iq_measured[i]        = odrives[i].AXIS_Iq_Measured;
+        msg->updated[i]            = odrives[i].UPDATED;
+        odrives[i].UPDATED         = 0;
 
-        msg->axis_error[i] = odrives[i].AXIS_Error;
-        msg->axis_state[i] = odrives[i].AXIS_Current_State;
-        msg->controller_status[i] = odrives[i].Controller_Status;
-
-        msg->pos_est[i] = odrives[i].AXIS_Encoder_Pos;
-        msg->vel_est[i] = odrives[i].AXIS_Encoder_Vel;
-
-        msg->encoder_shadow[i] = odrives[i].AXIS_Encoder_Shadow;
-        msg->encoder_cpr[i] = odrives[i].AXIS_Encoder_CPR;
-
-        msg->bus_voltage[i] = odrives[i].AXIS_Bus_Voltage;
-        msg->bus_current[i] = odrives[i].AXIS_Bus_Current;
-
-        msg->iq_setpoint[i] = odrives[i].AXIS_Iq_Setpoint;
-        msg->iq_measured[i] = odrives[i].AXIS_Iq_Measured;
-
-        msg->updated[i] = odrives[i].UPDATED;
-        odrives[i].UPDATED = 0;
-
+        /* Convert velocity estimate back to rad/s in wheel frame (accounts for gear ratio) */
         u[i] = wheel_sign[i] * (odrives[i].AXIS_Encoder_Vel / odrives[i].gear_ratio) * 2.0 * PI;
     }
 
     globalSpeedsFromUMecanum(*theta, x_offset, y_offset, radius, u, q_dot);
 
     double dt_s = dt * 0.001;
-    *x += (q_dot[1]) * dt_s;
-    *y += (q_dot[2]) * dt_s;
-    *theta += (q_dot[0]) * dt_s;
+    *x     += q_dot[1] * dt_s;
+    *y     += q_dot[2] * dt_s;
+    *theta += q_dot[0] * dt_s;
 
-    odom->x_pos = *x;
-    odom->y_pos = *y;
-    odom->phi = *theta;
+    odom->x_pos    = *x;
+    odom->y_pos    = *y;
+    odom->phi      = *theta;
+    odom->q_dot[0] = q_dot[0];
     odom->q_dot[1] = q_dot[1];
     odom->q_dot[2] = q_dot[2];
-    odom->q_dot[0] = q_dot[0];
 
     msg->timestamp_ms = osKernelGetTickCount();
 }
+
 
 osStatus_t ODrive_PushLatestTelemetry(osMessageQueueId_t queue, const ODriveTelemetryMsg *msg)
 {
@@ -2087,18 +1640,13 @@ osStatus_t ODrive_PushLatestTelemetry(osMessageQueueId_t queue, const ODriveTele
     ODriveTelemetryMsg discarded_msg;
 
     st = osMessageQueuePut(queue, msg, 0, 0);
-    if (st == osOK) {
-        return osOK;
-    }
+    if (st == osOK) return osOK;
 
     if (st == osErrorResource)
     {
         if (osMessageQueueGet(queue, &discarded_msg, NULL, 0) == osOK)
-        {
             return osMessageQueuePut(queue, msg, 0, 0);
-        }
     }
-
     return st;
 }
 
@@ -2115,14 +1663,14 @@ void UART_RX_ParseLine(const char *line_buf, ODriveCmdMsg *odrive_cmd,
         return;
     }
 
-    /* Type 1: control command */
     if (msg_type == 1) {
         double vx = 0.0, vy = 0.0, wz = 0.0;
         int parsed = sscanf(line_buf, "%*d %lf %lf %lf", &vx, &vy, &wz);
-
         if (parsed == 3) {
             odrive_cmd->type           = ODRIVE_CMD_SET_VEL;
             odrive_cmd->target_mask    = 0x0F;
+            odrive_cmd->source         = CMD_SOURCE_ROS;
+            odrive_cmd->buttons        = 0;
             odrive_cmd->robot_twist[0] = vx;
             odrive_cmd->robot_twist[1] = vy;
             odrive_cmd->robot_twist[2] = wz;
@@ -2137,7 +1685,6 @@ void UART_RX_ParseLine(const char *line_buf, ODriveCmdMsg *odrive_cmd,
             printf("Type-1 parse fail: \"%s\"\r\n", line_buf);
         }
 
-    /* Type 2: configuration command */
     } else if (msg_type == 2) {
         int sub_type = 0;
         unsigned int mask_u = 0x0F;
@@ -2150,6 +1697,7 @@ void UART_RX_ParseLine(const char *line_buf, ODriveCmdMsg *odrive_cmd,
         ODriveCmdMsg cfg_cmd = {0};
         cfg_cmd.type        = (uint8_t)sub_type;
         cfg_cmd.target_mask = (uint8_t)(mask_u & 0x0F);
+        cfg_cmd.source      = CMD_SOURCE_ROS;
 
         switch ((ODriveCmdType)sub_type) {
             case ODRIVE_CFG_SET_STATE: {
@@ -2228,20 +1776,29 @@ void StartODriveTask(void *argument)
 
     printf("\nODrive Task (State Machine)\r\n");
 
-    const uint8_t num_odrives  = 4;
-    const double  x_offset     = 0.3;
-    const double  y_offset     = 0.3;
-    const double  radius       = 0.1;
+    const uint8_t num_odrives   = 4;
+    const double  x_offset      = 0.3;
+    const double  y_offset      = 0.3;
+    const double  radius        = 0.1;
     const double  wheel_sign[4] = { -1.0, 1.0, -1.0, 1.0 };
 
-    odrives[0].NODE_ID = 36;
-    odrives[1].NODE_ID = 34;
-    odrives[2].NODE_ID = 33;
-    odrives[3].NODE_ID = 40;
+    odrives[0].NODE_ID     = 36;
+    odrives[1].NODE_ID     = 34;
+    odrives[2].NODE_ID     = 33;
+    odrives[3].NODE_ID     = 40;
+    odrives[0].gear_ratio  = 9;
+    odrives[1].gear_ratio  = 9;
+    odrives[2].gear_ratio  = 9;
+    odrives[3].gear_ratio  = 9;
 
-    ODriveSMState sm_state = SM_BOOT;
+    ODriveSMState sm_state         = SM_BOOT;
     Control_Mode  current_ctrl_mode  = VELOCITY_CONTROL;
     Input_Mode    current_input_mode = PASSTHROUGH;
+
+    /* BT source-priority override */
+    const uint32_t BT_OVERRIDE_TIMEOUT_MS = 500;
+    uint8_t  bt_override_active = 0;
+    uint32_t last_bt_tick       = 0;
 
     const uint32_t boot_delay_ms = 3000;
     uint32_t boot_tick = osKernelGetTickCount();
@@ -2249,7 +1806,7 @@ void StartODriveTask(void *argument)
     double x = 0.0, y = 0.0, theta = 0.0;
     double u[4]     = {0.0};
     double q_dot[3] = {0.0};
-    ODriveCmdMsg  cmd         = {0};
+    ODriveCmdMsg       cmd          = {0};
     ODriveTelemetryMsg telemetryMsg = {0};
     OdomData *odrive_odom = &telemetryMsg.odom;
     FDCAN_TXmsg tx = {0};
@@ -2258,13 +1815,12 @@ void StartODriveTask(void *argument)
     const uint32_t telemetry_period = 10;
     osStatus_t qst;
 
-    uint8_t usingIMU = 0;
     bno055_vector_t euler = {0,0,0,0};
-    if (usingIMU) {
-        bno055_assignI2C(&hi2c1);
-        bno055_setup();
-        bno055_setOperationModeNDOF();
-    }
+#if IMU_ENABLED
+    bno055_assignI2C(&hi2c1);
+    bno055_setup();
+    bno055_setOperationModeNDOF();
+#endif
 
     osDelay(1);
 
@@ -2272,7 +1828,9 @@ void StartODriveTask(void *argument)
     {
         now = osKernelGetTickCount();
 
-        if (usingIMU) euler = bno055_getVectorEuler();
+#if IMU_ENABLED
+        euler = bno055_getVectorEuler();
+#endif
         telemetryMsg.imu.yaw   = euler.x;
         telemetryMsg.imu.roll  = euler.y;
         telemetryMsg.imu.pitch = euler.z;
@@ -2286,13 +1844,18 @@ void StartODriveTask(void *argument)
                 if (qst == osOK && cmd.type == ODRIVE_CFG_STARTUP) {
                     printf("SM: BOOT->STARTUP (cmd)\r\n");
                     sm_state = SM_STARTUP;
-                    ODrive_ProcessCommand(&cmd, odrives, num_odrives, &tx, odrive_odom, x_offset, y_offset, radius, &current_ctrl_mode, &current_input_mode, (double*)wheel_sign, telemetryMsg.IK_computed_wheel_speeds);
+                    ODrive_ProcessCommand(&cmd, odrives, num_odrives, &tx,
+                        odrive_odom, x_offset, y_offset, radius,
+                        &current_ctrl_mode, &current_input_mode,
+                        (double*)wheel_sign, telemetryMsg.IK_computed_wheel_speeds);
                     sm_state = SM_RUNNING;
                 }
                 else if ((now - boot_tick) >= boot_delay_ms) {
                     printf("SM: BOOT->STARTUP (auto)\r\n");
                     sm_state = SM_STARTUP;
-                    HAL_StatusTypeDef st = ODrive_Startup(odrives, num_odrives, &tx, VELOCITY_CONTROL, PASSTHROUGH, CLOSED_LOOP_CONTROL);
+                    HAL_StatusTypeDef st = ODrive_Startup(
+                        odrives, num_odrives, &tx,
+                        VELOCITY_CONTROL, PASSTHROUGH, CLOSED_LOOP_CONTROL);
                     if (st == HAL_OK) {
                         current_ctrl_mode  = VELOCITY_CONTROL;
                         current_input_mode = PASSTHROUGH;
@@ -2313,21 +1876,76 @@ void StartODriveTask(void *argument)
 
             case SM_RUNNING:
             {
+                /* BT watchdog: if no BT packet for BT_OVERRIDE_TIMEOUT_MS, stop and release */
+                if (bt_override_active && (now - last_bt_tick) >= BT_OVERRIDE_TIMEOUT_MS) {
+                    ODriveCmdMsg zero_cmd = {0};
+                    zero_cmd.type        = ODRIVE_CMD_SET_VEL;
+                    zero_cmd.target_mask = 0x0F;
+                    ODrive_ProcessCommand(&zero_cmd, odrives, num_odrives, &tx,
+                        odrive_odom, x_offset, y_offset, radius,
+                        &current_ctrl_mode, &current_input_mode,
+                        (double*)wheel_sign, telemetryMsg.IK_computed_wheel_speeds);
+                    bt_override_active     = 0;
+                    telemetryMsg.bt_active = 0;
+                }
+
                 if (qst == osOK) {
+                    /* Bit 3 of buttons: emergency stop — bypasses source priority */
+                    if (cmd.buttons & BT_ESTOP_BUTTON) {
+                        printf("SM: RUNNING->IDLE (BT stop button)\r\n");
+                        ODriveCmdMsg stop_cmd = {0};
+                        stop_cmd.type        = ODRIVE_CMD_STOP_ODRIVES;
+                        stop_cmd.target_mask = 0x0F;
+                        ODrive_ProcessCommand(&stop_cmd, odrives, num_odrives, &tx,
+                            odrive_odom, x_offset, y_offset, radius,
+                            &current_ctrl_mode, &current_input_mode,
+                            (double*)wheel_sign, telemetryMsg.IK_computed_wheel_speeds);
+                        sm_state = SM_IDLE;
+                        break;
+                    }
+
+                    if (cmd.source == CMD_SOURCE_BT) {
+                        if (BT_active) {
+                            bt_override_active     = 1;
+                            last_bt_tick           = now;
+                            telemetryMsg.bt_active = 1;
+                        } else {
+                            /* Toggle-off final stop packet — release override immediately */
+                            bt_override_active     = 0;
+                            telemetryMsg.bt_active = 0;
+                        }
+                        telemetryMsg.bt_vx = (float)cmd.robot_twist[0];
+                        telemetryMsg.bt_vy = (float)cmd.robot_twist[1];
+                        telemetryMsg.bt_wz = (float)cmd.robot_twist[2];
+                    } else {
+                        /* ROS source: silently drop while BT override is active */
+                        if (bt_override_active && (now - last_bt_tick) < BT_OVERRIDE_TIMEOUT_MS)
+                            break;
+                    }
+
                     if (cmd.type == ODRIVE_CFG_STOP) {
                         printf("SM: RUNNING->IDLE (stop)\r\n");
-                        ODrive_ProcessCommand(&cmd, odrives, num_odrives, &tx, odrive_odom, x_offset, y_offset, radius, &current_ctrl_mode, &current_input_mode, (double*)wheel_sign, telemetryMsg.IK_computed_wheel_speeds);
+                        ODrive_ProcessCommand(&cmd, odrives, num_odrives, &tx,
+                            odrive_odom, x_offset, y_offset, radius,
+                            &current_ctrl_mode, &current_input_mode,
+                            (double*)wheel_sign, telemetryMsg.IK_computed_wheel_speeds);
                         sm_state = SM_IDLE;
                         break;
                     }
                     if (cmd.type == ODRIVE_CFG_REBOOT) {
                         printf("SM: RUNNING->BOOT (reboot)\r\n");
-                        ODrive_ProcessCommand(&cmd, odrives, num_odrives, &tx, odrive_odom, x_offset, y_offset, radius, &current_ctrl_mode, &current_input_mode, (double*)wheel_sign, telemetryMsg.IK_computed_wheel_speeds);
-                        sm_state = SM_BOOT;
+                        ODrive_ProcessCommand(&cmd, odrives, num_odrives, &tx,
+                            odrive_odom, x_offset, y_offset, radius,
+                            &current_ctrl_mode, &current_input_mode,
+                            (double*)wheel_sign, telemetryMsg.IK_computed_wheel_speeds);
+                        sm_state  = SM_BOOT;
                         boot_tick = osKernelGetTickCount();
                         break;
                     }
-                    ODrive_ProcessCommand(&cmd, odrives, num_odrives, &tx, odrive_odom, x_offset, y_offset, radius, &current_ctrl_mode, &current_input_mode, (double*)wheel_sign, telemetryMsg.IK_computed_wheel_speeds);
+                    ODrive_ProcessCommand(&cmd, odrives, num_odrives, &tx,
+                        odrive_odom, x_offset, y_offset, radius,
+                        &current_ctrl_mode, &current_input_mode,
+                        (double*)wheel_sign, telemetryMsg.IK_computed_wheel_speeds);
                 }
                 break;
             }
@@ -2339,8 +1957,7 @@ void StartODriveTask(void *argument)
                     ODrive_ProcessCommand(&cmd, odrives, num_odrives, &tx,
                         odrive_odom, x_offset, y_offset, radius,
                         &current_ctrl_mode, &current_input_mode,
-                        (double*)wheel_sign,
-                        telemetryMsg.IK_computed_wheel_speeds);
+                        (double*)wheel_sign, telemetryMsg.IK_computed_wheel_speeds);
                     sm_state = SM_RUNNING;
                 }
                 break;
@@ -2366,54 +1983,31 @@ void StartODriveTask(void *argument)
 
 /**
   * @brief  Period elapsed callback in non blocking mode
-  * @note   This function is called  when TIM6 interrupt took place, inside
-  * HAL_TIM_IRQHandler(). It makes a direct call to HAL_IncTick() to increment
-  * a global variable "uwTick" used as application time base.
-  * @param  htim : TIM handle
-  * @retval None
   */
 void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 {
   /* USER CODE BEGIN Callback 0 */
-
   /* USER CODE END Callback 0 */
-  if (htim->Instance == TIM6)
-  {
-    HAL_IncTick();
-  }
+  if (htim->Instance == TIM6) { HAL_IncTick(); }
   /* USER CODE BEGIN Callback 1 */
-
   /* USER CODE END Callback 1 */
 }
 
 /**
   * @brief  This function is executed in case of error occurrence.
-  * @retval None
   */
 void Error_Handler(void)
 {
   /* USER CODE BEGIN Error_Handler_Debug */
-  /* User can add his own implementation to report the HAL error return state */
   __disable_irq();
-  while (1)
-  {
-  }
+  while (1) {}
   /* USER CODE END Error_Handler_Debug */
 }
 
 #ifdef  USE_FULL_ASSERT
-/**
-  * @brief  Reports the name of the source file and the source line number
-  *         where the assert_param error has occurred.
-  * @param  file: pointer to the source file name
-  * @param  line: assert_param error line source number
-  * @retval None
-  */
 void assert_failed(uint8_t *file, uint32_t line)
 {
   /* USER CODE BEGIN 6 */
-  /* User can add his own implementation to report the file name and line number,
-     ex: printf("Wrong parameters value: file %s on line %d\r\n", file, line) */
   /* USER CODE END 6 */
 }
 #endif /* USE_FULL_ASSERT */

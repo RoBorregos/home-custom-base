@@ -65,6 +65,9 @@ void Error_Handler(void);
 #define PE4_Pin GPIO_PIN_4
 #define PE6_Pin GPIO_PIN_6
 
+#define BT_UART_TOGGLE_BUTTON  0x02
+#define BT_ESTOP_BUTTON 0x04
+
 typedef struct {
     float Kp;
     float Ki;

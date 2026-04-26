@@ -31,6 +31,8 @@
 #define SET_POSITION_GAIN               0x01A
 #define SET_VEL_GAINS                   0x01B
 
+extern volatile uint8_t BT_active;
+
 /* Axis Parameters */
 typedef struct Axis
 {

@@ -11,7 +11,6 @@
 
 extern FDCAN_HandleTypeDef hfdcan1;
 
-
 static inline void pack_i16(uint8_t *dst, int16_t value) {
     memcpy(dst, &value, sizeof(int16_t));
 }
