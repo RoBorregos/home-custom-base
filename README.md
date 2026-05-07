@@ -20,8 +20,6 @@ RoBorregos custom omnidirectional base — firmware and ROS2 interface for a fou
 | IMU yaw fed into inverse kinematics | **Pending** — `phi` hardcoded to 0 |
 | ControlTask (heading controller / path planner) | **Pending** — scaffolded, body empty |
 | BT watchdog (1 s timeout) | **Pending** — commented out |
-| ESP32 heartbeat | **Pending** |
-| BT_active: 1=connected / 2=active | **Pending** — currently 0/1 only |
 
 ---
 
