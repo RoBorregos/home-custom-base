@@ -17,7 +17,6 @@ RoBorregos custom omnidirectional base — firmware and ROS2 interface for a fou
 | Telemetry CSV to ROS computer @ 100 Hz | Working |
 | Dead-reckoning odometry @ 100 Hz | Working |
 | Web dashboard (`localhost:5000/offline`) | Working |
-| IMU yaw fed into inverse kinematics | **Pending** — `phi` hardcoded to 0 |
 | ControlTask (heading controller / path planner) | **Pending** — scaffolded, body empty |
 | BT watchdog (1 s timeout) | **Pending** — commented out |
 
