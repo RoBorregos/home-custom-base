@@ -11,6 +11,7 @@ setup(
             ['resource/' + package_name]),
         ('share/' + package_name, ['package.xml']),
         ('share/' + package_name + '/assets', ['assets/dashboard.html']),
+        ('share/' + package_name + '/assets/js', ['assets/js/chart.umd.min.js', 'assets/js/socket.io.min.js']),
     ],
     install_requires=['setuptools'],
     zip_safe=True,
@@ -21,7 +22,7 @@ setup(
     entry_points={
         'console_scripts': [
                 'odrive_dashboard = odrive_comm.odrive_dashboard:main',
-                'odrive_serial_twister = odrive_comm.odrive_serial_twister:main',
+                'odrive_serial_twist = odrive_comm.odrive_serial_twist:main',
                 'simple_rx = odrive_comm.simple_rx:main',
         ],
     },

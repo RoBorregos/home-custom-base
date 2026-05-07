@@ -45,6 +45,13 @@
 #include <string.h>
 //#include "mcp2515.h"
 #include "ODrive.h"
+/* BNO085 SH2 library */
+#include "sh2_hal_impl.h"
+#include "sh2.h"
+#include "sh2_err.h"
+#include "sh2_hal.h"
+#include "sh2_SensorValue.h"
+#include "euler.h"
 
 /* USER CODE END Includes */
 
@@ -152,12 +159,36 @@ const osThreadAttr_t ODriveTask_attributes = {
   .stack_size = 1024 * 4,
   .priority = (osPriority_t) osPriorityAboveNormal,
 };
+/* Definitions for IMU_Task (BNO085 SH2 service loop) */
+osThreadId_t IMU_TaskHandle;
+const osThreadAttr_t IMU_Task_attributes = {
+  .name = "IMU_Task",
+  .stack_size = 1024 * 4,
+  .priority = (osPriority_t) osPriorityAboveNormal,
+};
 /* Definitions for MutexUART_Data */
 osMutexId_t MutexUART_DataHandle;
 const osMutexAttr_t MutexUART_Data_attributes = {
   .name = "MutexUART_Data"
 };
 /* USER CODE BEGIN PV */
+
+/*
+ * BNO085 shared orientation data.
+ * Written by IMU_Task via imu_sensor_data_cb(); read by ODriveTask for telemetry.
+ * Values are in radians (yaw/pitch/roll from quaternion via q_to_ypr).
+ * Each float is 32-bit aligned → individual reads/writes are atomic on Cortex-M7.
+ * The ODriveTask converts to degrees before publishing to match the previous
+ * BNO055 (which used degrees). Change RAD_TO_DEG multiplier to 1.0 to use radians.
+ */
+volatile float g_bno085_yaw   = 0.0f;
+volatile float g_bno085_pitch = 0.0f;
+volatile float g_bno085_roll  = 0.0f;
+/* Set to 1 by the async event callback when a BNO085 reset event arrives */
+static volatile uint8_t g_bno085_sensor_ready = 0;
+
+#define BNO085_REPORT_INTERVAL_US  20000U   /* 50 Hz rotation vector */
+#define RAD_TO_DEG_D               (180.0 / 3.14159265358979323846)
 
 osMessageQueueId_t UART_QueueHandle;
 const osMessageQueueAttr_t UART_Queue_attributes = {
@@ -232,6 +263,7 @@ void Start_UART_TX_Task(void *argument);
 void StartControlTask(void *argument);
 void StartODriveTask(void *argument);
 void start_BT_RX_Task(void *argument);  /* ESP32 Bluetooth UART receiver */
+void StartIMUTask(void *argument);      /* BNO085 SH2 service loop        */
 
 /* USER CODE BEGIN PFP */
 
@@ -258,8 +290,8 @@ void setMotorDirection(GPIO_TypeDef *port, uint16_t pin1, uint16_t pin2, uint8_t
 int computeNecessaryWheelSpeedsMecanum(double phi, double x_off, double y_off, double r, double u[4], double phi_dot, double y_dot, double x_dot) {
 	u[0] = (x_dot*(cos(phi) + sin(phi)) - y_dot*(cos(phi) - sin(phi)) - phi_dot*(x_off + y_off)) / r;
     u[1] = (x_dot*(cos(phi) - sin(phi)) + y_dot*(cos(phi) + sin(phi)) + phi_dot*(x_off + y_off)) / r;
-    u[2] = (x_dot*(cos(phi) + sin(phi)) - y_dot*(cos(phi) - sin(phi)) + phi_dot*(x_off + y_off)) / r;
-    u[3] = (x_dot*(cos(phi) - sin(phi)) + y_dot*(cos(phi) + sin(phi)) - phi_dot*(x_off + y_off)) / r;
+    u[2] = (x_dot*(cos(phi) - sin(phi)) + y_dot*(cos(phi) + sin(phi)) - phi_dot*(x_off + y_off)) / r;
+    u[3] = (x_dot*(cos(phi) + sin(phi)) - y_dot*(cos(phi) - sin(phi)) + phi_dot*(x_off + y_off)) / r;
     return 0;
 }
 
@@ -333,10 +365,8 @@ Error_Handler();
   MX_TIM13_Init();
   MX_TIM14_Init();
   MX_TIM15_Init();
-//  MX_SPI1_Init();
-#if IMU_ENABLED
-  MX_I2C1_Init();
-#endif
+//  MX_SPI1_Init();   /* SPI1 unused — BNO085 is on I2C1 */
+  MX_I2C1_Init();   /* BNO085 uses I2C1 (PB6=SCL, PB7=SDA, addr 0x4A) */
   MX_FDCAN1_Init();
   MX_USART2_UART_Init();
   /* USER CODE BEGIN 2 */
@@ -438,6 +468,9 @@ Error_Handler();
   if (ODriveTaskHandle == NULL) printf("ODriveTask creation FAILED\r\n");
 
   /* USER CODE BEGIN RTOS_THREADS */
+  /* BNO085 IMU service task — initialises sensor and calls sh2_service() continuously */
+  IMU_TaskHandle = osThreadNew(StartIMUTask, NULL, &IMU_Task_attributes);
+  if (IMU_TaskHandle == NULL) printf("IMU_Task creation FAILED\r\n");
   /* USER CODE END RTOS_THREADS */
 
   /* USER CODE BEGIN RTOS_EVENTS */
@@ -615,15 +648,15 @@ static void MX_SPI1_Init(void)
   hspi1.Init.Mode = SPI_MODE_MASTER;
   hspi1.Init.Direction = SPI_DIRECTION_2LINES;
   hspi1.Init.DataSize = SPI_DATASIZE_8BIT;
-  hspi1.Init.CLKPolarity = SPI_POLARITY_LOW;
-  hspi1.Init.CLKPhase = SPI_PHASE_1EDGE;
+  hspi1.Init.CLKPolarity = SPI_POLARITY_HIGH;   /* BNO085 requires Mode 3 */
+  hspi1.Init.CLKPhase = SPI_PHASE_2EDGE;
   hspi1.Init.NSS = SPI_NSS_SOFT;
   hspi1.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_16;
   hspi1.Init.FirstBit = SPI_FIRSTBIT_MSB;
   hspi1.Init.TIMode = SPI_TIMODE_DISABLE;
   hspi1.Init.CRCCalculation = SPI_CRCCALCULATION_DISABLE;
   hspi1.Init.CRCPolynomial = 0x0;
-  hspi1.Init.NSSPMode = SPI_NSS_PULSE_ENABLE;
+  hspi1.Init.NSSPMode = SPI_NSS_PULSE_DISABLE;  /* CS managed in software */
   hspi1.Init.NSSPolarity = SPI_NSS_POLARITY_LOW;
   hspi1.Init.FifoThreshold = SPI_FIFO_THRESHOLD_01DATA;
   hspi1.Init.TxCRCInitializationPattern = SPI_CRC_INITIALIZATION_ALL_ZERO_PATTERN;
@@ -959,6 +992,36 @@ static void MX_GPIO_Init(void)
   __HAL_RCC_GPIOC_CLK_ENABLE();
 
   /* USER CODE BEGIN MX_GPIO_Init_2 */
+  /* BNO085 CS — PB4, output push-pull, idle HIGH (deasserted) */
+  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_4, GPIO_PIN_SET);
+  GPIO_InitStruct.Pin   = GPIO_PIN_4;
+  GPIO_InitStruct.Mode  = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull  = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
+  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+
+  /* BNO085 RST — PD15, output push-pull, idle HIGH (sensor not in reset) */
+  HAL_GPIO_WritePin(GPIOD, GPIO_PIN_15, GPIO_PIN_SET);
+  GPIO_InitStruct.Pin   = GPIO_PIN_15;
+  GPIO_InitStruct.Mode  = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull  = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(GPIOD, &GPIO_InitStruct);
+
+  /* BNO085 INT — PD14, input with pull-up (sensor drives LOW when data ready) */
+  GPIO_InitStruct.Pin   = GPIO_PIN_14;
+  GPIO_InitStruct.Mode  = GPIO_MODE_INPUT;
+  GPIO_InitStruct.Pull  = GPIO_PULLUP;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(GPIOD, &GPIO_InitStruct);
+
+  /* BNO085 WAKE/PS0 — PA4, output push-pull, idle HIGH */
+  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_4, GPIO_PIN_SET);
+  GPIO_InitStruct.Pin   = GPIO_PIN_4;
+  GPIO_InitStruct.Mode  = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull  = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
   /* USER CODE END MX_GPIO_Init_2 */
   (void)GPIO_InitStruct;
 }
@@ -1164,69 +1227,63 @@ void start_BT_RX_Task(void *argument)
                     if (sscanf(line_buf2, "%d", &msg_type) == 1 && msg_type == 3) {
                         float vx = 0.0f, vy = 0.0f, wz = 0.0f;
                         unsigned int buttons_u = 0;
-                        int parsed = sscanf(line_buf2, "%*d %f %f %f %x",
-                                            &vx, &vy, &wz, &buttons_u);
-                        if (parsed == 4) {
-                            uint16_t buttons = (uint16_t)(buttons_u & 0xFFFF);
-
-                            if (vx > -BT_DEADZONE_LINEAR  && vx < BT_DEADZONE_LINEAR)  vx = 0.0f;
-                            if (vy > -BT_DEADZONE_LINEAR  && vy < BT_DEADZONE_LINEAR)  vy = 0.0f;
-                            if (wz > -BT_DEADZONE_ANGULAR && wz < BT_DEADZONE_ANGULAR) wz = 0.0f;
-
+                        unsigned int controll_state_u = 0;
+                        int parsed = sscanf(line_buf2, "%*d %f %f %f %x %u",
+                                            &vx, &vy, &wz, &buttons_u,
+                                            &controll_state_u);
+                        if (parsed >= 4) {
                             /*
-                             * Button 0x02 means:
-                             * ESP32 is toggling BT UART OFF.
+                             * controll_state mirrors the ESP32's full status:
+                             *   0 = no controller paired        → BT_active 0 (Inactive)
+                             *   1 = paired, TX disabled         → BT_active 1 (Paired)
+                             *   2 = paired, TX enabled          → BT_active 2 (Active)
                              *
-                             * Release BT_active so the other UART can control again.
+                             * Fall back to 1 if the field is missing (old firmware).
                              */
-                            if (buttons & BT_UART_TOGGLE_BUTTON) {
-                                uint8_t was_bt_active = BT_active;
+                            uint8_t controll_state = (parsed >= 5)
+                                                     ? (uint8_t)(controll_state_u <= 2
+                                                                  ? controll_state_u : 2)
+                                                     : 1;
 
-                                BT_active = 0;
-
-                                if (was_bt_active) {
-                                    printf("BT: toggle-off received, BT_active=0\r\n");
-                                } else {
-                                    printf("BT: toggle-off received while already inactive\r\n");
-                                }
+                            /* Directly map ESP32 state to BT_active */
+                            if (controll_state != BT_active) {
+                                uint8_t prev = BT_active;
+                                BT_active = controll_state;
+                                printf("BT: state %u->%u\r\n", prev, BT_active);
 
                                 /*
-                                 * Queue one final stop command.
-                                 * Since ESP32 sends this packet 3 times, you can either queue all 3,
-                                 * or only queue the first one when BT was previously active.
-                                 *
-                                 * I recommend only queueing if BT was active.
+                                 * Transitioning OUT of Active: send one stop command so
+                                 * the state machine releases BT override immediately
+                                 * instead of waiting for the watchdog timeout.
                                  */
-                                if (was_bt_active) {
+                                if (prev == 2 && BT_active < 2) {
                                     ODriveCmdMsg stop_cmd = {0};
                                     stop_cmd.type           = ODRIVE_CMD_SET_VEL;
                                     stop_cmd.target_mask    = 0x0F;
                                     stop_cmd.source         = CMD_SOURCE_BT;
-                                    stop_cmd.buttons        = buttons;
                                     stop_cmd.robot_twist[0] = 0.0f;
                                     stop_cmd.robot_twist[1] = 0.0f;
                                     stop_cmd.robot_twist[2] = 0.0f;
 
-                                    qst = osMessageQueuePut(URX_2_CAN_QueueHandle, &stop_cmd, 0, 0);
-                                    if (qst != osOK) {
-                                        printf("BT: failed to queue final stop cmd\r\n");
-                                    }
+                                    qst = osMessageQueuePut(URX_2_CAN_QueueHandle,
+                                                            &stop_cmd, 0, 0);
+                                    if (qst != osOK)
+                                        printf("BT: failed to queue stop cmd\r\n");
                                 }
+                            }
 
-                                /*
-                                 * Important:
-                                 * Do not process this as a normal BT velocity command.
-                                 */
+                            /* Only queue motion commands when Active */
+                            if (BT_active != 2) {
                                 line_index2 = 0;
                                 memset(line_buf2, 0, sizeof(line_buf2));
                                 continue;
                             }
 
-                            /*
-                             * Normal BT command.
-                             * Any valid BT packet that does not contain 0x02 activates BT control.
-                             */
-                            BT_active = 1;
+                            if (vx > -BT_DEADZONE_LINEAR  && vx < BT_DEADZONE_LINEAR)  vx = 0.0f;
+                            if (vy > -BT_DEADZONE_LINEAR  && vy < BT_DEADZONE_LINEAR)  vy = 0.0f;
+                            if (wz > -BT_DEADZONE_ANGULAR && wz < BT_DEADZONE_ANGULAR) wz = 0.0f;
+
+                            uint16_t buttons = (uint16_t)(buttons_u & 0xFFFF);
 
                             ODriveCmdMsg bt_cmd = {0};
                             bt_cmd.type           = ODRIVE_CMD_SET_VEL;
@@ -1238,9 +1295,8 @@ void start_BT_RX_Task(void *argument)
                             bt_cmd.robot_twist[2] = wz;
 
                             qst = osMessageQueuePut(URX_2_CAN_QueueHandle, &bt_cmd, 0, 0);
-                            if (qst != osOK) {
+                            if (qst != osOK)
                                 printf("BT: failed to queue cmd\r\n");
-                            }
                         } else {
                             printf("BT: parse fail: \"%s\"\r\n", line_buf2);
                         }
@@ -1287,6 +1343,9 @@ void Start_UART_TX_Task(void *argument)
         qst2 = osMessageQueueGet(UART_QueueHandle, &last_cmd, NULL, 0);
         (void)qst1; (void)qst2;
 
+        /* Always reflect the live BT_active — avoids stale values between SM updates */
+        telemetryMsg.bt_active = BT_active;
+
         printf("CMD_vx=%.3lf,CMD_vy=%.3lf,CMD_wz=%.3lf,"
                "IMU_yaw=%.2f,IMU_roll=%.2f,IMU_pitch=%.2f,"
                "IK_u0=%.3lf,IK_u1=%.3lf,IK_u2=%.3lf,IK_u3=%.3lf,"
@@ -1299,8 +1358,7 @@ void Start_UART_TX_Task(void *argument)
                "BT_active=%u,BT_vx=%.3f,BT_vy=%.3f,BT_wz=%.3f\r\n",
                last_cmd.robot_twist[0], last_cmd.robot_twist[1], last_cmd.robot_twist[2],
                telemetryMsg.imu.yaw, telemetryMsg.imu.roll, telemetryMsg.imu.pitch,
-               telemetryMsg.IK_computed_wheel_speeds[0], telemetryMsg.IK_computed_wheel_speeds[1],
-               telemetryMsg.IK_computed_wheel_speeds[2], telemetryMsg.IK_computed_wheel_speeds[3],
+               telemetryMsg.IK_computed_wheel_speeds[0], telemetryMsg.IK_computed_wheel_speeds[1], telemetryMsg.IK_computed_wheel_speeds[2], telemetryMsg.IK_computed_wheel_speeds[3],
                telemetryMsg.odom.phi, telemetryMsg.odom.x_pos, telemetryMsg.odom.y_pos,
                telemetryMsg.odom.q_dot[0], telemetryMsg.odom.q_dot[1], telemetryMsg.odom.q_dot[2],
                telemetryMsg.node_id[0], telemetryMsg.axis_error[0], telemetryMsg.axis_state[0], telemetryMsg.controller_status[0],
@@ -1329,6 +1387,112 @@ void StartControlTask(void *argument)
   /* USER CODE BEGIN StartControlTask */
     for(;;) { osDelay(10); }
   /* USER CODE END StartControlTask */
+}
+
+/* -------------------------------------------------------------------------
+ * BNO085 IMU Task — SH2 callbacks and service loop
+ * ---------------------------------------------------------------------- */
+
+static void imu_async_event_cb(void *cookie, sh2_AsyncEvent_t *event)
+{
+    (void)cookie;
+    if (event->eventId == SH2_RESET) {
+        g_bno085_sensor_ready = 1;
+    }
+}
+
+static void imu_sensor_data_cb(void *cookie, sh2_SensorEvent_t *event)
+{
+    (void)cookie;
+    sh2_SensorValue_t val;
+    if (sh2_decodeSensorEvent(&val, event) != SH2_OK) return;
+
+    if (val.sensorId == SH2_ROTATION_VECTOR) {
+        float yaw, pitch, roll;
+        q_to_ypr(val.un.rotationVector.real,
+                 val.un.rotationVector.i,
+                 val.un.rotationVector.j,
+                 val.un.rotationVector.k,
+                 &yaw, &pitch, &roll);
+        /* Each 32-bit float write is atomic on Cortex-M7 (aligned store).
+         * ODriveTask reads these at most once per 10 ms, so the worst case
+         * is reading yaw from sample N and pitch/roll from sample N+1 —
+         * acceptable for robot telemetry at 50 Hz. */
+        g_bno085_yaw   = yaw;
+        g_bno085_pitch = pitch;
+        g_bno085_roll  = roll;
+    }
+}
+
+static void imu_service_ms(uint32_t ms)
+{
+    uint32_t t0 = osKernelGetTickCount();
+    while ((osKernelGetTickCount() - t0) < ms) {
+        sh2_service();
+        osDelay(1);
+    }
+}
+
+static void imu_enable_rotation_vector(void)
+{
+    sh2_SensorConfig_t cfg;
+    __builtin_memset(&cfg, 0, sizeof(cfg));
+    cfg.reportInterval_us = BNO085_REPORT_INTERVAL_US;
+    int rc = sh2_setSensorConfig(SH2_ROTATION_VECTOR, &cfg);
+    if (rc != SH2_OK) {
+        printf("BNO085: setSensorConfig failed rc=%d\r\n", rc);
+    }
+}
+
+void StartIMUTask(void *argument)
+{
+
+    /* Wait for other AboveNormal tasks (ODriveTask) to finish their startup
+     * prints before we call printf — huart3 has no TX mutex and HAL_UART_Transmit
+     * returns HAL_BUSY silently when preempted mid-print at the same priority. */
+    osDelay(500);
+    printf("IMU_Task: starting BNO085 init\r\n");
+
+    int rc = sh2_open(BNO085_GetHal(), imu_async_event_cb, NULL);
+    if (rc != SH2_OK) {
+        printf("IMU_Task: sh2_open failed rc=%d — halting\r\n", rc);
+        for (;;) osDelay(1000);
+    }
+
+    /* Drain startup traffic while letting the SHTP/SH2 layer settle */
+    imu_service_ms(200);
+
+    rc = sh2_setSensorCallback(imu_sensor_data_cb, NULL);
+    if (rc != SH2_OK) {
+        printf("IMU_Task: setSensorCallback failed rc=%d\r\n", rc);
+    }
+
+    /* Give SH2 time to process control/startup packets before config */
+    imu_service_ms(100);
+
+    imu_enable_rotation_vector();
+
+    /* Clear any spurious reset flag that arrived during sh2_open startup */
+    g_bno085_sensor_ready = 0;
+
+    printf("IMU_Task: BNO085 running at 50 Hz\r\n");
+
+    for (;;) {
+        sh2_service();
+
+        /* If the sensor reset (e.g. power glitch), re-enable the rotation vector */
+        if (g_bno085_sensor_ready) {
+            g_bno085_sensor_ready = 0;
+            printf("IMU_Task: BNO085 reset detected — re-configuring\r\n");
+            imu_service_ms(200);
+            imu_enable_rotation_vector();
+        }
+
+        /* Yield for ~2 ms. sh2_service() returns immediately when INT is high
+         * (no data pending), so this keeps the task at ~500 Hz poll without
+         * hammering the I2C bus (I2C only transacts when INT is LOW). */
+        osDelay(2);
+    }
 }
 
 /* USER CODE BEGIN Header_StartODriveTask */
@@ -1815,25 +1979,20 @@ void StartODriveTask(void *argument)
     const uint32_t telemetry_period = 10;
     osStatus_t qst;
 
-    bno055_vector_t euler = {0,0,0,0};
-#if IMU_ENABLED
-    bno055_assignI2C(&hi2c1);
-    bno055_setup();
-    bno055_setOperationModeNDOF();
-#endif
-
+    /* BNO055 removed — orientation now provided by IMU_Task via g_bno085_* globals */
     osDelay(1);
 
     for (;;)
     {
         now = osKernelGetTickCount();
 
-#if IMU_ENABLED
-        euler = bno055_getVectorEuler();
-#endif
-        telemetryMsg.imu.yaw   = euler.x;
-        telemetryMsg.imu.roll  = euler.y;
-        telemetryMsg.imu.pitch = euler.z;
+        /* Read BNO085 orientation from IMU_Task shared globals.
+         * Each float read is atomic on Cortex-M7 (32-bit aligned load).
+         * Convert radians → degrees to preserve backward compatibility with
+         * the previous BNO055 output format (degrees). */
+        telemetryMsg.imu.yaw   = (double)g_bno085_yaw   * RAD_TO_DEG_D;
+        telemetryMsg.imu.roll  = (double)g_bno085_roll  * RAD_TO_DEG_D;
+        telemetryMsg.imu.pitch = (double)g_bno085_pitch * RAD_TO_DEG_D;
 
         qst = osMessageQueueGet(URX_2_CAN_QueueHandle, &cmd, NULL, 2);
 
@@ -1886,7 +2045,7 @@ void StartODriveTask(void *argument)
                         &current_ctrl_mode, &current_input_mode,
                         (double*)wheel_sign, telemetryMsg.IK_computed_wheel_speeds);
                     bt_override_active     = 0;
-                    telemetryMsg.bt_active = 0;
+                    telemetryMsg.bt_active = BT_active;
                 }
 
                 if (qst == osOK) {
@@ -1905,15 +2064,15 @@ void StartODriveTask(void *argument)
                     }
 
                     if (cmd.source == CMD_SOURCE_BT) {
-                        if (BT_active) {
-                            bt_override_active     = 1;
-                            last_bt_tick           = now;
-                            telemetryMsg.bt_active = 1;
+                        if (BT_active == 2) {
+                            /* Active: BT is controlling the robot */
+                            bt_override_active = 1;
+                            last_bt_tick       = now;
                         } else {
-                            /* Toggle-off final stop packet — release override immediately */
-                            bt_override_active     = 0;
-                            telemetryMsg.bt_active = 0;
+                            /* Paired or Inactive: toggle-off stop packet — release override */
+                            bt_override_active = 0;
                         }
+                        telemetryMsg.bt_active = BT_active;
                         telemetryMsg.bt_vx = (float)cmd.robot_twist[0];
                         telemetryMsg.bt_vy = (float)cmd.robot_twist[1];
                         telemetryMsg.bt_wz = (float)cmd.robot_twist[2];

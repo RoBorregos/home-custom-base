@@ -4,8 +4,8 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>ODrive Dashboard</title>
-<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/socket.io@4.7.2/client-dist/socket.io.min.js"></script>
+<script src="/js/chart.umd.min.js"></script>
+<script src="/js/socket.io.min.js"></script>
 <style>
 :root{
   --bg:#f0f2f6;--surf:#e8eaf2;--card:#ffffff;
@@ -202,6 +202,10 @@ select:focus{outline:none;border-color:var(--acc)}
           <button class="btn" id="bapg" style="width:100%;margin-top:2px">Apply gains</button>
         </div>
       </div>
+      <div style="margin-top:8px;display:flex;align-items:center;gap:6px;padding:5px 8px;background:var(--surf);border-radius:6px;flex-shrink:0">
+        <span style="font-size:10px;color:var(--mut);font-weight:600;white-space:nowrap">Bluetooth control:</span>
+        <span id="btst" style="font-size:11px;font-weight:700;color:var(--red)">Inactive</span>
+      </div>
     </div>
 
     <!-- col 4: mode + global actions + log -->
@@ -330,6 +334,7 @@ link('slvi','vigv',v=>v.toFixed(3),0.01,4);
 // telemetry
 socket.on('telemetry',(d)=>{
   g('rs').textContent='live'; g('rs').style.color='var(--grn)';
+  if(d.bt_active!==undefined){const b=g('btst');const _btl=['Inactive','Paired','Active'];const _btc=['var(--red)','var(--amb)','var(--grn)'];const _bti=Math.min(Math.max(d.bt_active,0),2);b.textContent=_btl[_bti];b.style.color=_btc[_bti];}
   g('cvx').textContent=d.cmd_vx.toFixed(3);
   g('cvy').textContent=d.cmd_vy.toFixed(3);
   g('cwz').textContent=d.cmd_wz.toFixed(3);

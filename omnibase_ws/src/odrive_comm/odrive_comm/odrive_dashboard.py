@@ -181,7 +181,7 @@ class ODriveDashboardNode(Node):
 
     def _start_web_server(self, port: int):
         try:
-            from flask import Flask, render_template_string
+            from flask import Flask, render_template_string, send_from_directory
             from flask_socketio import SocketIO
         except ImportError:
             self.get_logger().error(
@@ -198,6 +198,17 @@ class ODriveDashboardNode(Node):
         @app.route('/')
         def index():
             return render_template_string(DASHBOARD_HTML)
+
+        @app.route('/js/<path:filename>')
+        def serve_js(filename):
+            # Try installed share dir first, fall back to source tree next to this file
+            for candidate in [
+                Path(get_package_share_directory('odrive_comm')) / 'assets' / 'js',
+                Path(__file__).parent.parent / 'assets' / 'js',
+            ]:
+                if candidate.exists():
+                    return send_from_directory(str(candidate), filename)
+            return 'JS file not found — see status.txt for setup instructions', 404
 
         @sio.on('connect')
         def on_connect():
@@ -402,6 +413,7 @@ class ODriveDashboardNode(Node):
             o_phi  = f(data.get('ODOM_phi')); o_x = f(data.get('ODOM_x'))
             o_y    = f(data.get('ODOM_y'));   o_w = f(data.get('ODOM_w'))
             o_vx   = f(data.get('ODOM_vx')); o_vy = f(data.get('ODOM_vy'))
+            bt_active = i(data.get('BT_active'))
 
             def _f32(l): m=Float32MultiArray(); m.data=l; return m
             def _i32(l): m=Int32MultiArray();   m.data=l; return m
@@ -455,6 +467,7 @@ class ODriveDashboardNode(Node):
                 'updated': updated, 'pos_est': pos_est, 'vel_est': vel_est,
                 'bus_voltage': vbus, 'bus_current': ibus,
                 'iq_setpoint': iq_set, 'iq_measured': iq_meas,
+                'bt_active': bt_active,
             }
             self._latest_telem = telem
             if self._sio:
@@ -476,7 +489,8 @@ class ODriveDashboardNode(Node):
                     ctrl_status=z4i, updated=z4i,
                     pos_est=z4f, vel_est=z4f,
                     bus_voltage=z4f, bus_current=z4f,
-                    iq_setpoint=z4f, iq_measured=z4f)
+                    iq_setpoint=z4f, iq_measured=z4f,
+                    bt_active=0)
 
     @staticmethod
     def _sf(v) -> float:
