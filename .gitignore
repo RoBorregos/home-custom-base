@@ -63,4 +63,5 @@ firmware/.metadata
 /firmware/STM32H7_TESTS_OMNIBASE_FDCAN
 /firmware/stm32H755_CAN
 /omnibase_ws/.vscode
+/omnibase_ws/.claude
 /firmware/working_uart_between_tasks_rtosheap60gb.c
