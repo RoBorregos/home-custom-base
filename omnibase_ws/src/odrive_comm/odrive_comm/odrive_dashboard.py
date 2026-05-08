@@ -55,6 +55,17 @@ from rclpy.node import Node
 from geometry_msgs.msg import Twist, TwistStamped
 from std_msgs.msg import Float32MultiArray, Int32MultiArray, String
 import serial
+import serial.tools.list_ports
+
+_STM_VID = 0x0483
+_STM_PID = 0x374E
+
+
+def _find_stm_port(fallback: str) -> str:
+    for p in serial.tools.list_ports.comports():
+        if p.vid == _STM_VID and p.pid == _STM_PID:
+            return p.device
+    return fallback
 
 AXIS_STATES = {
     0: "UNDEFINED", 1: "IDLE", 2: "STARTUP_SEQUENCE",
@@ -105,7 +116,7 @@ class ODriveDashboardNode(Node):
         self.declare_parameter('enable_web_gui',      True)
         self.declare_parameter('web_gui_port',        5000)
 
-        port             = self.get_parameter('serial_port').value
+        port             = _find_stm_port(self.get_parameter('serial_port').value)
         baud             = self.get_parameter('baud_rate').value
         self.use_stamped = self.get_parameter('use_stamped_cmd_vel').value
         self.tx_period   = self.get_parameter('tx_period').value
