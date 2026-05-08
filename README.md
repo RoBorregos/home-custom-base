@@ -32,7 +32,7 @@ RoBorregos custom omnidirectional base — firmware and ROS2 interface for a fou
 ros2 run odrive_comm odrive_dashboard
 ```
 
-Dashboard: `http://localhost:5000`
+Dashboard: `http://host_ip:5000`
 
 ---
 
