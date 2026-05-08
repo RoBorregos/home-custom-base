@@ -129,6 +129,8 @@ class ODriveDashboardNode(Node):
 
         self.declare_parameter('demo_mode', False)
         self._demo = self.get_parameter('demo_mode').value
+        self._baud = baud
+        self._ser_lock = threading.Lock()
         try:
             self.ser = serial.Serial(port, baud, timeout=0.1)
             self.get_logger().info(f"Serial: {port} @ {baud}")
@@ -368,24 +370,56 @@ class ODriveDashboardNode(Node):
     # ── serial ────────────────────────────────────────────────────────────────
 
     def _serial_write(self, text: str):
-        if self.ser is None:
-            return
-        try:
-            self.ser.write((text + '\r\n').encode())
-        except serial.SerialException as e:
-            self.get_logger().error(f"Serial write: {e}")
+        with self._ser_lock:
+            if self.ser is None:
+                return
+            try:
+                self.ser.write((text + '\r\n').encode())
+            except serial.SerialException as e:
+                self.get_logger().error(f"Serial write: {e}")
+                try:
+                    self.ser.close()
+                except Exception:
+                    pass
+                self.ser = None
 
     # ── RX thread ─────────────────────────────────────────────────────────────
 
     def _receiver(self):
-        if self.ser is None:
-            return  # nothing to receive in demo mode
+        reconnect_delay = 2.0
         while rclpy.ok():
+            with self._ser_lock:
+                ser = self.ser
+
+            if ser is None:
+                if self._demo:
+                    return
+                port = _find_stm_port(self.get_parameter('serial_port').value)
+                self.get_logger().info(f"Reconnecting serial on {port}...")
+                try:
+                    new_ser = serial.Serial(port, self._baud, timeout=0.1)
+                    with self._ser_lock:
+                        self.ser = new_ser
+                    self.discovered_node_ids.clear()
+                    self.get_logger().info(f"Serial reconnected: {port}")
+                except serial.SerialException as e:
+                    self.get_logger().warn(
+                        f"Reconnect failed ({e}), retrying in {reconnect_delay:.0f}s")
+                    time.sleep(reconnect_delay)
+                continue
+
             try:
-                line = self.ser.readline().decode(errors='ignore').strip()
+                line = ser.readline().decode(errors='ignore').strip()
             except serial.SerialException as e:
                 self.get_logger().error(f"Serial read: {e}")
-                time.sleep(0.1)
+                with self._ser_lock:
+                    if self.ser is ser:
+                        try:
+                            self.ser.close()
+                        except Exception:
+                            pass
+                        self.ser = None
+                time.sleep(0.5)
                 continue
             if not line:
                 continue
