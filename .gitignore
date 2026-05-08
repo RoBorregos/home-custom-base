@@ -56,12 +56,7 @@ firmware/.metadata
 **/CM7/.settings
 **/CM7/Debug
 
-/firmware/STM32H7_OMNIBASE
-/firmware/STM32H7_OMNIBASE (odrive task v1, pending uart tasks)
-/firmware/STM32H7_OMNIBASE_CAN (copy)
-/firmware/STM32H7_TESTS_OMNIBASE_CAN
-/firmware/STM32H7_TESTS_OMNIBASE_FDCAN
-/firmware/stm32H755_CAN
 /omnibase_ws/.vscode
 /omnibase_ws/.claude
-/firmware/working_uart_between_tasks_rtosheap60gb.c
+/.vscode
+/.claude
