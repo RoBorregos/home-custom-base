@@ -99,9 +99,28 @@ typedef struct
 } InputData;
 
 typedef struct {
+    /* Euler angles (degrees) — kept for backward compatibility with the dashboard. */
     double yaw;
     double roll;
     double pitch;
+
+    /* Orientation quaternion from BNO085 SH2_ROTATION_VECTOR.
+     * Standard convention: (qx, qy, qz, qw) with qw being the real component. */
+    float qx;
+    float qy;
+    float qz;
+    float qw;
+
+    /* Angular velocity from SH2_GYROSCOPE_CALIBRATED, units rad/s, body frame. */
+    float wx;
+    float wy;
+    float wz;
+
+    /* Linear acceleration from SH2_LINEAR_ACCELERATION (gravity removed),
+     * units m/s^2, body frame. */
+    float ax;
+    float ay;
+    float az;
 } IMUData;
 
 typedef struct {

@@ -184,10 +184,31 @@ const osMutexAttr_t MutexUART_Data_attributes = {
 volatile float g_bno085_yaw   = 0.0f;
 volatile float g_bno085_pitch = 0.0f;
 volatile float g_bno085_roll  = 0.0f;
+
+/*
+ * Quaternion from SH2_ROTATION_VECTOR.
+ * Stored as (qx, qy, qz, qw) where qw is the real (scalar) component, matching
+ * the ROS sensor_msgs/Imu convention.
+ */
+volatile float g_bno085_qx = 0.0f;
+volatile float g_bno085_qy = 0.0f;
+volatile float g_bno085_qz = 0.0f;
+volatile float g_bno085_qw = 1.0f;
+
+/* Angular velocity from SH2_GYROSCOPE_CALIBRATED, rad/s, body frame. */
+volatile float g_bno085_wx = 0.0f;
+volatile float g_bno085_wy = 0.0f;
+volatile float g_bno085_wz = 0.0f;
+
+/* Linear acceleration from SH2_LINEAR_ACCELERATION, m/s^2, body frame (gravity removed). */
+volatile float g_bno085_ax = 0.0f;
+volatile float g_bno085_ay = 0.0f;
+volatile float g_bno085_az = 0.0f;
+
 /* Set to 1 by the async event callback when a BNO085 reset event arrives */
 static volatile uint8_t g_bno085_sensor_ready = 0;
 
-#define BNO085_REPORT_INTERVAL_US  20000U   /* 50 Hz rotation vector */
+#define BNO085_REPORT_INTERVAL_US  20000U   /* 50 Hz rotation vector / gyro / linear-accel */
 #define RAD_TO_DEG_D               (180.0 / 3.14159265358979323846)
 
 osMessageQueueId_t UART_QueueHandle;
@@ -1346,8 +1367,19 @@ void Start_UART_TX_Task(void *argument)
         /* Always reflect the live BT_active — avoids stale values between SM updates */
         telemetryMsg.bt_active = BT_active;
 
+        /* UART telemetry line.
+         * Existing Euler IMU_yaw/roll/pitch fields are preserved for backward
+         * compatibility with old consumers; the new IMU_q* / IMU_w* / IMU_a*
+         * fields feed the ROS sensor_msgs/Imu message:
+         *   - IMU_qx, IMU_qy, IMU_qz, IMU_qw  orientation quaternion (unitless)
+         *   - IMU_wx, IMU_wy, IMU_wz          angular velocity [rad/s]
+         *   - IMU_ax, IMU_ay, IMU_az          linear acceleration [m/s^2]
+         */
         printf("CMD_vx=%.3lf,CMD_vy=%.3lf,CMD_wz=%.3lf,"
                "IMU_yaw=%.2f,IMU_roll=%.2f,IMU_pitch=%.2f,"
+               "IMU_qx=%.6f,IMU_qy=%.6f,IMU_qz=%.6f,IMU_qw=%.6f,"
+               "IMU_wx=%.4f,IMU_wy=%.4f,IMU_wz=%.4f,"
+               "IMU_ax=%.4f,IMU_ay=%.4f,IMU_az=%.4f,"
                "IK_u0=%.3lf,IK_u1=%.3lf,IK_u2=%.3lf,IK_u3=%.3lf,"
                "ODOM_phi=%.3f,ODOM_x=%.3f,ODOM_y=%.3f,"
                "ODOM_w=%.3f,ODOM_vx=%.3f,ODOM_vy=%.3f,"
@@ -1358,6 +1390,9 @@ void Start_UART_TX_Task(void *argument)
                "BT_active=%u,BT_vx=%.3f,BT_vy=%.3f,BT_wz=%.3f\r\n",
                last_cmd.robot_twist[0], last_cmd.robot_twist[1], last_cmd.robot_twist[2],
                telemetryMsg.imu.yaw, telemetryMsg.imu.roll, telemetryMsg.imu.pitch,
+               telemetryMsg.imu.qx, telemetryMsg.imu.qy, telemetryMsg.imu.qz, telemetryMsg.imu.qw,
+               telemetryMsg.imu.wx, telemetryMsg.imu.wy, telemetryMsg.imu.wz,
+               telemetryMsg.imu.ax, telemetryMsg.imu.ay, telemetryMsg.imu.az,
                telemetryMsg.IK_computed_wheel_speeds[0], telemetryMsg.IK_computed_wheel_speeds[1], telemetryMsg.IK_computed_wheel_speeds[2], telemetryMsg.IK_computed_wheel_speeds[3],
                telemetryMsg.odom.phi, telemetryMsg.odom.x_pos, telemetryMsg.odom.y_pos,
                telemetryMsg.odom.q_dot[0], telemetryMsg.odom.q_dot[1], telemetryMsg.odom.q_dot[2],
@@ -1407,20 +1442,52 @@ static void imu_sensor_data_cb(void *cookie, sh2_SensorEvent_t *event)
     sh2_SensorValue_t val;
     if (sh2_decodeSensorEvent(&val, event) != SH2_OK) return;
 
-    if (val.sensorId == SH2_ROTATION_VECTOR) {
+    /* Each 32-bit float write is atomic on Cortex-M7 (aligned store).
+     * ODriveTask reads these at most once per 10 ms, so the worst case
+     * is reading qx from sample N and the rest from sample N+1 —
+     * acceptable for robot telemetry at 50 Hz. */
+    switch (val.sensorId) {
+
+    case SH2_ROTATION_VECTOR: {
+        /* Cache quaternion components for the ROS sensor_msgs/Imu message.
+         * BNO085 reports (i, j, k, real); ROS expects (x, y, z, w). */
+        g_bno085_qx = val.un.rotationVector.i;
+        g_bno085_qy = val.un.rotationVector.j;
+        g_bno085_qz = val.un.rotationVector.k;
+        g_bno085_qw = val.un.rotationVector.real;
+
         float yaw, pitch, roll;
         q_to_ypr(val.un.rotationVector.real,
                  val.un.rotationVector.i,
                  val.un.rotationVector.j,
                  val.un.rotationVector.k,
                  &yaw, &pitch, &roll);
-        /* Each 32-bit float write is atomic on Cortex-M7 (aligned store).
-         * ODriveTask reads these at most once per 10 ms, so the worst case
-         * is reading yaw from sample N and pitch/roll from sample N+1 —
-         * acceptable for robot telemetry at 50 Hz. */
         g_bno085_yaw   = yaw;
         g_bno085_pitch = pitch;
         g_bno085_roll  = roll;
+        break;
+    }
+
+    case SH2_GYROSCOPE_CALIBRATED:
+        /* Angular velocity in rad/s, body frame — matches ROS Imu convention. */
+        g_bno085_wx = val.un.gyroscope.x;
+        g_bno085_wy = val.un.gyroscope.y;
+        g_bno085_wz = val.un.gyroscope.z;
+        break;
+
+    case SH2_LINEAR_ACCELERATION:
+        /* Linear acceleration in m/s^2 with gravity already removed by the
+         * BNO085 sensor fusion. ROS Imu wants the IMU's measured acceleration
+         * (which normally includes gravity), but using linear-acceleration is
+         * a common pragmatic choice for wheeled robots; downstream consumers
+         * can integrate this directly. */
+        g_bno085_ax = val.un.linearAcceleration.x;
+        g_bno085_ay = val.un.linearAcceleration.y;
+        g_bno085_az = val.un.linearAcceleration.z;
+        break;
+
+    default:
+        break;
     }
 }
 
@@ -1433,15 +1500,24 @@ static void imu_service_ms(uint32_t ms)
     }
 }
 
-static void imu_enable_rotation_vector(void)
+static void imu_enable_report(sh2_SensorId_t sensor_id, const char *name)
 {
     sh2_SensorConfig_t cfg;
     __builtin_memset(&cfg, 0, sizeof(cfg));
     cfg.reportInterval_us = BNO085_REPORT_INTERVAL_US;
-    int rc = sh2_setSensorConfig(SH2_ROTATION_VECTOR, &cfg);
+    int rc = sh2_setSensorConfig(sensor_id, &cfg);
     if (rc != SH2_OK) {
-        printf("BNO085: setSensorConfig failed rc=%d\r\n", rc);
+        printf("BNO085: setSensorConfig(%s) failed rc=%d\r\n", name, rc);
     }
+}
+
+static void imu_enable_all_reports(void)
+{
+    /* Required to populate orientation, angular velocity, and linear
+     * acceleration in the ROS sensor_msgs/Imu message. */
+    imu_enable_report(SH2_ROTATION_VECTOR,      "ROTATION_VECTOR");
+    imu_enable_report(SH2_GYROSCOPE_CALIBRATED, "GYROSCOPE_CALIBRATED");
+    imu_enable_report(SH2_LINEAR_ACCELERATION,  "LINEAR_ACCELERATION");
 }
 
 void StartIMUTask(void *argument)
@@ -1470,7 +1546,7 @@ void StartIMUTask(void *argument)
     /* Give SH2 time to process control/startup packets before config */
     imu_service_ms(100);
 
-    imu_enable_rotation_vector();
+    imu_enable_all_reports();
 
     /* Clear any spurious reset flag that arrived during sh2_open startup */
     g_bno085_sensor_ready = 0;
@@ -1485,7 +1561,7 @@ void StartIMUTask(void *argument)
             g_bno085_sensor_ready = 0;
             printf("IMU_Task: BNO085 reset detected — re-configuring\r\n");
             imu_service_ms(200);
-            imu_enable_rotation_vector();
+            imu_enable_all_reports();
         }
 
         /* Yield for ~2 ms. sh2_service() returns immediately when INT is high
@@ -1986,13 +2062,28 @@ void StartODriveTask(void *argument)
     {
         now = osKernelGetTickCount();
 
-        /* Read BNO085 orientation from IMU_Task shared globals.
+        /* Read BNO085 data from IMU_Task shared globals.
          * Each float read is atomic on Cortex-M7 (32-bit aligned load).
-         * Convert radians → degrees to preserve backward compatibility with
-         * the previous BNO055 output format (degrees). */
+         * Euler angles are converted radians → degrees to preserve backward
+         * compatibility with the previous BNO055 output format (degrees).
+         * Quaternion, angular velocity, and linear acceleration are copied
+         * raw (rad, rad/s, m/s^2) for the ROS sensor_msgs/Imu message. */
         telemetryMsg.imu.yaw   = (double)g_bno085_yaw   * RAD_TO_DEG_D;
         telemetryMsg.imu.roll  = (double)g_bno085_roll  * RAD_TO_DEG_D;
         telemetryMsg.imu.pitch = (double)g_bno085_pitch * RAD_TO_DEG_D;
+
+        telemetryMsg.imu.qx = g_bno085_qx;
+        telemetryMsg.imu.qy = g_bno085_qy;
+        telemetryMsg.imu.qz = g_bno085_qz;
+        telemetryMsg.imu.qw = g_bno085_qw;
+
+        telemetryMsg.imu.wx = g_bno085_wx;
+        telemetryMsg.imu.wy = g_bno085_wy;
+        telemetryMsg.imu.wz = g_bno085_wz;
+
+        telemetryMsg.imu.ax = g_bno085_ax;
+        telemetryMsg.imu.ay = g_bno085_ay;
+        telemetryMsg.imu.az = g_bno085_az;
 
         qst = osMessageQueueGet(URX_2_CAN_QueueHandle, &cmd, NULL, 2);
 

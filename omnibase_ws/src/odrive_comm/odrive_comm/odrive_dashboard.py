@@ -52,8 +52,10 @@ from ament_index_python import get_package_share_directory
 import rclpy
 from rcl_interfaces.msg import SetParametersResult
 from rclpy.node import Node
-from geometry_msgs.msg import Twist, TwistStamped
+from geometry_msgs.msg import Twist, TwistStamped, Quaternion
 from std_msgs.msg import Float32MultiArray, Int32MultiArray, String
+from sensor_msgs.msg import Imu
+from nav_msgs.msg import Odometry
 import serial
 import serial.tools.list_ports
 
@@ -66,6 +68,18 @@ def _find_stm_port(fallback: str) -> str:
         if p.vid == _STM_VID and p.pid == _STM_PID:
             return p.device
     return fallback
+
+
+def _yaw_to_quaternion(yaw_rad: float) -> Quaternion:
+    """Convert a yaw angle in radians into a geometry_msgs/Quaternion.
+
+    Used as a fallback for nav_msgs/Odometry.pose.orientation and for
+    sensor_msgs/Imu.orientation when the firmware did not supply a quaternion
+    on a given telemetry packet. Roll and pitch are assumed to be zero for the
+    planar omnidirectional base.
+    """
+    half = 0.5 * yaw_rad
+    return Quaternion(x=0.0, y=0.0, z=math.sin(half), w=math.cos(half))
 
 AXIS_STATES = {
     0: "UNDEFINED", 1: "IDLE", 2: "STARTUP_SEQUENCE",
@@ -115,6 +129,10 @@ class ODriveDashboardNode(Node):
         self.declare_parameter('node_ids',            [33, 34, 35, 40])
         self.declare_parameter('enable_web_gui',      True)
         self.declare_parameter('web_gui_port',        5000)
+        # Frame ids used in the ROS Imu and Odometry messages.
+        self.declare_parameter('odom_frame_id',       'odom')
+        self.declare_parameter('base_frame_id',       'base_link')
+        self.declare_parameter('imu_frame_id',        'imu_link')
 
         port             = _find_stm_port(self.get_parameter('serial_port').value)
         baud             = self.get_parameter('baud_rate').value
@@ -124,6 +142,9 @@ class ODriveDashboardNode(Node):
             self.get_parameter('node_ids').value)
         enable_web = self.get_parameter('enable_web_gui').value
         web_port   = self.get_parameter('web_gui_port').value
+        self.odom_frame_id = self.get_parameter('odom_frame_id').value
+        self.base_frame_id = self.get_parameter('base_frame_id').value
+        self.imu_frame_id  = self.get_parameter('imu_frame_id').value
 
         self.add_on_set_parameters_callback(self._on_params_changed)
 
@@ -152,9 +173,14 @@ class ODriveDashboardNode(Node):
         self.pub_raw         = self.create_publisher(String,            'odrive/raw',               10)
         self.pub_debug       = self.create_publisher(String,            'odrive/debug',             10)
         self.pub_cmd         = self.create_publisher(Float32MultiArray, 'odrive/cmd_twist',         10)
-        self.pub_imu         = self.create_publisher(Float32MultiArray, 'odrive/imu_euler',         10)
+        # Legacy Float32MultiArray topic kept for the web dashboard.
+        self.pub_imu_euler   = self.create_publisher(Float32MultiArray, 'odrive/imu_euler',         10)
+        # Standard ROS 2 IMU message: orientation quaternion, angular velocity,
+        # and linear acceleration sourced from the BNO085 telemetry fields.
+        self.pub_imu         = self.create_publisher(Imu,               'odrive/imu',               10)
         self.pub_ik          = self.create_publisher(Float32MultiArray, 'odrive/ik_wheel_speeds',   10)
-        self.pub_odom        = self.create_publisher(Float32MultiArray, 'odrive/odom',              10)
+        # Standard ROS 2 Odometry message built from STM32 ODOM_* fields.
+        self.pub_odom        = self.create_publisher(Odometry,          'odrive/odom',              10)
         self.pub_body_twist  = self.create_publisher(Float32MultiArray, 'odrive/body_twist',        10)
         self.pub_node_ids    = self.create_publisher(Int32MultiArray,   'odrive/node_ids',          10)
         self.pub_axis_errors = self.create_publisher(Int32MultiArray,   'odrive/axis_errors',       10)
@@ -452,8 +478,27 @@ class ODriveDashboardNode(Node):
 
             cmd_vx = f(data.get('CMD_vx')); cmd_vy = f(data.get('CMD_vy'))
             cmd_wz = f(data.get('CMD_wz'))
+
+            # Legacy Euler telemetry (degrees, BNO085 yaw/pitch/roll).
             imu_y  = f(data.get('IMU_yaw')); imu_r = f(data.get('IMU_roll'))
             imu_p  = f(data.get('IMU_pitch'))
+
+            # New IMU telemetry fields from the STM32 (sensor_msgs/Imu compatible):
+            #   orientation quaternion  (unitless, (x, y, z, w))
+            #   angular velocity        (rad/s, body frame)
+            #   linear acceleration     (m/s^2, body frame, gravity removed)
+            # data.get() returns None when a field is missing — `f()` then
+            # falls back to 0.0 so a truncated telemetry line cannot crash us.
+            imu_qx = f(data.get('IMU_qx')); imu_qy = f(data.get('IMU_qy'))
+            imu_qz = f(data.get('IMU_qz')); imu_qw = f(data.get('IMU_qw'))
+            imu_wx = f(data.get('IMU_wx')); imu_wy = f(data.get('IMU_wy'))
+            imu_wz = f(data.get('IMU_wz'))
+            imu_ax = f(data.get('IMU_ax')); imu_ay = f(data.get('IMU_ay'))
+            imu_az = f(data.get('IMU_az'))
+            # True once we have seen at least one quaternion field in this packet.
+            imu_quat_present = any(k in data for k in
+                                   ('IMU_qx', 'IMU_qy', 'IMU_qz', 'IMU_qw'))
+
             ik     = [f(data.get(f'IK_u{j}')) for j in range(4)]
             o_phi  = f(data.get('ODOM_phi')); o_x = f(data.get('ODOM_x'))
             o_y    = f(data.get('ODOM_y'));   o_w = f(data.get('ODOM_w'))
@@ -464,10 +509,81 @@ class ODriveDashboardNode(Node):
             def _i32(l): m=Int32MultiArray();   m.data=l; return m
 
             self.pub_cmd        .publish(_f32([cmd_vx, cmd_vy, cmd_wz]))
-            self.pub_imu        .publish(_f32([imu_y, imu_r, imu_p]))
+            # Backward-compatible Euler topic (degrees) for the web dashboard.
+            self.pub_imu_euler  .publish(_f32([imu_y, imu_r, imu_p]))
             self.pub_ik         .publish(_f32(ik))
-            self.pub_odom       .publish(_f32([o_phi, o_x, o_y]))
             self.pub_body_twist .publish(_f32([o_w, o_vx, o_vy]))
+
+            # ── sensor_msgs/Imu ────────────────────────────────────────────
+            # Fill from the IMU_q* / IMU_w* / IMU_a* telemetry fields. If the
+            # firmware has not (yet) sent a quaternion this cycle, fall back to
+            # an orientation derived from ODOM_phi so downstream consumers
+            # always receive a valid unit quaternion.
+            imu_msg = Imu()
+            imu_msg.header.stamp = self.get_clock().now().to_msg()
+            imu_msg.header.frame_id = self.imu_frame_id
+            if imu_quat_present and (imu_qx or imu_qy or imu_qz or imu_qw):
+                imu_msg.orientation = Quaternion(
+                    x=imu_qx, y=imu_qy, z=imu_qz, w=imu_qw)
+            else:
+                imu_msg.orientation = _yaw_to_quaternion(o_phi)
+            imu_msg.angular_velocity.x = imu_wx
+            imu_msg.angular_velocity.y = imu_wy
+            imu_msg.angular_velocity.z = imu_wz
+            imu_msg.linear_acceleration.x = imu_ax
+            imu_msg.linear_acceleration.y = imu_ay
+            imu_msg.linear_acceleration.z = imu_az
+            # Covariances are not yet calibrated. Per sensor_msgs/Imu, setting
+            # element 0 of a covariance matrix to -1 marks the field as
+            # unknown; until the BNO085 reports accuracies we publish small
+            # placeholder variances on the diagonal so consumers that require
+            # a positive-definite covariance (e.g. robot_localization) still
+            # work. Flip the lines below to advertise "unknown" instead.
+            imu_msg.orientation_covariance = [
+                0.01, 0.0, 0.0,
+                0.0, 0.01, 0.0,
+                0.0, 0.0, 0.01,
+            ]
+            imu_msg.angular_velocity_covariance = [
+                0.001, 0.0, 0.0,
+                0.0, 0.001, 0.0,
+                0.0, 0.0, 0.001,
+            ]
+            imu_msg.linear_acceleration_covariance = [
+                0.05, 0.0, 0.0,
+                0.0, 0.05, 0.0,
+                0.0, 0.0, 0.05,
+            ]
+            self.pub_imu.publish(imu_msg)
+
+            # ── nav_msgs/Odometry ───────────────────────────────────────────
+            # ODOM_x/ODOM_y in meters, ODOM_phi in radians (heading),
+            # ODOM_vx/ODOM_vy in m/s (body-frame linear), ODOM_w in rad/s.
+            odom_msg = Odometry()
+            odom_msg.header.stamp = imu_msg.header.stamp
+            odom_msg.header.frame_id = self.odom_frame_id
+            odom_msg.child_frame_id  = self.base_frame_id
+            odom_msg.pose.pose.position.x = o_x
+            odom_msg.pose.pose.position.y = o_y
+            odom_msg.pose.pose.position.z = 0.0
+            odom_msg.pose.pose.orientation = _yaw_to_quaternion(o_phi)
+            odom_msg.twist.twist.linear.x  = o_vx
+            odom_msg.twist.twist.linear.y  = o_vy
+            odom_msg.twist.twist.linear.z  = 0.0
+            odom_msg.twist.twist.angular.z = o_w
+            # Pose/twist covariances are not yet characterised. Use small
+            # placeholders on the diagonal.
+            _pose_cov = [0.0] * 36
+            _pose_cov[0]  = 0.05  # x
+            _pose_cov[7]  = 0.05  # y
+            _pose_cov[35] = 0.05  # yaw
+            odom_msg.pose.covariance = _pose_cov
+            _twist_cov = [0.0] * 36
+            _twist_cov[0]  = 0.05  # vx
+            _twist_cov[7]  = 0.05  # vy
+            _twist_cov[35] = 0.05  # wz
+            odom_msg.twist.covariance = _twist_cov
+            self.pub_odom.publish(odom_msg)
             self.pub_node_ids   .publish(_i32(node_ids))
             self.pub_axis_errors.publish(_i32(axis_errors))
             self.pub_axis_states.publish(_i32(axis_states))
@@ -504,6 +620,10 @@ class ODriveDashboardNode(Node):
             telem = {
                 'cmd_vx': cmd_vx, 'cmd_vy': cmd_vy, 'cmd_wz': cmd_wz,
                 'imu_yaw': imu_y, 'imu_roll': imu_r, 'imu_pitch': imu_p,
+                'imu_qx': imu_qx, 'imu_qy': imu_qy,
+                'imu_qz': imu_qz, 'imu_qw': imu_qw,
+                'imu_wx': imu_wx, 'imu_wy': imu_wy, 'imu_wz': imu_wz,
+                'imu_ax': imu_ax, 'imu_ay': imu_ay, 'imu_az': imu_az,
                 'ik_speeds': ik,
                 'odom_phi': o_phi, 'odom_x': o_x, 'odom_y': o_y,
                 'odom_w': o_w, 'odom_vx': o_vx, 'odom_vy': o_vy,
@@ -528,6 +648,9 @@ class ODriveDashboardNode(Node):
         z4f = [0.0]*4; z4i = [0]*4
         return dict(cmd_vx=0.0, cmd_vy=0.0, cmd_wz=0.0,
                     imu_yaw=0.0, imu_roll=0.0, imu_pitch=0.0,
+                    imu_qx=0.0, imu_qy=0.0, imu_qz=0.0, imu_qw=1.0,
+                    imu_wx=0.0, imu_wy=0.0, imu_wz=0.0,
+                    imu_ax=0.0, imu_ay=0.0, imu_az=0.0,
                     ik_speeds=z4f, odom_phi=0.0, odom_x=0.0, odom_y=0.0,
                     odom_w=0.0, odom_vx=0.0, odom_vy=0.0,
                     node_ids=z4i, axis_errors=z4i, axis_states=z4i,
