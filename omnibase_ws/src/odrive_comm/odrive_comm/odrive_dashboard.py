@@ -123,7 +123,7 @@ class ODriveDashboardNode(Node):
         super().__init__('odrive_dashboard_node')
 
         self.declare_parameter('serial_port',         '/dev/ttyACM0')
-        self.declare_parameter('baud_rate',           115200)
+        self.declare_parameter('baud_rate',           921600)
         self.declare_parameter('use_stamped_cmd_vel', True)
         self.declare_parameter('tx_period',           0.1)
         self.declare_parameter('node_ids',            [33, 34, 35, 40])

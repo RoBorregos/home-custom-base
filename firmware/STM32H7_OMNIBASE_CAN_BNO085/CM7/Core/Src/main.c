@@ -10,7 +10,7 @@
   *   ODriveTask state machine runs, queues are exercised, and the BT UART
   *   path works normally.  Set CAN_STUB to 0 when ODrives are connected.
   *
-  * BT PROTOCOL (USART2, 115200 baud, same as ESP32 UART):
+  * BT PROTOCOL (USART2, 921600 baud, ESP32 UART 15200):
   *   Type-3 message from ESP32: "3 <vx> <vy> <wz> <buttons_hex>\r\n"
   *   example: "3 0.5 0.0 0.0 00\r\n"
   *
@@ -980,7 +980,7 @@ static void MX_USART2_UART_Init(void)
 static void MX_USART3_UART_Init(void)
 {
   huart3.Instance = USART3;
-  huart3.Init.BaudRate = 115200;
+  huart3.Init.BaudRate = 921600;
   huart3.Init.WordLength = UART_WORDLENGTH_8B;
   huart3.Init.StopBits = UART_STOPBITS_1;
   huart3.Init.Parity = UART_PARITY_NONE;
@@ -2040,6 +2040,18 @@ void StartODriveTask(void *argument)
     uint8_t  bt_override_active = 0;
     uint32_t last_bt_tick       = 0;
 
+    /* General velocity-command watchdog.
+     * If no ODRIVE_CMD_SET_VEL arrives from ANY source (ROS or BT) within
+     * CMD_WATCHDOG_TIMEOUT_MS, we fire a single zero-velocity SET_VEL to all
+     * four axes so the robot does not coast on its last command after the
+     * controller has gone silent (e.g. ROS node crashed, USB unplugged,
+     * BT link dropped). `cmd_watchdog_fired` is a latch so we don't spam
+     * the CAN bus while the link is still down; it clears as soon as a new
+     * SET_VEL arrives. */
+    const uint32_t CMD_WATCHDOG_TIMEOUT_MS = 500;
+    uint32_t last_vel_cmd_tick = osKernelGetTickCount();
+    uint8_t  cmd_watchdog_fired = 0;
+
     const uint32_t boot_delay_ms = 3000;
     uint32_t boot_tick = osKernelGetTickCount();
 
@@ -2087,6 +2099,24 @@ void StartODriveTask(void *argument)
 
         qst = osMessageQueueGet(URX_2_CAN_QueueHandle, &cmd, NULL, 2);
 
+        /* Keep the velocity-command watchdog disarmed and timestamp fresh
+         * whenever we are not actively driving. This prevents an immediate
+         * fire on the next SM_BOOT/SM_STARTUP/SM_IDLE → SM_RUNNING transition
+         * after a long pause. */
+        if (sm_state != SM_RUNNING) {
+            last_vel_cmd_tick  = now;
+            cmd_watchdog_fired = 0;
+        }
+
+        /* If we just received a velocity command from any source, refresh the
+         * watchdog. We do this before the state machine so a SET_VEL that is
+         * later dropped (e.g. ROS command masked by an active BT override)
+         * still proves the upstream link is alive. */
+        if (qst == osOK && cmd.type == ODRIVE_CMD_SET_VEL) {
+            last_vel_cmd_tick  = now;
+            cmd_watchdog_fired = 0;
+        }
+
         switch (sm_state)
         {
             case SM_BOOT:
@@ -2126,6 +2156,29 @@ void StartODriveTask(void *argument)
 
             case SM_RUNNING:
             {
+                /* General command watchdog: if no SET_VEL has arrived from
+                 * any source for CMD_WATCHDOG_TIMEOUT_MS, send a single
+                 * zero-velocity SET_VEL to all four axes and latch so we
+                 * don't repeatedly retransmit on a dead link. The latch
+                 * clears as soon as a new SET_VEL arrives (above). */
+                if (!cmd_watchdog_fired &&
+                    (now - last_vel_cmd_tick) >= CMD_WATCHDOG_TIMEOUT_MS) {
+                    printf("CMD watchdog: no SET_VEL for %lu ms — stopping motors\r\n",
+                           (unsigned long)CMD_WATCHDOG_TIMEOUT_MS);
+                    ODriveCmdMsg zero_cmd = {0};
+                    zero_cmd.type        = ODRIVE_CMD_SET_VEL;
+                    zero_cmd.target_mask = 0x0F;
+                    /* robot_twist[] is already zero from the {0} initialiser */
+                    ODrive_ProcessCommand(&zero_cmd, odrives, num_odrives, &tx,
+                        odrive_odom, x_offset, y_offset, radius,
+                        &current_ctrl_mode, &current_input_mode,
+                        (double*)wheel_sign, telemetryMsg.IK_computed_wheel_speeds);
+                    cmd_watchdog_fired = 1;
+                    /* Also clear the BT override state so ROS can immediately
+                     * regain control as soon as packets resume. */
+                    bt_override_active = 0;
+                }
+
                 /* BT watchdog: if no BT packet for BT_OVERRIDE_TIMEOUT_MS, stop and release */
                 if (bt_override_active && (now - last_bt_tick) >= BT_OVERRIDE_TIMEOUT_MS) {
                     ODriveCmdMsg zero_cmd = {0};
