@@ -10,7 +10,7 @@
   *   ODriveTask state machine runs, queues are exercised, and the BT UART
   *   path works normally.  Set CAN_STUB to 0 when ODrives are connected.
   *
-  * BT PROTOCOL (USART2, 921600 baud, ESP32 UART 15200):
+  * BT PROTOCOL (USART2, 230400 baud, ESP32 UART 15200):
   *   Type-3 message from ESP32: "3 <vx> <vy> <wz> <buttons_hex>\r\n"
   *   example: "3 0.5 0.0 0.0 00\r\n"
   *
@@ -992,7 +992,7 @@ static void MX_USART2_UART_Init(void)
 static void MX_USART3_UART_Init(void)
 {
   huart3.Instance = USART3;
-  huart3.Init.BaudRate = 921600;
+  huart3.Init.BaudRate = 230400;
   huart3.Init.WordLength = UART_WORDLENGTH_8B;
   huart3.Init.StopBits = UART_STOPBITS_1;
   huart3.Init.Parity = UART_PARITY_NONE;
