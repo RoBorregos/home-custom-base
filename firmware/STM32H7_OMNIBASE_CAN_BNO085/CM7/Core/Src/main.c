@@ -325,6 +325,18 @@ int globalSpeedsFromUMecanum(double phi, double x_off, double y_off, double r, d
 
 volatile uint8_t BT_active = 0;
 
+/*
+ * Tick (HAL_GetTick / osKernelGetTickCount, milliseconds) of the most recent
+ * *valid* message received from the ESP32 on USART2. "Valid" means a Type-3
+ * line that parsed cleanly into the (vx, vy, wz, buttons) tuple — heartbeat
+ * lines are valid too. UINT32_MAX is the sentinel meaning "never received".
+ *
+ * Written only by start_BT_RX_Task; read by Start_UART_TX_Task to compute
+ * the ESP32_age_ms telemetry field. uint32_t reads/writes are atomic on
+ * Cortex-M7 (single aligned access), so no mutex is needed.
+ */
+volatile uint32_t g_bt_last_valid_msg_tick = UINT32_MAX;
+
 /* USER CODE END 0 */
 
 /**
@@ -1253,6 +1265,13 @@ void start_BT_RX_Task(void *argument)
                                             &vx, &vy, &wz, &buttons_u,
                                             &controll_state_u);
                         if (parsed >= 4) {
+                            /* Mark this as a valid ESP32 message for the
+                             * connection-age telemetry. We update on every
+                             * successful Type-3 parse (including paired/
+                             * inactive heartbeats), since any such packet
+                             * proves the ESP32→STM32 link is alive. */
+                            g_bt_last_valid_msg_tick = HAL_GetTick();
+
                             /*
                              * controll_state mirrors the ESP32's full status:
                              *   0 = no controller paired        → BT_active 0 (Inactive)
@@ -1367,6 +1386,18 @@ void Start_UART_TX_Task(void *argument)
         /* Always reflect the live BT_active — avoids stale values between SM updates */
         telemetryMsg.bt_active = BT_active;
 
+        /* Connection-age for the ESP32→STM32 Bluetooth link.
+         * Snapshot the volatile tick once to avoid a torn read if the BT task
+         * updates it mid-printf. -1 (cast to long) signals "no valid ESP32
+         * message has been received since boot" on the ROS side. */
+        uint32_t bt_tick_snap = g_bt_last_valid_msg_tick;
+        long esp32_age_ms;
+        if (bt_tick_snap == UINT32_MAX) {
+            esp32_age_ms = -1;
+        } else {
+            esp32_age_ms = (long)(HAL_GetTick() - bt_tick_snap);
+        }
+
         /* UART telemetry line.
          * Existing Euler IMU_yaw/roll/pitch fields are preserved for backward
          * compatibility with old consumers; the new IMU_q* / IMU_w* / IMU_a*
@@ -1374,6 +1405,8 @@ void Start_UART_TX_Task(void *argument)
          *   - IMU_qx, IMU_qy, IMU_qz, IMU_qw  orientation quaternion (unitless)
          *   - IMU_wx, IMU_wy, IMU_wz          angular velocity [rad/s]
          *   - IMU_ax, IMU_ay, IMU_az          linear acceleration [m/s^2]
+         * ESP32_age_ms: ms since the last valid Type-3 message from the ESP32
+         * on USART2; -1 means no message has been received yet.
          */
         printf("CMD_vx=%.3lf,CMD_vy=%.3lf,CMD_wz=%.3lf,"
                "IMU_yaw=%.2f,IMU_roll=%.2f,IMU_pitch=%.2f,"
@@ -1387,7 +1420,8 @@ void Start_UART_TX_Task(void *argument)
                "N1=%u,E1=%lu,S1=%u,C1=%u,P1=%.3f,V1=%.3f,Sh1=%ld,CPR1=%ld,Vbus1=%.3f,Ibus1=%.3f,IqSet1=%.3f,IqMeas1=%.3f,U1=%u,"
                "N2=%u,E2=%lu,S2=%u,C2=%u,P2=%.3f,V2=%.3f,Sh2=%ld,CPR2=%ld,Vbus2=%.3f,Ibus2=%.3f,IqSet2=%.3f,IqMeas2=%.3f,U2=%u,"
                "N3=%u,E3=%lu,S3=%u,C3=%u,P3=%.3f,V3=%.3f,Sh3=%ld,CPR3=%ld,Vbus3=%.3f,Ibus3=%.3f,IqSet3=%.3f,IqMeas3=%.3f,U3=%u,"
-               "BT_active=%u,BT_vx=%.3f,BT_vy=%.3f,BT_wz=%.3f\r\n",
+               "BT_active=%u,BT_vx=%.3f,BT_vy=%.3f,BT_wz=%.3f,"
+               "ESP32_age_ms=%ld\r\n",
                last_cmd.robot_twist[0], last_cmd.robot_twist[1], last_cmd.robot_twist[2],
                telemetryMsg.imu.yaw, telemetryMsg.imu.roll, telemetryMsg.imu.pitch,
                telemetryMsg.imu.qx, telemetryMsg.imu.qy, telemetryMsg.imu.qz, telemetryMsg.imu.qw,
@@ -1408,7 +1442,8 @@ void Start_UART_TX_Task(void *argument)
                telemetryMsg.node_id[3], telemetryMsg.axis_error[3], telemetryMsg.axis_state[3], telemetryMsg.controller_status[3],
                telemetryMsg.pos_est[3], telemetryMsg.vel_est[3], telemetryMsg.encoder_shadow[3], telemetryMsg.encoder_cpr[3],
                telemetryMsg.bus_voltage[3], telemetryMsg.bus_current[3], telemetryMsg.iq_setpoint[3], telemetryMsg.iq_measured[3], telemetryMsg.updated[3],
-               telemetryMsg.bt_active, telemetryMsg.bt_vx, telemetryMsg.bt_vy, telemetryMsg.bt_wz);
+               telemetryMsg.bt_active, telemetryMsg.bt_vx, telemetryMsg.bt_vy, telemetryMsg.bt_wz,
+               esp32_age_ms);
 
         osDelay(10);
     }
