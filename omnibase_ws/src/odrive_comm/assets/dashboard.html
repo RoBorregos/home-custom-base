@@ -150,13 +150,31 @@ select:focus{outline:none;border-color:var(--acc)}
       </div>
     </div>
 
-    <!-- col 2: odometry + robot velocity chart -->
+    <!-- col 2: odometry + link status + robot velocity chart -->
     <div class="card">
       <div class="ct">Odometry</div>
       <div class="mr3">
         <div class="met"><div class="ml">φ rad</div><div class="mv" id="ophi">0.000</div></div>
         <div class="met"><div class="ml">X m</div><div class="mv" id="ox">0.000</div></div>
         <div class="met"><div class="ml">Y m</div><div class="mv" id="oy">0.000</div></div>
+      </div>
+      <!-- Link status: ESP32→STM32 age (from firmware), STM32→PC age (measured here). -->
+      <div class="ct">Links</div>
+      <div style="display:flex;flex-direction:column;gap:3px;margin-bottom:6px;font-size:10px">
+        <div style="display:flex;justify-content:space-between;align-items:center;gap:6px">
+          <span style="color:var(--mut)">ESP32→STM32</span>
+          <span style="display:flex;gap:6px;align-items:center">
+            <span id="lnkesp" class="mv" style="font-size:11px">unknown</span>
+            <span id="lnkespp" class="pill">UNKNOWN</span>
+          </span>
+        </div>
+        <div style="display:flex;justify-content:space-between;align-items:center;gap:6px">
+          <span style="color:var(--mut)">STM32→PC</span>
+          <span style="display:flex;gap:6px;align-items:center">
+            <span id="lnkpc" class="mv" style="font-size:11px">unknown</span>
+            <span id="lnkpcp" class="pill">UNKNOWN</span>
+          </span>
+        </div>
       </div>
       <div class="ct">Robot velocity</div>
       <div class="ccw"><canvas id="vc"></canvas></div>
@@ -331,10 +349,44 @@ link('slpg','pgv', v=>v.toFixed(2),1,200);
 link('slvg','vgv', v=>v.toFixed(3),0.01,2);
 link('slvi','vigv',v=>v.toFixed(3),0.01,4);
 
+// Link status helpers — render the ESP32→STM32 and STM32→PC ages with
+// an OK / WARN / LOST / UNKNOWN pill.  Thresholds match the Python side:
+//   OK    age < 500 ms
+//   WARN  500 ms ≤ age < 2000 ms
+//   LOST  age ≥ 2000 ms
+//   UNKNOWN  age is null / missing
+function fmtAge(ms){
+  if(ms===null||ms===undefined) return 'unknown';
+  if(ms<1000) return ms.toFixed(0)+' ms';
+  return (ms/1000).toFixed(2)+' s';
+}
+function applyLinkPill(pillEl, status){
+  pillEl.textContent = status;
+  pillEl.classList.remove('run','err');
+  // Colours from the existing palette:
+  //   OK   -> green   (.pill.run)
+  //   WARN -> amber   (inline style, no .pill.amb exists)
+  //   LOST -> red     (.pill.err)
+  //   UNKNOWN -> muted (default .pill)
+  pillEl.style.background=''; pillEl.style.color='';
+  if(status==='OK')        pillEl.classList.add('run');
+  else if(status==='WARN'){ pillEl.style.background='rgba(217,154,40,.12)'; pillEl.style.color='var(--amb)'; }
+  else if(status==='LOST') pillEl.classList.add('err');
+}
+function updateLink(prefix, ageMs, status){
+  g('lnk'+prefix).textContent = fmtAge(ageMs);
+  applyLinkPill(g('lnk'+prefix+'p'), status||'UNKNOWN');
+}
+
 // telemetry
 socket.on('telemetry',(d)=>{
   g('rs').textContent='live'; g('rs').style.color='var(--grn)';
   if(d.bt_active!==undefined){const b=g('btst');const _btl=['Inactive','Paired','Active'];const _btc=['var(--red)','var(--amb)','var(--grn)'];const _bti=Math.min(Math.max(d.bt_active,0),2);b.textContent=_btl[_bti];b.style.color=_btc[_bti];}
+  // Always refresh the link widget — the server pushes a fresh
+  // telemetry frame at ~4 Hz so the age values keep advancing even
+  // when the STM32 has gone silent.
+  updateLink('esp', d.esp32_age_ms, d.esp32_status);
+  updateLink('pc',  d.pc_age_ms,    d.pc_status);
   g('cvx').textContent=d.cmd_vx.toFixed(3);
   g('cvy').textContent=d.cmd_vy.toFixed(3);
   g('cwz').textContent=d.cmd_wz.toFixed(3);
