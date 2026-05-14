@@ -317,9 +317,32 @@ int computeNecessaryWheelSpeedsMecanum(double phi, double x_off, double y_off, d
 }
 
 int globalSpeedsFromUMecanum(double phi, double x_off, double y_off, double r, double u[4], double q_dot[3]) {
-    q_dot[0] = (u[1] - u[0] + u[2] - u[3]) / ((4 * (x_off + y_off)) / r);
-    q_dot[1] = cos(phi)*(r/4)*(u[0] + u[1] + u[2] + u[3]) + sin(phi)*(r/4)*(u[0] - u[1] + u[2] - u[3]);
-    q_dot[2] = sin(phi)*(r/4)*(u[0] + u[1] + u[2] + u[3]) - cos(phi)*(r/4)*(u[0] - u[1] + u[2] - u[3]);
+    /* Forward kinematics for a 4-wheel mecanum drive.
+     *
+     * Step 1: recover body-frame velocities (vx_body, vy_body, phi_dot) from
+     * the four wheel angular velocities u[i]. The wheel-sign patterns match
+     * those used by computeNecessaryWheelSpeedsMecanum so IK and FK round-trip:
+     *     +x body  →  ( +, +, +, + )      = u[0]+u[1]+u[2]+u[3]
+     *     +y body  →  ( −, +, +, − )      = -u[0]+u[1]+u[2]-u[3]
+     *     +phi     →  ( −, +, −, + )      = -u[0]+u[1]-u[2]+u[3]
+     *
+     * Step 2: rotate body-frame linear velocities into the world frame using
+     * the current heading phi:
+     *     x_dot_world = cos(phi)*vx_body − sin(phi)*vy_body
+     *     y_dot_world = sin(phi)*vx_body + cos(phi)*vy_body
+     *
+     * The previous implementation used the y-pattern in q_dot[0] and the
+     * phi-pattern in q_dot[2] (rows swapped), so sideways motion appeared as
+     * yaw rate / 0 instead of vy, and pure rotation appeared as fake vy.
+     */
+    const double L = x_off + y_off;
+    const double vx_body = (r / 4.0) * ( u[0] + u[1] + u[2] + u[3]);
+    const double vy_body = (r / 4.0) * (-u[0] + u[1] + u[2] - u[3]);
+    const double phi_dot = (r / (4.0 * L)) * (-u[0] + u[1] - u[2] + u[3]);
+
+    q_dot[0] = phi_dot;
+    q_dot[1] = cos(phi) * vx_body - sin(phi) * vy_body;
+    q_dot[2] = sin(phi) * vx_body + cos(phi) * vy_body;
     return 0;
 }
 
