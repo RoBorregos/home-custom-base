@@ -2075,9 +2075,9 @@ void StartODriveTask(void *argument)
     printf("\nODrive Task (State Machine)\r\n");
 
     const uint8_t num_odrives   = 4;
-    const double  x_offset      = 0.3;
-    const double  y_offset      = 0.3;
-    const double  radius        = 0.1;
+    const double  x_offset      = 0.195;
+    const double  y_offset      = 0.195;
+    const double  radius        = 0.0762;
     const double  wheel_sign[4] = { -1.0, 1.0, -1.0, 1.0 };
 
     odrives[0].NODE_ID     = 36;
