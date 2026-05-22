@@ -11,7 +11,7 @@
           <plugin>gz_ros2_control/GazeboSimSystem</plugin>
         </hardware>
 
-        <joint name="${prefix}_front_left_mecanum_right_wheel_joint">
+        <joint name="${prefix}_wheel_FL_joint">
           <command_interface name="velocity">
             <param name="min">-10</param>
             <param name="max">10</param>
@@ -20,7 +20,7 @@
           <state_interface name="position"/>
         </joint>
 
-        <joint name="${prefix}_rear_left_mecanum_left_wheel_joint">
+        <joint name="${prefix}_wheel_FR_joint">
           <command_interface name="velocity">
             <param name="min">-10</param>
             <param name="max">10</param>
@@ -29,7 +29,7 @@
           <state_interface name="position"/>
         </joint>
 
-        <joint name="${prefix}_front_right_mecanum_left_wheel_joint">
+        <joint name="${prefix}_wheel_RL_joint">
           <command_interface name="velocity">
             <param name="min">-10</param>
             <param name="max">10</param>
@@ -38,7 +38,7 @@
           <state_interface name="position"/>
         </joint>
 
-        <joint name="${prefix}_rear_right_mecanum_right_wheel_joint">
+        <joint name="${prefix}_wheel_RR_joint">
           <command_interface name="velocity">
             <param name="min">-10</param>
             <param name="max">10</param>
@@ -51,7 +51,7 @@
       <!-- To emulate Mecanum wheels in Gazebo with spherical collisions it
   requires a custom friction model so the vehicle can strafe left to right -->
       <!-- Wheel friction properties -->
-      <gazebo reference="${prefix}_rear_left_mecanum_left_wheel_link">
+      <gazebo reference="${prefix}_wheel_RL">
         <collision>
           <surface>
             <friction>
@@ -65,7 +65,7 @@
         </collision>
       </gazebo>
 
-      <gazebo reference="${prefix}_rear_right_mecanum_right_wheel_link">
+      <gazebo reference="${prefix}_wheel_RR">
         <collision>
           <surface>
             <friction>
@@ -79,7 +79,7 @@
         </collision>
       </gazebo>
 
-      <gazebo reference="${prefix}_front_left_mecanum_left_wheel_link">
+      <gazebo reference="${prefix}_wheel_FL">
         <collision>
           <surface>
             <friction>
@@ -93,7 +93,7 @@
         </collision>
       </gazebo>
 
-      <gazebo reference="${prefix}_front_right_mecanum_right_wheel_link">
+      <gazebo reference="${prefix}_wheel_FR">
         <collision>
           <surface>
             <friction>

@@ -26,7 +26,7 @@ def generate_launch_description():
 
     declared_arguments.append(
         DeclareLaunchArgument(
-            "decription_file",
+            "description_file",
             default_value=PathJoinSubstitution(
                 [FindPackageShare("home_custom_base_description"), "urdf", "robot.xacro"]
             ),
@@ -46,9 +46,9 @@ def generate_launch_description():
     
     declared_arguments.append(
         DeclareLaunchArgument(
-            "tf_prefix",
-            default_value="",
-            description="TF prefix for the robot in case of multiple robots"
+            "prefix",
+            default_value="home_base",
+            description="Prefix for robot link/joint names"
         )
     )
 
@@ -67,15 +67,24 @@ def generate_launch_description():
             description="Launch RViz if true"
         )
     )
-    
+
+    declared_arguments.append(
+        DeclareLaunchArgument(
+            "use_gui",
+            default_value="false",
+            description="Use joint_state_publisher_gui if true, otherwise joint_state_publisher"
+        )
+    )
+
     #Argument initialization
     robot_type = LaunchConfiguration("robot_type")
-    description_file = LaunchConfiguration("decription_file")
+    description_file = LaunchConfiguration("description_file")
     rviz_config_file = LaunchConfiguration("rviz_config_file")
-    tf_prefix = LaunchConfiguration("tf_prefix")
+    prefix = LaunchConfiguration("prefix")
     use_sim_time = LaunchConfiguration("use_sim_time")
     use_rviz = LaunchConfiguration("use_rviz")
-    
+    use_gui = LaunchConfiguration("use_gui")
+
     robot_description_content = Command(
         [
             FindExecutable(name="xacro"),
@@ -84,7 +93,7 @@ def generate_launch_description():
             " ",
             "robot_type:=", robot_type,
             " ",
-            "tf_prefix:=", tf_prefix,
+            "prefix:=", prefix,
             " ",
             "use_sim_time:=", use_sim_time
         ]
@@ -97,8 +106,15 @@ def generate_launch_description():
     }
     
     joint_state_publisher_node = Node(
+        package="joint_state_publisher",
+        executable="joint_state_publisher",
+        condition=LaunchConfigurationEquals("use_gui", "false"),
+    )
+
+    joint_state_publisher_gui_node = Node(
         package="joint_state_publisher_gui",
         executable="joint_state_publisher_gui",
+        condition=LaunchConfigurationEquals("use_gui", "true"),
     )
     
     robot_state_publisher_node = Node(
@@ -119,6 +135,7 @@ def generate_launch_description():
     
     nodes_to_start = [
         joint_state_publisher_node,
+        joint_state_publisher_gui_node,
         robot_state_publisher_node,
         rviz_node
     ]
