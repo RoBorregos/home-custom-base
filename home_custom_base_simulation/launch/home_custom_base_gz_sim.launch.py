@@ -12,8 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
+
+from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription
+from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription, SetEnvironmentVariable
 from launch.actions import RegisterEventHandler
 from launch.event_handlers import OnProcessExit
 from launch.launch_description_sources import PythonLaunchDescriptionSource
@@ -26,6 +29,17 @@ from launch_ros.substitutions import FindPackageShare
 def generate_launch_description():
     # Launch Arguments
     use_sim_time = LaunchConfiguration('use_sim_time', default=True)
+
+    # Make package:// meshes resolvable by Gazebo Sim via GZ_SIM_RESOURCE_PATH.
+    # Gazebo Sim rewrites package://<pkg>/... to model://<pkg>/..., so we point
+    # the resource path to the parent of each package's share directory.
+    description_share = get_package_share_directory('home_custom_base_description')
+    resource_path_parent = os.path.dirname(description_share)
+    existing_resource_path = os.environ.get('GZ_SIM_RESOURCE_PATH', '')
+    set_gz_resource_path = SetEnvironmentVariable(
+        'GZ_SIM_RESOURCE_PATH',
+        os.pathsep.join(filter(None, [existing_resource_path, resource_path_parent]))
+    )
 
     # Get URDF via xacro
     robot_description_content = Command(
@@ -65,15 +79,16 @@ def generate_launch_description():
     joint_state_broadcaster_spawner = Node(
         package='controller_manager',
         executable='spawner',
-        arguments=['joint_state_broadcaster'],
+        arguments=['joint_state_broadcaster',
+                   '--controller-manager-timeout', '60'],
     )
     mecanum_drive_controller_spawner = Node(
         package='controller_manager',
         executable='spawner',
         arguments=[
             'mecanum_controller',
-            '--param-file',
-            robot_controllers,
+            '--param-file', robot_controllers,
+            '--controller-manager-timeout', '60',
             ],
     )
 
@@ -86,6 +101,7 @@ def generate_launch_description():
     )
 
     return LaunchDescription([
+        set_gz_resource_path,
         # Launch gazebo environment
         IncludeLaunchDescription(
             PythonLaunchDescriptionSource(
