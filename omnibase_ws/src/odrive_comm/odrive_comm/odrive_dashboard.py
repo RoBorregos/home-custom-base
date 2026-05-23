@@ -106,6 +106,58 @@ CFG_STOP          = 0x29
 CFG_SET_INPUT_POS = 0x30
 
 # ─────────────────────────────────────────────────────────────────────────────
+#  TELEMETRY FIELD MAP
+#  Mirrors the comment block above the printf() in
+#  firmware/STM32H7_OMNIBASE_CAN_BNO085/CM7/Core/Src/main.c:Start_UART_TX_Task.
+#  The firmware emits each field as `i=value` with `i` the positional index
+#  below; we translate back into the legacy named-key dict so the rest of the
+#  parser doesn't change. If the firmware list is reordered or extended, edit
+#  THIS list and the firmware printf in lock-step.
+# ─────────────────────────────────────────────────────────────────────────────
+TELEM_FIELDS = [
+    # 0..2  CMD twist
+    'CMD_vx', 'CMD_vy', 'CMD_wz',
+    # 3..5  IMU Euler (legacy, degrees)
+    'IMU_yaw', 'IMU_roll', 'IMU_pitch',
+    # 6..9  IMU quaternion
+    'IMU_qx', 'IMU_qy', 'IMU_qz', 'IMU_qw',
+    # 10..12  IMU angular velocity
+    'IMU_wx', 'IMU_wy', 'IMU_wz',
+    # 13..15  IMU linear acceleration
+    'IMU_ax', 'IMU_ay', 'IMU_az',
+    # 16..19  IK wheel speeds
+    'IK_u0', 'IK_u1', 'IK_u2', 'IK_u3',
+    # 20..23  EKF pose
+    'ODOM_phi', 'ODOM_x', 'ODOM_y', 'ODOM_z',
+    # 24..27  EKF orientation quaternion
+    'ODOM_qx', 'ODOM_qy', 'ODOM_qz', 'ODOM_qw',
+    # 28..30  World-frame twist
+    'ODOM_w', 'ODOM_vx', 'ODOM_vy',
+    # 31..32  Body-frame linear twist
+    'ODOM_vxb', 'ODOM_vyb',
+    # 33..35  Pose covariance diagonal
+    'ODOM_var_x', 'ODOM_var_y', 'ODOM_var_yaw',
+    # 36..38  Twist covariance diagonal
+    'ODOM_var_vx', 'ODOM_var_vy', 'ODOM_var_wz',
+    # 39..51  Axis 0 block (N, E, S, C, P, V, Sh, CPR, Vbus, Ibus, IqSet, IqMeas, U)
+    'N0', 'E0', 'S0', 'C0', 'P0', 'V0', 'Sh0', 'CPR0',
+    'Vbus0', 'Ibus0', 'IqSet0', 'IqMeas0', 'U0',
+    # 52..64  Axis 1 block
+    'N1', 'E1', 'S1', 'C1', 'P1', 'V1', 'Sh1', 'CPR1',
+    'Vbus1', 'Ibus1', 'IqSet1', 'IqMeas1', 'U1',
+    # 65..77  Axis 2 block
+    'N2', 'E2', 'S2', 'C2', 'P2', 'V2', 'Sh2', 'CPR2',
+    'Vbus2', 'Ibus2', 'IqSet2', 'IqMeas2', 'U2',
+    # 78..90  Axis 3 block
+    'N3', 'E3', 'S3', 'C3', 'P3', 'V3', 'Sh3', 'CPR3',
+    'Vbus3', 'Ibus3', 'IqSet3', 'IqMeas3', 'U3',
+    # 91..94  BT state
+    'BT_active', 'BT_vx', 'BT_vy', 'BT_wz',
+    # 95  ESP32 age, ms (-1 sentinel = no Type-3 message yet)
+    'ESP32_age_ms',
+]
+
+# ─────────────────────────────────────────────────────────────────────────────
 #  DASHBOARD HTML
 # ─────────────────────────────────────────────────────────────────────────────
 from pathlib import Path
@@ -123,7 +175,7 @@ class ODriveDashboardNode(Node):
         super().__init__('odrive_dashboard_node')
 
         self.declare_parameter('serial_port',         '/dev/ttyACM0')
-        self.declare_parameter('baud_rate',           230400)
+        self.declare_parameter('baud_rate',           460800)
         self.declare_parameter('use_stamped_cmd_vel', True)
         self.declare_parameter('tx_period',           0.1)
         self.declare_parameter('node_ids',            [33, 34, 35, 40])
@@ -526,9 +578,25 @@ class ODriveDashboardNode(Node):
 
     def _parse_and_publish(self, line: str):
         try:
+            # Firmware emits the compact form `i=value` (see TELEM_FIELDS).
+            # \w+ accepts the leading digit prefix too; we translate the
+            # numeric keys back to legacy named keys so the body of this
+            # function stays identical to the pre-compaction parser.
             matches = re.findall(
                 r'(\w+)=([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)', line)
-            data = {k: float(v) for k, v in matches}
+            if not matches:
+                return
+            data: dict = {}
+            for k, v in matches:
+                if k.isdigit():
+                    idx = int(k)
+                    if 0 <= idx < len(TELEM_FIELDS):
+                        data[TELEM_FIELDS[idx]] = float(v)
+                else:
+                    # Forward-compat: accept either compact (digit) or named
+                    # keys, so a half-flashed setup (old firmware + new node,
+                    # or vice-versa) still produces a usable telemetry frame.
+                    data[k] = float(v)
             if not data:
                 return
 

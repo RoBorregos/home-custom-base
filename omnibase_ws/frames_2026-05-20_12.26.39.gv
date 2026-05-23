@@ -1,0 +1,17 @@
+digraph G {
+"odom" -> "base_link"[label=" Broadcaster: default_authority\nAverage rate: 40.909\nBuffer length: 1.32\nMost recent transform: 15.14\nOldest transform: 13.82\n"];
+"map" -> "odom"[label=" Broadcaster: default_authority\nAverage rate: 20.8\nBuffer length: 1.25\nMost recent transform: 15.6\nOldest transform: 14.35\n"];
+"base_link" -> "bl_wheel"[label=" Broadcaster: default_authority\nAverage rate: 10.436\nBuffer length: 2.3\nMost recent transform: 1779301599.567958\nOldest transform: 1779301597.268301\n"];
+"base_link" -> "br_wheel"[label=" Broadcaster: default_authority\nAverage rate: 10.436\nBuffer length: 2.3\nMost recent transform: 1779301599.567958\nOldest transform: 1779301597.268301\n"];
+"base_link" -> "fl_wheel"[label=" Broadcaster: default_authority\nAverage rate: 10.436\nBuffer length: 2.3\nMost recent transform: 1779301599.567958\nOldest transform: 1779301597.268301\n"];
+"base_link" -> "fr_wheel"[label=" Broadcaster: default_authority\nAverage rate: 10.436\nBuffer length: 2.3\nMost recent transform: 1779301599.567958\nOldest transform: 1779301597.268301\n"];
+"base_link" -> "base_footprint"[label=" Broadcaster: default_authority\nAverage rate: 10000.0\nBuffer length: 0.0\nMost recent transform: 0.0\nOldest transform: 0.0\n"];
+"base_link" -> "depth_camera_link"[label=" Broadcaster: default_authority\nAverage rate: 10000.0\nBuffer length: 0.0\nMost recent transform: 0.0\nOldest transform: 0.0\n"];
+"base_link" -> "imu_link"[label=" Broadcaster: default_authority\nAverage rate: 10000.0\nBuffer length: 0.0\nMost recent transform: 0.0\nOldest transform: 0.0\n"];
+"base_link" -> "base_scan_br"[label=" Broadcaster: default_authority\nAverage rate: 10000.0\nBuffer length: 0.0\nMost recent transform: 0.0\nOldest transform: 0.0\n"];
+"base_link" -> "base_scan_fl"[label=" Broadcaster: default_authority\nAverage rate: 10000.0\nBuffer length: 0.0\nMost recent transform: 0.0\nOldest transform: 0.0\n"];
+edge [style=invis];
+ subgraph cluster_legend { style=bold; color=black; label ="view_frames Result";
+"Recorded at time: 1779301599.6587043"[ shape=plaintext ] ;
+}->"map";
+}

@@ -1,231 +1,329 @@
-============================================================
-Connection-status monitoring — reasoning and changes
-============================================================
+============================================================================
+Axis Lab tab — phase 0 + phase 1 status
+Date: 2026-05-20
+============================================================================
 
-Goal
-----
-Display the health of the two robot communication links live on the web
-dashboard, using elapsed time since the last valid message in each
-direction:
+CONTEXT
+-------
+Goal (multi-phase): add an "Individual Motor" tab to the web dashboard that
+mirrors the per-axis features of the official ODrive GUI — inspect, control,
+test, calibrate and configure one motor at a time, with the motor selector
+mapping physical wheels to CAN node IDs (since each motor lives on its own
+ODrive S1).
 
-  1. ESP32 → STM32  (Bluetooth controller, USART2)
-  2. STM32 → PC     (USB-CDC telemetry stream, USART3)
+This file captures what was implemented in phase 0 (bandwidth/format prep,
+which had to land first) and phase 1 (GUI scaffold), plus the open items
+that need new firmware in phases 2-5.
 
-Both links carry their own clocks (the STM32 SysTick and the PC's
-monotonic clock), so each side is responsible for measuring the link it
-"owns" and the dashboard combines them.
 
-------------------------------------------------------------
-Design summary
-------------------------------------------------------------
+PHASE 0 — UART BANDWIDTH AND COMPACT TELEMETRY FORMAT
+-----------------------------------------------------
+Why first: the existing CSV line was already ~1100-1300 chars/tick. At
+230400 baud (per-char polling HAL_UART_Transmit) the line takes ~50 ms to
+emit, capping the dashboard at ~20 Hz, not the 100 Hz the firmware tries
+to produce. Adding any more per-axis fields (temperature, torques, powers,
+version, detailed errors) would make it worse. Two compounding changes:
 
-STM32 firmware
-  - A new volatile global `g_bt_last_valid_msg_tick` (ms) is updated by
-    `start_BT_RX_Task` every time a Type-3 ESP32 line parses successfully.
-  - `Start_UART_TX_Task` snapshots that tick once per telemetry packet,
-    computes the age via `HAL_GetTick()`, and appends
-    `ESP32_age_ms=<n>` to the existing UART line. If no ESP32 message
-    has ever been received, the firmware emits `ESP32_age_ms=-1`
-    (sentinel — "unknown").
-  - All existing telemetry fields, ODrive/IMU/odometry, the watchdog,
-    and the BT override behaviour are untouched.
+  1. USART3 bumped from 230400 → 460800 baud.
+     Firmware: huart3.Init.BaudRate at main.c line 1045.
+     ROS node: `baud_rate` default in odrive_dashboard.py line 126.
+     Both must move together — the dashboard parameter can still be
+     overridden at launch time.
 
-ROS dashboard node (odrive_dashboard.py)
-  - On every line read from the STM32 serial port the receiver stamps
-    `self._last_raw_msg_time = time.monotonic()` BEFORE running the
-    parser, so a malformed line still proves the link is alive.
-  - `_parse_and_publish` extracts `ESP32_age_ms` from the regex match
-    dict using the existing safe `_si()` helper. -1 (or a missing
-    field) is mapped to `None` so the dashboard can show "unknown".
-  - A new ROS timer at 4 Hz (`_tick_link_status`) re-emits the latest
-    telemetry dict to the web client with refreshed age values, so the
-    "STM32→PC" reading keeps growing visibly while the STM32 is silent.
-  - A helper `_inject_link_ages(telem)` adds four keys to every emitted
-    frame:
-        esp32_age_ms / esp32_status   (ESP32→STM32)
-        pc_age_ms    / pc_status      (STM32→PC)
+  2. Telemetry line rewritten to compact `i=value` form. Every field has
+     a fixed positional index (0..95 today). A single comment block
+     above the printf documents the mapping; the same list is mirrored
+     as `TELEM_FIELDS` in the Python node so the parser translates
+     numeric keys back into the legacy named-key dict — the rest of
+     `_parse_and_publish()` is byte-identical to before.
 
-Dashboard HTML (assets/dashboard.html)
-  - A compact "Links" block is inserted between Odometry and the
-    velocity chart in row-1 column-2 of the layout (`.cfgrow` col 2).
-  - Two rows: ESP32→STM32 and STM32→PC, each showing the age
-    ("123 ms" / "1.42 s" / "unknown") and an OK/WARN/LOST/UNKNOWN pill.
-  - JS helpers `fmtAge`, `applyLinkPill`, `updateLink` reuse the
-    existing `.pill`, `.pill.run`, `.pill.err` classes plus an inline
-    amber style for WARN to match the rest of the dashboard palette.
+     The map block is in main.c::Start_UART_TX_Task (block comment above
+     the printf). Indices today:
 
-------------------------------------------------------------
-Files changed
-------------------------------------------------------------
+         0..2   CMD twist
+         3..5   IMU Euler (legacy, degrees)
+         6..9   IMU quaternion
+        10..12  IMU angular velocity
+        13..15  IMU linear acceleration
+        16..19  IK wheel speeds u0..u3
+        20..23  EKF pose phi,x,y,z
+        24..27  EKF orientation quaternion
+        28..30  World twist (omega, vx, vy)
+        31..32  Body-frame linear twist (vxb, vyb)
+        33..35  Pose covariance diagonal
+        36..38  Twist covariance diagonal
+        39..51  Axis 0 block (N,E,S,C,P,V,Sh,CPR,Vbus,Ibus,IqSet,IqMeas,U)
+        52..64  Axis 1 block
+        65..77  Axis 2 block
+        78..90  Axis 3 block
+        91..94  BT state (active, vx, vy, wz)
+        95      ESP32 age in ms (-1 sentinel = no message yet)
 
+  Net effect: a typical line shrank from ~1100-1300 chars to ~600-700,
+  and at 460800 baud the per-char polling cost dropped to ~22 µs. Worst
+  case is now ~15 ms/line — comfortably under the 10 ms telemetry tick
+  with room to grow.
+
+  Forward-compat: the parser still accepts named keys (e.g. CMD_vx=…),
+  so a half-flashed setup (old firmware + new node, or new firmware +
+  old node) keeps producing usable telemetry until both sides are
+  updated.
+
+
+PHASE 1 — AXIS LAB TAB SCAFFOLD
+--------------------------------
+Net new UX:
+
+  * Tab bar inserted between the topbar and the existing `.wrap` panel.
+    Two tabs: "Overview" (the existing dashboard, untouched) and
+    "Axis Lab" (new).
+
+  * Axis Lab layout is a 2-column grid:
+      LEFT side  — motor selector + safety controls + state/calibration
+                   buttons.
+      RIGHT side — detailed status panel + 2×2 live charts +
+                   direct-input control card (mostly disabled).
+
+  * Motor selector: four chips, one per axis. Each chip shows
+      - an editable label (defaults to FL/FR/RL/RR; persisted to
+        localStorage under key `al.labels.v1`),
+      - the current CAN node ID (from telemetry, not hardcoded),
+      - a status pill that follows the same OK/RUN/ERR coloring as
+        the Overview tab.
+    Clicking a chip selects it (highlight + main panel switches).
+
+  * Heartbeat-age proxy: the firmware doesn't expose per-axis CAN
+    heartbeat ages today. The Axis Lab synthesises one by watching the
+    `U` updated-flag in telemetry — when it toggles, we stamp
+    `performance.now()`; the age is `now - last_toggle`. Thresholds
+    match the existing link widget: OK <500 ms, WARN <2 s, LOST ≥2 s.
+
+  * Detailed status card for the selected motor:
+      axis state (decoded enum), controller mode (decoded), active
+      error (hex + green/red), updated-flag value, position, velocity,
+      encoder shadow, encoder CPR, Vbus, Ibus, Iq set, Iq measured.
+    "Phase 3" placeholder row for fields the firmware doesn't yet
+    capture (FET temp, motor temp, torque target, torque estimate).
+
+  * 2×2 charts: Position / Velocity / Iq set vs Iq meas / Vbus vs Ibus.
+    80-sample rolling buffer per chart.
+
+  * Safety controls:
+      - "Wheel is lifted / robot is on stand" checkbox. Gates every
+        button with `data-needlift="1"` (currently all calibration
+        buttons and all direct-input buttons). No hardware interlock —
+        this is operator attestation.
+      - Test-limit inputs: max vel, max curr, max torque, max pos step.
+        Stored client-side; phase 2 will read them when sending direct
+        commands.
+      - EMERGENCY: idle selected motor — always enabled, sends a
+        `set_state` with state=IDLE for the selected mask.
+
+  * State / lifecycle buttons (use existing CFG_* type-2 commands with
+    a single-axis mask = 1 << sel):
+      Closed loop / Idle / Clear errors / Stop / Reboot (confirm).
+
+  * Calibration buttons (lifted-required):
+      Full calib (state 3), Motor only (4), Enc offset (7),
+      Enc dir find (10), Enc idx search (6), Homing (11),
+      Hall polarity (12), Hall phase (13).
+
+  * Direct-input section: rendered but every button is disabled, with
+    a note that they need new firmware command types in phase 2 (the
+    current `ODRIVE_CMD_SET_VEL` always runs the mecanum IK over
+    mask 0x0F).
+
+  * Identify/blink button: rendered but disabled with a tooltip — needs
+    firmware addition (Set_Identify or SDO function call) in phase 4.
+
+
+FILES MODIFIED
+--------------
 1. firmware/STM32H7_OMNIBASE_CAN_BNO085/CM7/Core/Src/main.c
-     - Added `volatile uint32_t g_bt_last_valid_msg_tick = UINT32_MAX;`
-       next to the existing `BT_active` global.
-     - Inside `start_BT_RX_Task`, after the successful Type-3 sscanf
-       (`parsed >= 4`), set `g_bt_last_valid_msg_tick = HAL_GetTick();`.
-     - In `Start_UART_TX_Task`, snapshot the tick, compute
-       `esp32_age_ms` (long, -1 when sentinel), append
-       `ESP32_age_ms=%ld\r\n` to the printf format and add the
-       matching argument at the end of the var list.
+   - Bumped huart3 baud 230400 → 460800.
+   - Rewrote the UART_TX printf to the compact format with the index map
+     in the comment above it.
 
 2. omnibase_ws/src/odrive_comm/odrive_comm/odrive_dashboard.py
-     - New instance state in `__init__`:
-         self._last_raw_msg_time: float | None = None
-         self._latest_esp32_age_ms: int | None = None
-     - New 4 Hz ROS timer:
-         self.create_timer(0.25, self._tick_link_status)
-     - In `_receiver`, stamp `self._last_raw_msg_time` for every line
-       read from the serial port.
-     - In `_parse_and_publish`, parse `ESP32_age_ms` and cache it
-       (None when -1 or missing).
-     - Added class constants `_LINK_OK_S = 0.5`, `_LINK_WARN_S = 2.0`
-       and methods `_link_status_label`, `_inject_link_ages`,
-       `_tick_link_status`.
-     - Both the per-packet emit and the periodic timer call
-       `_inject_link_ages(telem)` before pushing to SocketIO.
-     - Extended `_empty_telem` with the four new keys
-       (`esp32_age_ms`, `esp32_status`, `pc_age_ms`, `pc_status`,
-       initialised to None / 'UNKNOWN').
+   - Bumped default `baud_rate` 230400 → 460800.
+   - Added module-level `TELEM_FIELDS` list (single source of truth,
+     must stay in lock-step with the firmware comment block).
+   - Parser now accepts both numeric (`i=value`) and named keys, and
+     translates numeric keys back into the legacy named dict so the
+     rest of `_parse_and_publish()` is unchanged.
 
 3. omnibase_ws/src/odrive_comm/assets/dashboard.html
-     - Added the "Links" block (two rows + status pills) inside the
-       row-1 column-2 card, between Odometry and Robot velocity.
-     - Added JS helpers `fmtAge`, `applyLinkPill`, `updateLink` and a
-       pair of `updateLink('esp', ...)` / `updateLink('pc', ...)`
-       calls inside the `socket.on('telemetry', ...)` handler.
+   - Added tab CSS (`.tabbar`, `.tab`, `.tabpanel.hidden`,
+     `.al-*` family for the Axis Lab specifics).
+   - Inserted the tab bar above the existing layout.
+   - Wrapped the existing `.wrap` block in `<div id="tab-overview">`
+     and added the new `<div id="tab-axislab">` panel.
+   - Self-contained Axis Lab IIFE appended at the bottom of the
+     script tag: tab switching, label persistence, selector rendering,
+     telemetry handler, button command routing, e-stop, charts.
 
-------------------------------------------------------------
-Exact telemetry field added
-------------------------------------------------------------
 
-Field name  : ESP32_age_ms
-Type        : signed integer, milliseconds
-Position    : appended at the end of the existing telemetry line, after
-              `BT_active`, `BT_vx`, `BT_vy`, `BT_wz`
-Sentinel    : -1  → "no valid ESP32 message has been received since the
-                    STM32 booted"
-Example     : ...,BT_active=0,BT_vx=0.000,BT_vy=0.000,BT_wz=0.000,
-              ESP32_age_ms=123
+COMMANDS / SOCKET MESSAGES ADDED
+--------------------------------
+Phase 1 reuses the existing Socket.IO `command` envelope — no new server-
+side message types yet. The Axis Lab simply sends with a single-axis mask
+(`1 << selected_idx`) instead of the global `0x0F` used by the Overview.
 
-------------------------------------------------------------
-Dashboard widgets modified
-------------------------------------------------------------
+For phases 2-5, the user spec proposes three new envelopes; they are NOT
+implemented yet (left as TODO):
 
-  HTML element ids touched / introduced
-  -------------------------------------
-  Existing card  : the row-1 col-2 .card (Odometry / Robot velocity)
-  New rows added : ESP32→STM32 line  ids   lnkesp  (age)   lnkespp (pill)
-                   STM32→PC    line  ids   lnkpc   (age)   lnkpcp  (pill)
+  { type: "odrive_can",  node_id, cmd_id, values: {...} }
+  { type: "odrive_sdo_read",  node_id, path }
+  { type: "odrive_sdo_write", node_id, path, value }
 
-  Status colouring
-  ----------------
-  OK    (age < 500 ms)        : green pill  (.pill.run)
-  WARN  (500 ms ≤ age < 2 s)  : amber pill  (inline style)
-  LOST  (age ≥ 2 s)           : red   pill  (.pill.err)
-  UNKNOWN  (no message yet)   : muted pill  (default .pill)
 
-  Why these thresholds
-  --------------------
-  - STM32→PC: `Start_UART_TX_Task` does `osDelay(10)` and is gated by
-    `osMessageQueueGet(CAN_2_UTX_QueueHandle, ..., osWaitForever)`,
-    so the steady-state rate is ~100 Hz. 500 ms = 50 missed packets
-    → unambiguous degradation.
-  - ESP32→STM32: in ACTIVE mode the ESP32 streams Type-3 packets at
-    ~50 Hz; in PAIRED/INACTIVE it still sends heartbeats well above
-    2 Hz. 500 ms covers both rates comfortably.
-  - 2 s is the BT watchdog horizon the firmware already uses, so the
-    LOST threshold lines up with when the firmware itself starts to
-    treat the link as dead.
+VERIFICATION (manual, requires bench)
+-------------------------------------
+1. Flash the updated firmware. With a USART3 monitor at 460800 baud,
+   confirm telemetry lines arrive every ~10 ms and that each field is
+   numeric-prefixed (`0=...,1=...,...,95=...`).
 
-------------------------------------------------------------
-Validation commands
-------------------------------------------------------------
+2. Launch the dashboard:
+       cd ~/Github/home-custom-base/omnibase_ws
+       colcon build --packages-select odrive_comm
+       source install/setup.bash
+       ros2 run odrive_comm odrive_dashboard
+   Open http://<host>:5000. The Overview tab must look and behave
+   identically to before (telemetry, BT pill, link widgets, controls).
 
-Build + source the workspace:
+3. Switch to Axis Lab. Expected behaviour:
+     - Four chips, default labels FL/FR/RL/RR. Edit any label; refresh
+       the page; the change persists.
+     - Click a chip — title updates, charts begin filling. Status panel
+       reflects the selected axis.
+     - "Lifted" checkbox unticked → click any calibration button → log
+       prints `blocked: tick "Wheel is lifted" …` and nothing is sent.
+     - Lifted ticked → calibration buttons send the matching
+       `set_state` with mask = 1 << sel.
+     - Closed loop / Idle / Clear errors / Stop work without the lifted
+       check.
+     - EMERGENCY idle always sends regardless of checkbox.
+     - Direct-input section: every button stays disabled; the note
+       below explains why.
 
-    cd ~/Github/home-custom-base/omnibase_ws
-    colcon build --packages-select odrive_comm
-    source install/setup.bash
+4. Forward-compat sanity check: temporarily revert the firmware printf
+   to named keys (or run with an old firmware build) — the dashboard
+   should keep working because the parser still accepts named keys.
 
-Run the node:
 
-    ros2 run odrive_comm odrive_dashboard
+REMAINING TODOS (BY PHASE)
+--------------------------
+Phase 2 — Per-axis direct control (firmware change required)
+  * New `ODrive.c` helpers / command-message types:
+      ODRIVE_CMD_AXIS_INPUT_VEL    (axis_idx, vel,    torque_ff)
+      ODRIVE_CMD_AXIS_INPUT_POS    (axis_idx, pos,    vel_ff, torque_ff)
+      ODRIVE_CMD_AXIS_INPUT_TORQUE (axis_idx, torque)
+    These must NOT run mecanum IK — they target a single ODrive
+    directly via Set_Input_Vel / Set_Input_Pos / Set_Input_Torque.
+  * Add three text-protocol sub-commands for the Python node to forward
+    these. Suggested encodings:
+      "2 31 <mask_hex> <vel> <trq_ff>"
+      "2 32 <mask_hex> <pos> <vel_ff> <trq_ff>"
+      "2 33 <mask_hex> <torque>"
+    Mask is preserved for symmetry but the firmware should only honour
+    single-bit masks here.
+  * Re-enable the Axis Lab buttons by removing `disabled` from
+    `data-st="al-jogpos|al-jogneg|al-vsend|al-tsend|al-tpulse|al-psend|al-pstep|al-trapsend|al-zero"`.
+  * Wire the JS switch-cases for those `data-st` values to send the new
+    `axis_input_*` socket commands.
 
-Verify the raw stream contains the new field:
+Phase 3 — Extended CAN telemetry (firmware change required)
+  * Per-axis fields to add to the `Axis` struct in ODrive.h:
+      fet_temperature, motor_temperature, torque_target,
+      torque_estimate, electrical_power, mechanical_power,
+      hw_version, fw_version, protocol_version,
+      active_errors (full 32-bit), disarm_reason, procedure_result,
+      trajectory_done.
+  * RX handlers in ODrive_RX_CallBack for ODrive 0.6.x CAN message IDs:
+      0x000 Get_Version          (request once on startup, store)
+      0x003 Get_Error            (poll every ~200 ms via RTR)
+      0x015 Get_Temperature      (poll every ~250 ms)
+      0x01C Get_Torques          (poll every ~50 ms)
+      0x01D Get_Powers           (poll every ~250 ms)
+    Plus the existing 0x001 heartbeat parser should be extended to
+    decode procedure_result + trajectory_done from the second/third
+    bytes (was previously ignored).
+  * New fields to the telemetry line — append after index 90 to keep
+    the existing indices stable. Pick a contiguous range per axis,
+    e.g. 13 new fields × 4 axes = 96..147, then renumber BT/ESP32.
+    The TELEM_FIELDS list in odrive_dashboard.py must update too.
+  * Update the Axis Lab "phase 3 placeholder" row to display the real
+    values (FET / motor temp / torque target / torque est) and add a
+    Powers chart.
 
-    ros2 topic echo /odrive/raw --once
-    # Expect a line ending with `...,ESP32_age_ms=<n>`
+Phase 4 — Calibration polish + identify
+  * Wire `Set_Identify` (newer ODrive 0.6.x CAN cmd, if present in the
+    firmware build — verify in the ODrive Robotics protocol doc for
+    the exact CMD ID and payload). Remove `disabled` from the
+    `#al-identify` button and add a switch case.
+  * Add live calibration progress indicator in the Axis Lab: when the
+    selected axis is in a calibration state (3, 4, 6, 7, 10-13), show
+    the procedure_result / trajectory_done fields once phase 3 lands.
+  * Wire "Save configuration" command — needs an SDO function call
+    (phase 6) OR a dedicated CAN command if the firmware build exposes
+    one.
 
-Verify the publish rate (sanity, ~100 Hz with the new 921600 baud):
+Phase 5 — Safety expansions
+  * Cross-check active_errors before sending any motion command; show
+    a warning banner if `e != 0` and refuse `set_input_*` until cleared.
+  * "Wheel lifted" attestation is operator-only today. If we ever add
+    an actual lift sensor, gate the checkbox behind its reading.
 
-    ros2 topic hz /odrive/raw
+Phase 6 — SDO read/write (BLOCKED on flat_endpoints.json)
+  * User must dump the endpoints map from a live ODrive 0.6.x with
+    odrivetool:
+        python3 -c "import odrive,json; \
+          d = odrive.find_any()._dump_metadata(); \
+          json.dump(d, open('flat_endpoints.json','w'), indent=2)"
+    and check it in under
+        omnibase_ws/src/odrive_comm/config/flat_endpoints.json
+  * New firmware support: RxSdo (CAN cmd 0x004) + TxSdo (0x005).
+    Request/response state machine in ODrive.c with a small queue
+    (one outstanding read/write per axis at a time, ~100 ms timeout).
+    Forward responses back to the host as a new telemetry record
+    (or a separate "sdo_response" UART line).
+  * New socket envelope handlers in odrive_dashboard.py:
+        odrive_sdo_read  → resolve path via flat_endpoints.json →
+                           build RxSdo CAN frame → wait for TxSdo →
+                           cache + push to web client.
+        odrive_sdo_write → same but with payload.
+        odrive_sdo_call  → for function-call endpoints (save_config,
+                           erase_config, identify if it's an SDO func).
+  * Backend cache: keyed by (node_id, path); TTL ~500 ms for live
+    fields, indefinite for config fields. Eager refresh when the
+    config editor opens.
 
-Open the dashboard in a browser at http://localhost:5000 and watch the
-two new rows in the Odometry card:
-    ESP32→STM32: 35 ms     OK
-    STM32→PC:    9 ms      OK
+Phase 7 — Config browser/editor UI
+  * New section inside the Axis Lab card: collapsible groups
+    (Controller, Live controller, Motor, Trap traj, CAN config,
+    Axis safety) listing the paths from the user spec.
+  * Read-all button (issues N SDO reads, populates the form).
+  * Write-edited button (issues SDO writes for dirty fields).
+  * Save configuration (SDO function call).
+  * Export current values to JSON / import from JSON.
+  * Erase config behind a typed confirmation modal.
 
-------------------------------------------------------------
-Disconnection test scenarios
-------------------------------------------------------------
+Phase 8 — Polish
+  * Decode active_errors into named flags using the ODrive 0.6.x error
+    enum (we currently only show the hex value).
+  * Tooltips on every control with units + the underlying CAN/SDO path.
+  * Per-axis log pane scoped to the selected motor.
 
-1. ESP32 disconnected / stopped
-   - Power off the ESP32 (or unpair the controller).
-   - ESP32→STM32 age starts climbing. After ~500 ms it flips to WARN,
-     after ~2 s to LOST. The STM32→PC line stays OK because the STM32
-     is still publishing telemetry.
-   - If the STM32 has never seen an ESP32 message since boot, the line
-     reads `unknown / UNKNOWN`.
 
-2. STM32 disconnected / stopped
-   - Unplug the STM32 USB cable (or hold reset).
-   - The ROS node's serial readline times out; `_last_raw_msg_time`
-     stops being refreshed. The 4 Hz timer keeps emitting telemetry,
-     so the STM32→PC age climbs visibly on the dashboard
-     (OK → WARN → LOST).
-   - The ESP32→STM32 field stops updating but the cached value remains
-     visible (and will look misleadingly "stale OK" — see notes below).
-     The STM32→PC LOST pill is the canonical signal in this case.
-
-3. PC no longer receiving /odrive/raw
-   - Equivalent to scenario 2 from the dashboard's perspective.
-     Verify with:
-         ros2 topic hz /odrive/raw      # should drop to 0
-         ros2 topic echo /odrive/raw    # no new lines
-   - The web dashboard shows STM32→PC: LOST with an age in seconds.
-
-------------------------------------------------------------
-Assumptions and design notes
-------------------------------------------------------------
-
-- "Valid ESP32 message" is defined as a successfully sscanf-parsed
-  Type-3 line (`parsed >= 4`), regardless of `controll_state` /
-  buttons / dead-zones. Heartbeat lines in PAIRED / INACTIVE state are
-  intentionally treated as valid so the link can be monitored even
-  when nobody is actively driving the robot.
-
-- The firmware-side timestamp uses `HAL_GetTick()` (1 kHz SysTick).
-  Wrap-around at ~49.7 days is handled by the unsigned subtraction
-  `HAL_GetTick() - bt_tick_snap`. The sentinel `UINT32_MAX` only
-  collides ~49.7 days into a boot, at which point the
-  "first ESP32 message" check is moot.
-
-- `time.monotonic()` is used on the host so that NTP / system-clock
-  jumps cannot make the STM32→PC age go negative or jump backwards.
-
-- During an STM32 disconnect the firmware can't update its own
-  ESP32_age_ms, so the dashboard freezes that value at its last
-  reported number. We deliberately do NOT extrapolate it on the PC
-  (we have no way to know what the firmware would say). The STM32→PC
-  LOST pill is the indicator of "you can't trust the ESP32 number any
-  more"; treat it as authoritative.
-
-- All parsing uses the existing `_si()` helper, which returns 0 on
-  malformed input. We then convert 0/negative to `None` so the
-  dashboard shows "unknown" rather than a misleading number. The node
-  cannot crash on a truncated `ESP32_age_ms=` field.
-
-- No existing behaviour was removed: every previous telemetry field,
-  ROS publisher, IMU/odometry message, BT override logic, command
-  watchdog, and ODrive flow continues to work as before. The change
-  is purely additive.
+WHAT THIS PHASE WAS *NOT* DESIGNED TO DO
+----------------------------------------
+* No firmware changes beyond the baud bump and the printf rewrite.
+  Phases 2/3/4 need new C code in ODrive.c and ODrive_RX_CallBack;
+  phase 6 needs the SDO state machine.
+* No new ROS topics. The existing per-axis topics keep working
+  unchanged.
+* No new dependencies (still vanilla rclpy + python-socketio +
+  Flask + Chart.js).
+* No assumption that the user has already characterised the
+  FL/FR/RL/RR physical mapping — the dashboard simply lets them edit
+  the labels per-deployment and remembers their choice.

@@ -40,7 +40,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <math.h>
-#include "bno055_stm32.h"
 #include "uart_rx.h"
 #include <string.h>
 //#include "mcp2515.h"
@@ -52,6 +51,7 @@
 #include "sh2_hal.h"
 #include "sh2_SensorValue.h"
 #include "euler.h"
+#include "ekf.h"
 
 /* USER CODE END Includes */
 
@@ -208,6 +208,14 @@ volatile float g_bno085_az = 0.0f;
 /* Set to 1 by the async event callback when a BNO085 reset event arrives */
 static volatile uint8_t g_bno085_sensor_ready = 0;
 
+/* Monotonically incremented by imu_sensor_data_cb on every fresh rotation /
+ * gyro / accel update. The ODrive task reads it once per telemetry tick and
+ * only applies an EKF IMU correction when the value has advanced — that way
+ * we never double-count the same IMU sample even though the EKF runs faster
+ * than the BNO085's 50 Hz output. 32-bit increments/reads are atomic on
+ * Cortex-M7, so no mutex is needed. */
+volatile uint32_t g_bno085_seq = 0;
+
 #define BNO085_REPORT_INTERVAL_US  20000U   /* 50 Hz rotation vector / gyro / linear-accel */
 #define RAD_TO_DEG_D               (180.0 / 3.14159265358979323846)
 
@@ -313,6 +321,24 @@ int computeNecessaryWheelSpeedsMecanum(double phi, double x_off, double y_off, d
     u[1] = (x_dot*(cos(phi) - sin(phi)) + y_dot*(cos(phi) + sin(phi)) + phi_dot*(x_off + y_off)) / r;
     u[2] = (x_dot*(cos(phi) - sin(phi)) + y_dot*(cos(phi) + sin(phi)) - phi_dot*(x_off + y_off)) / r;
     u[3] = (x_dot*(cos(phi) + sin(phi)) - y_dot*(cos(phi) - sin(phi)) + phi_dot*(x_off + y_off)) / r;
+    return 0;
+}
+
+/* Body-frame forward kinematics for a 4-wheel mecanum drive.
+ *
+ *   v_body[0] = vx_body  [m/s]   forward (robot x)
+ *   v_body[1] = vy_body  [m/s]   sideways (robot y)
+ *   v_body[2] = phi_dot  [rad/s] yaw rate
+ *
+ * Unlike globalSpeedsFromUMecanum() the result is in the body frame, which is
+ * what the EKF wants as a measurement (the EKF carries its own theta estimate
+ * and does the rotation into the world frame itself). */
+int bodySpeedsFromUMecanum(double x_off, double y_off, double r,
+                           const double u[4], double v_body[3]) {
+    const double L = x_off + y_off;
+    v_body[0] = (r / 4.0) * ( u[0] + u[1] + u[2] + u[3]);
+    v_body[1] = (r / 4.0) * (-u[0] + u[1] + u[2] - u[3]);
+    v_body[2] = (r / (4.0 * L)) * (-u[0] + u[1] - u[2] + u[3]);
     return 0;
 }
 
@@ -1015,7 +1041,7 @@ static void MX_USART2_UART_Init(void)
 static void MX_USART3_UART_Init(void)
 {
   huart3.Instance = USART3;
-  huart3.Init.BaudRate = 230400;
+  huart3.Init.BaudRate = 460800;
   huart3.Init.WordLength = UART_WORDLENGTH_8B;
   huart3.Init.StopBits = UART_STOPBITS_1;
   huart3.Init.Parity = UART_PARITY_NONE;
@@ -1421,52 +1447,86 @@ void Start_UART_TX_Task(void *argument)
             esp32_age_ms = (long)(HAL_GetTick() - bt_tick_snap);
         }
 
-        /* UART telemetry line.
-         * Existing Euler IMU_yaw/roll/pitch fields are preserved for backward
-         * compatibility with old consumers; the new IMU_q* / IMU_w* / IMU_a*
-         * fields feed the ROS sensor_msgs/Imu message:
-         *   - IMU_qx, IMU_qy, IMU_qz, IMU_qw  orientation quaternion (unitless)
-         *   - IMU_wx, IMU_wy, IMU_wz          angular velocity [rad/s]
-         *   - IMU_ax, IMU_ay, IMU_az          linear acceleration [m/s^2]
-         * ESP32_age_ms: ms since the last valid Type-3 message from the ESP32
-         * on USART2; -1 means no message has been received yet.
+        /* === COMPACT TELEMETRY FORMAT ============================================
+         * One CSV line per tick. Each field is `i=value` with `i` a fixed
+         * positional index. This is intentionally short so we can drive 100 Hz
+         * at 460800 baud and still leave headroom for the future per-axis
+         * "Axis Lab" telemetry (temperature, torques, powers).
+         *
+         * The index map MUST match TELEM_FIELDS in
+         *   omnibase_ws/src/odrive_comm/odrive_comm/odrive_dashboard.py
+         * If you add or reorder fields here, update the Python list in lock-step.
+         *
+         *  0..2     CMD twist           cmd_vx, cmd_vy, cmd_wz           [m/s, m/s, rad/s]
+         *  3..5     IMU Euler (legacy)  imu_yaw, imu_roll, imu_pitch     [deg]
+         *  6..9     IMU quaternion      imu_qx, imu_qy, imu_qz, imu_qw   [unitless]
+         * 10..12    IMU angular vel     imu_wx, imu_wy, imu_wz           [rad/s]
+         * 13..15    IMU linear accel    imu_ax, imu_ay, imu_az           [m/s^2, gravity removed]
+         * 16..19    IK wheel speeds     ik_u0..ik_u3                     [rad/s]
+         * 20..23    EKF pose            odom_phi, odom_x, odom_y, odom_z [rad, m, m, m=0]
+         * 24..27    EKF quaternion      odom_qx, odom_qy, odom_qz, odom_qw
+         * 28..30    World twist         odom_w, odom_vx, odom_vy         [rad/s, m/s, m/s]
+         * 31..32    Body lin twist      odom_vxb, odom_vyb               [m/s]
+         * 33..35    Pose cov diag       var_x, var_y, var_yaw
+         * 36..38    Twist cov diag      var_vx, var_vy, var_wz
+         * 39..90    Per-axis block, 13 fields per axis, 4 axes (axis i -> 39 + i*13)
+         *           Block offsets:
+         *             +0  N node_id           +1  E axis_error
+         *             +2  S axis_state        +3  C controller_status
+         *             +4  P pos_est           +5  V vel_est
+         *             +6  Sh encoder_shadow   +7  CPR encoder_cpr
+         *             +8  Vbus                +9  Ibus
+         *            +10  IqSet              +11  IqMeas
+         *            +12  U updated_flag
+         * 91..94    BT state            bt_active, bt_vx, bt_vy, bt_wz
+         * 95        ESP32 age, ms (-1 = no Type-3 message received since boot)
+         * =========================================================================
          */
-        printf("CMD_vx=%.3lf,CMD_vy=%.3lf,CMD_wz=%.3lf,"
-               "IMU_yaw=%.2f,IMU_roll=%.2f,IMU_pitch=%.2f,"
-               "IMU_qx=%.6f,IMU_qy=%.6f,IMU_qz=%.6f,IMU_qw=%.6f,"
-               "IMU_wx=%.4f,IMU_wy=%.4f,IMU_wz=%.4f,"
-               "IMU_ax=%.4f,IMU_ay=%.4f,IMU_az=%.4f,"
-               "IK_u0=%.3lf,IK_u1=%.3lf,IK_u2=%.3lf,IK_u3=%.3lf,"
-               "ODOM_phi=%.3f,ODOM_x=%.3f,ODOM_y=%.3f,"
-               "ODOM_w=%.3f,ODOM_vx=%.3f,ODOM_vy=%.3f,"
-               "N0=%u,E0=%lu,S0=%u,C0=%u,P0=%.3f,V0=%.3f,Sh0=%ld,CPR0=%ld,Vbus0=%.3f,Ibus0=%.3f,IqSet0=%.3f,IqMeas0=%.3f,U0=%u,"
-               "N1=%u,E1=%lu,S1=%u,C1=%u,P1=%.3f,V1=%.3f,Sh1=%ld,CPR1=%ld,Vbus1=%.3f,Ibus1=%.3f,IqSet1=%.3f,IqMeas1=%.3f,U1=%u,"
-               "N2=%u,E2=%lu,S2=%u,C2=%u,P2=%.3f,V2=%.3f,Sh2=%ld,CPR2=%ld,Vbus2=%.3f,Ibus2=%.3f,IqSet2=%.3f,IqMeas2=%.3f,U2=%u,"
-               "N3=%u,E3=%lu,S3=%u,C3=%u,P3=%.3f,V3=%.3f,Sh3=%ld,CPR3=%ld,Vbus3=%.3f,Ibus3=%.3f,IqSet3=%.3f,IqMeas3=%.3f,U3=%u,"
-               "BT_active=%u,BT_vx=%.3f,BT_vy=%.3f,BT_wz=%.3f,"
-               "ESP32_age_ms=%ld\r\n",
-               last_cmd.robot_twist[0], last_cmd.robot_twist[1], last_cmd.robot_twist[2],
-               telemetryMsg.imu.yaw, telemetryMsg.imu.roll, telemetryMsg.imu.pitch,
-               telemetryMsg.imu.qx, telemetryMsg.imu.qy, telemetryMsg.imu.qz, telemetryMsg.imu.qw,
-               telemetryMsg.imu.wx, telemetryMsg.imu.wy, telemetryMsg.imu.wz,
-               telemetryMsg.imu.ax, telemetryMsg.imu.ay, telemetryMsg.imu.az,
-               telemetryMsg.IK_computed_wheel_speeds[0], telemetryMsg.IK_computed_wheel_speeds[1], telemetryMsg.IK_computed_wheel_speeds[2], telemetryMsg.IK_computed_wheel_speeds[3],
-               telemetryMsg.odom.phi, telemetryMsg.odom.x_pos, telemetryMsg.odom.y_pos,
-               telemetryMsg.odom.q_dot[0], telemetryMsg.odom.q_dot[1], telemetryMsg.odom.q_dot[2],
-               telemetryMsg.node_id[0], telemetryMsg.axis_error[0], telemetryMsg.axis_state[0], telemetryMsg.controller_status[0],
-               telemetryMsg.pos_est[0], telemetryMsg.vel_est[0], telemetryMsg.encoder_shadow[0], telemetryMsg.encoder_cpr[0],
-               telemetryMsg.bus_voltage[0], telemetryMsg.bus_current[0], telemetryMsg.iq_setpoint[0], telemetryMsg.iq_measured[0], telemetryMsg.updated[0],
-               telemetryMsg.node_id[1], telemetryMsg.axis_error[1], telemetryMsg.axis_state[1], telemetryMsg.controller_status[1],
-               telemetryMsg.pos_est[1], telemetryMsg.vel_est[1], telemetryMsg.encoder_shadow[1], telemetryMsg.encoder_cpr[1],
-               telemetryMsg.bus_voltage[1], telemetryMsg.bus_current[1], telemetryMsg.iq_setpoint[1], telemetryMsg.iq_measured[1], telemetryMsg.updated[1],
-               telemetryMsg.node_id[2], telemetryMsg.axis_error[2], telemetryMsg.axis_state[2], telemetryMsg.controller_status[2],
-               telemetryMsg.pos_est[2], telemetryMsg.vel_est[2], telemetryMsg.encoder_shadow[2], telemetryMsg.encoder_cpr[2],
-               telemetryMsg.bus_voltage[2], telemetryMsg.bus_current[2], telemetryMsg.iq_setpoint[2], telemetryMsg.iq_measured[2], telemetryMsg.updated[2],
-               telemetryMsg.node_id[3], telemetryMsg.axis_error[3], telemetryMsg.axis_state[3], telemetryMsg.controller_status[3],
-               telemetryMsg.pos_est[3], telemetryMsg.vel_est[3], telemetryMsg.encoder_shadow[3], telemetryMsg.encoder_cpr[3],
-               telemetryMsg.bus_voltage[3], telemetryMsg.bus_current[3], telemetryMsg.iq_setpoint[3], telemetryMsg.iq_measured[3], telemetryMsg.updated[3],
-               telemetryMsg.bt_active, telemetryMsg.bt_vx, telemetryMsg.bt_vy, telemetryMsg.bt_wz,
-               esp32_age_ms);
+        printf(
+            /* 0..2  */  "0=%.3lf,1=%.3lf,2=%.3lf,"
+            /* 3..5  */  "3=%.2f,4=%.2f,5=%.2f,"
+            /* 6..9  */  "6=%.6f,7=%.6f,8=%.6f,9=%.6f,"
+            /* 10..12*/  "10=%.4f,11=%.4f,12=%.4f,"
+            /* 13..15*/  "13=%.4f,14=%.4f,15=%.4f,"
+            /* 16..19*/  "16=%.3lf,17=%.3lf,18=%.3lf,19=%.3lf,"
+            /* 20..23*/  "20=%.3f,21=%.3f,22=%.3f,23=%.3f,"
+            /* 24..27*/  "24=%.6f,25=%.6f,26=%.6f,27=%.6f,"
+            /* 28..30*/  "28=%.3f,29=%.3f,30=%.3f,"
+            /* 31..32*/  "31=%.3f,32=%.3f,"
+            /* 33..35*/  "33=%.5f,34=%.5f,35=%.5f,"
+            /* 36..38*/  "36=%.5f,37=%.5f,38=%.5f,"
+            /* 39..51 axis 0 */  "39=%u,40=%lu,41=%u,42=%u,43=%.3f,44=%.3f,45=%ld,46=%ld,47=%.3f,48=%.3f,49=%.3f,50=%.3f,51=%u,"
+            /* 52..64 axis 1 */  "52=%u,53=%lu,54=%u,55=%u,56=%.3f,57=%.3f,58=%ld,59=%ld,60=%.3f,61=%.3f,62=%.3f,63=%.3f,64=%u,"
+            /* 65..77 axis 2 */  "65=%u,66=%lu,67=%u,68=%u,69=%.3f,70=%.3f,71=%ld,72=%ld,73=%.3f,74=%.3f,75=%.3f,76=%.3f,77=%u,"
+            /* 78..90 axis 3 */  "78=%u,79=%lu,80=%u,81=%u,82=%.3f,83=%.3f,84=%ld,85=%ld,86=%.3f,87=%.3f,88=%.3f,89=%.3f,90=%u,"
+            /* 91..94*/  "91=%u,92=%.3f,93=%.3f,94=%.3f,"
+            /* 95    */  "95=%ld\r\n",
+            last_cmd.robot_twist[0], last_cmd.robot_twist[1], last_cmd.robot_twist[2],
+            telemetryMsg.imu.yaw, telemetryMsg.imu.roll, telemetryMsg.imu.pitch,
+            telemetryMsg.imu.qx, telemetryMsg.imu.qy, telemetryMsg.imu.qz, telemetryMsg.imu.qw,
+            telemetryMsg.imu.wx, telemetryMsg.imu.wy, telemetryMsg.imu.wz,
+            telemetryMsg.imu.ax, telemetryMsg.imu.ay, telemetryMsg.imu.az,
+            telemetryMsg.IK_computed_wheel_speeds[0], telemetryMsg.IK_computed_wheel_speeds[1], telemetryMsg.IK_computed_wheel_speeds[2], telemetryMsg.IK_computed_wheel_speeds[3],
+            telemetryMsg.odom.phi, telemetryMsg.odom.x_pos, telemetryMsg.odom.y_pos, telemetryMsg.odom.z_pos,
+            telemetryMsg.odom.qx, telemetryMsg.odom.qy, telemetryMsg.odom.qz, telemetryMsg.odom.qw,
+            telemetryMsg.odom.q_dot[0], telemetryMsg.odom.q_dot[1], telemetryMsg.odom.q_dot[2],
+            telemetryMsg.odom.vx_body, telemetryMsg.odom.vy_body,
+            telemetryMsg.odom.pose_covariance[0],  telemetryMsg.odom.pose_covariance[7],  telemetryMsg.odom.pose_covariance[35],
+            telemetryMsg.odom.twist_covariance[0], telemetryMsg.odom.twist_covariance[7], telemetryMsg.odom.twist_covariance[35],
+            telemetryMsg.node_id[0], telemetryMsg.axis_error[0], telemetryMsg.axis_state[0], telemetryMsg.controller_status[0],
+            telemetryMsg.pos_est[0], telemetryMsg.vel_est[0], telemetryMsg.encoder_shadow[0], telemetryMsg.encoder_cpr[0],
+            telemetryMsg.bus_voltage[0], telemetryMsg.bus_current[0], telemetryMsg.iq_setpoint[0], telemetryMsg.iq_measured[0], telemetryMsg.updated[0],
+            telemetryMsg.node_id[1], telemetryMsg.axis_error[1], telemetryMsg.axis_state[1], telemetryMsg.controller_status[1],
+            telemetryMsg.pos_est[1], telemetryMsg.vel_est[1], telemetryMsg.encoder_shadow[1], telemetryMsg.encoder_cpr[1],
+            telemetryMsg.bus_voltage[1], telemetryMsg.bus_current[1], telemetryMsg.iq_setpoint[1], telemetryMsg.iq_measured[1], telemetryMsg.updated[1],
+            telemetryMsg.node_id[2], telemetryMsg.axis_error[2], telemetryMsg.axis_state[2], telemetryMsg.controller_status[2],
+            telemetryMsg.pos_est[2], telemetryMsg.vel_est[2], telemetryMsg.encoder_shadow[2], telemetryMsg.encoder_cpr[2],
+            telemetryMsg.bus_voltage[2], telemetryMsg.bus_current[2], telemetryMsg.iq_setpoint[2], telemetryMsg.iq_measured[2], telemetryMsg.updated[2],
+            telemetryMsg.node_id[3], telemetryMsg.axis_error[3], telemetryMsg.axis_state[3], telemetryMsg.controller_status[3],
+            telemetryMsg.pos_est[3], telemetryMsg.vel_est[3], telemetryMsg.encoder_shadow[3], telemetryMsg.encoder_cpr[3],
+            telemetryMsg.bus_voltage[3], telemetryMsg.bus_current[3], telemetryMsg.iq_setpoint[3], telemetryMsg.iq_measured[3], telemetryMsg.updated[3],
+            telemetryMsg.bt_active, telemetryMsg.bt_vx, telemetryMsg.bt_vy, telemetryMsg.bt_wz,
+            esp32_age_ms);
 
         osDelay(10);
     }
@@ -1547,6 +1607,11 @@ static void imu_sensor_data_cb(void *cookie, sh2_SensorEvent_t *event)
     default:
         break;
     }
+
+    /* Mark fresh data for the EKF correction step. Counts every SH2 callback
+     * (rotation / gyro / accel) — the ODrive task only needs to see *any*
+     * advance to know it can apply a new IMU correction. */
+    g_bno085_seq++;
 }
 
 static void imu_service_ms(uint32_t ms)
@@ -1635,6 +1700,10 @@ HAL_StatusTypeDef ODrive_Startup(Axis odrives[], uint8_t num_odrives, FDCAN_TXms
                                   Control_Mode control_mode, Input_Mode input_mode,
                                   uint8_t requested_state)
 {
+    static const float pos_gain_def[]     = ODRIVE_DEFAULT_POS_GAIN;
+    static const float vel_gain_def[]     = ODRIVE_DEFAULT_VEL_GAIN;
+    static const float vel_int_gain_def[] = ODRIVE_DEFAULT_VEL_INT_GAIN;
+
     HAL_StatusTypeDef st;
     for (uint8_t i = 0; i < num_odrives; i++)
     {
@@ -1645,6 +1714,14 @@ HAL_StatusTypeDef ODrive_Startup(Axis odrives[], uint8_t num_odrives, FDCAN_TXms
         FDCAN_WAIT_TX_FREE();
         st = Set_Controller_Modes(&odrives[i], msg, control_mode, input_mode);
         if (st != HAL_OK) { printf("ODrive startup failed: axis %u Set_Controller_Modes\r\n", i); return st; }
+
+        FDCAN_WAIT_TX_FREE();
+        st = Set_Position_Gain(&odrives[i], msg, pos_gain_def[i]);
+        if (st != HAL_OK) { printf("ODrive startup failed: axis %u Set_Position_Gain\r\n", i); return st; }
+
+        FDCAN_WAIT_TX_FREE();
+        st = Set_Vel_Gains(&odrives[i], msg, vel_gain_def[i], vel_int_gain_def[i]);
+        if (st != HAL_OK) { printf("ODrive startup failed: axis %u Set_Vel_Gains\r\n", i); return st; }
 
         FDCAN_WAIT_TX_FREE();
         st = Set_Axis_Requested_State(&odrives[i], msg, requested_state);
@@ -1886,12 +1963,29 @@ void ODrive_ProcessCommand(const ODriveCmdMsg *cmd, Axis odrives[], uint8_t num_
 }
 
 
+/* Run one EKF cycle (predict + corrections) and pack the result into the
+ * telemetry / odometry payload.
+ *
+ *   ekf            EKF instance (state survives across calls).
+ *   imu_seq_seen   in/out: the last g_bno085_seq value that produced an IMU
+ *                  correction; pass &-1 the first time and forward the slot
+ *                  on subsequent calls so we never double-count a sample.
+ *   dt_ms          time elapsed since the previous call to this function.
+ *
+ * Steps:
+ *   1. Refresh per-axis telemetry and recover wheel angular velocities u[].
+ *   2. Body-frame mecanum FK -> (vx_body, vy_body, omega_body).
+ *   3. EKF predict using the optional IMU body acceleration.
+ *   4. EKF correct with the wheel-FK twist.
+ *   5. If new IMU data has arrived, EKF correct with IMU yaw + IMU omega.
+ *   6. Fill OdomData (legacy fields + new z, quaternion, covariances) from
+ *      the filtered state. */
 void ODrive_UpdateTelemetryAndOdometry(Axis odrives[], uint8_t num_odrives,
                                        ODriveTelemetryMsg *msg, OdomData *odom,
-                                       double *x, double *y, double *theta,
+                                       EKF *ekf, uint32_t *imu_seq_seen,
                                        double x_offset, double y_offset, double radius,
-                                       double u[4], double q_dot[3], uint32_t dt,
-                                       double wheel_sign[])
+                                       double u[4], uint32_t dt_ms,
+                                       const double wheel_sign[])
 {
     for (uint8_t i = 0; i < num_odrives; i++)
     {
@@ -1914,19 +2008,73 @@ void ODrive_UpdateTelemetryAndOdometry(Axis odrives[], uint8_t num_odrives,
         u[i] = wheel_sign[i] * (odrives[i].AXIS_Encoder_Vel / odrives[i].gear_ratio) * 2.0 * PI;
     }
 
-    globalSpeedsFromUMecanum(*theta, x_offset, y_offset, radius, u, q_dot);
+    /* Body-frame velocities from wheel FK — feed the EKF as a measurement. */
+    double v_body[3];
+    bodySpeedsFromUMecanum(x_offset, y_offset, radius, u, v_body);
 
-    double dt_s = dt * 0.001;
-    *x     += q_dot[1] * dt_s;
-    *y     += q_dot[2] * dt_s;
-    *theta += q_dot[0] * dt_s;
+    const double dt_s = (double)dt_ms * 0.001;
 
-    odom->x_pos    = *x;
-    odom->y_pos    = *y;
-    odom->phi      = *theta;
-    odom->q_dot[0] = q_dot[0];
-    odom->q_dot[1] = q_dot[1];
-    odom->q_dot[2] = q_dot[2];
+    /* Predict step. IMU body acceleration is read from the shared globals;
+     * the EKF ignores it unless params.use_imu_acceleration is true. */
+    const double ax = (double)g_bno085_ax;
+    const double ay = (double)g_bno085_ay;
+    ekf_predict(ekf, dt_s, ax, ay);
+
+    /* Correction 1: wheel-FK twist. Pass -1 for variances => filter uses its
+     * configured defaults. */
+    ekf_correct_odom_twist(ekf, v_body[0], v_body[1], v_body[2], -1.0, -1.0, -1.0);
+
+    /* Corrections 2 & 3: IMU yaw + IMU yaw-rate, but only if a fresh sample
+     * has arrived since the previous call. */
+    const uint32_t seq_now = g_bno085_seq;
+    if (seq_now != *imu_seq_seen) {
+        *imu_seq_seen = seq_now;
+
+        const double qw = (double)g_bno085_qw;
+        const double qx = (double)g_bno085_qx;
+        const double qy = (double)g_bno085_qy;
+        const double qz = (double)g_bno085_qz;
+        const double siny_cosp = 2.0 * (qw * qz + qx * qy);
+        const double cosy_cosp = 1.0 - 2.0 * (qy * qy + qz * qz);
+        const double yaw_imu   = atan2(siny_cosp, cosy_cosp);
+
+        ekf_correct_imu_yaw  (ekf, yaw_imu,                 -1.0);
+        ekf_correct_imu_omega(ekf, (double)g_bno085_wz,     -1.0);
+    }
+
+    /* --- Pack OdomData from the filter state --- */
+    const double x_f     = ekf_get_x(ekf);
+    const double y_f     = ekf_get_y(ekf);
+    const double theta_f = ekf_get_theta(ekf);
+    const double vx_f    = ekf_get_vx(ekf);
+    const double vy_f    = ekf_get_vy(ekf);
+    const double w_f     = ekf_get_omega(ekf);
+
+    const double c = cos(theta_f);
+    const double s = sin(theta_f);
+
+    /* Legacy fields */
+    odom->x_pos    = x_f;
+    odom->y_pos    = y_f;
+    odom->phi      = theta_f;
+    odom->q_dot[0] = w_f;                     /* phi_dot world == omega body */
+    odom->q_dot[1] = c * vx_f - s * vy_f;     /* x_dot world */
+    odom->q_dot[2] = s * vx_f + c * vy_f;     /* y_dot world */
+
+    /* New planar-base pose fields */
+    odom->z_pos = 0.0;
+    ekf_yaw_to_quaternion(theta_f, &odom->qx, &odom->qy, &odom->qz, &odom->qw);
+
+    /* Body-frame twist */
+    odom->vx_body = vx_f;
+    odom->vy_body = vy_f;
+    odom->vz_body = 0.0;
+    odom->wx      = 0.0;
+    odom->wy      = 0.0;
+    odom->wz      = w_f;
+
+    ekf_fill_pose_covariance (ekf, odom->pose_covariance);
+    ekf_fill_twist_covariance(ekf, odom->twist_covariance);
 
     msg->timestamp_ms = osKernelGetTickCount();
 }
@@ -2113,13 +2261,25 @@ void StartODriveTask(void *argument)
     const uint32_t boot_delay_ms = 3000;
     uint32_t boot_tick = osKernelGetTickCount();
 
-    double x = 0.0, y = 0.0, theta = 0.0;
     double u[4]     = {0.0};
-    double q_dot[3] = {0.0};
     ODriveCmdMsg       cmd          = {0};
     ODriveTelemetryMsg telemetryMsg = {0};
     OdomData *odrive_odom = &telemetryMsg.odom;
     FDCAN_TXmsg tx = {0};
+
+    /* 6-state EKF replaces the previous integration of q_dot * dt.
+     * sample_time is set to match the 10 ms telemetry tick so the dt-clamp
+     * inside ekf_predict yields sensible numbers on the very first call. */
+    EKF       ekf;
+    EKFParams ekf_params;
+    ekf_params_defaults(&ekf_params);
+    ekf_params.sample_time = 0.010;
+    ekf_init(&ekf, &ekf_params);
+
+    /* Match the initial value of g_bno085_seq so we wait for the first real
+     * IMU sample before applying any IMU correction. Once the BNO085 emits
+     * its first report, g_bno085_seq becomes != 0 and triggers the update. */
+    uint32_t imu_seq_seen = 0;
 
     uint32_t now, last_telem_tick = osKernelGetTickCount();
     const uint32_t telemetry_period = 10;
@@ -2329,9 +2489,9 @@ void StartODriveTask(void *argument)
         if (delta_t >= telemetry_period) {
             ODrive_UpdateTelemetryAndOdometry(
                 odrives, num_odrives, &telemetryMsg, odrive_odom,
-                &x, &y, &theta,
+                &ekf, &imu_seq_seen,
                 x_offset, y_offset, radius,
-                u, q_dot, delta_t, (double*)wheel_sign);
+                u, delta_t, wheel_sign);
 
             ODrive_PushLatestTelemetry(CAN_2_UTX_QueueHandle, &telemetryMsg);
             last_telem_tick = now;

@@ -41,6 +41,16 @@ extern "C" {
 /* Exported constants --------------------------------------------------------*/
 /* USER CODE BEGIN EC */
 
+/* Default ODrive controller gains pushed by ODrive_Startup, one per axis.
+ *   pos_gain     [(rev/s) / rev]   — position-loop P
+ *   vel_gain     [Nm / (rev/s)]    — velocity-loop P
+ *   vel_int_gain [Nm / rev]        — velocity-loop I
+ * Mirror the dashboard slider defaults in
+ * omnibase_ws/src/odrive_comm/assets/dashboard.html (pgv/vgv/vigv). */
+#define ODRIVE_DEFAULT_POS_GAIN      { 20.00f, 20.00f, 20.00f, 20.00f }
+#define ODRIVE_DEFAULT_VEL_GAIN      {  0.32f,  0.32f,  0.32f,  0.32f }
+#define ODRIVE_DEFAULT_VEL_INT_GAIN  {  0.70f,  0.70f,  0.70f,  0.70f }
+
 /* USER CODE END EC */
 
 /* Exported macro ------------------------------------------------------------*/
@@ -145,10 +155,38 @@ typedef struct {
 } EncoderData;
 
 typedef struct {
+	/* Legacy fields, kept so the existing UART/dashboard pipeline keeps
+	 * working. After the EKF integration these are populated from the
+	 * filtered state, not from raw dead-reckoning. q_dot stores the
+	 * world-frame velocity tuple [phi_dot, x_dot_world, y_dot_world]. */
 	double x_pos;
 	double y_pos;
 	double phi;
-	double q_dot[3]; // <- Inertial x_dot, y_dot, z_dot
+	double q_dot[3];
+
+	/* Planar mobile base: z is always 0. */
+	double z_pos;
+
+	/* Orientation quaternion derived from EKF yaw (planar => qx=qy=0). */
+	float qx;
+	float qy;
+	float qz;
+	float qw;
+
+	/* Body-frame twist (vz, wx, wy are always 0 for a mecanum base). */
+	double vx_body;
+	double vy_body;
+	double vz_body;
+	double wx;
+	double wy;
+	double wz;
+
+	/* ROS-style row-major 6x6 covariance matrices.
+	 *   pose_covariance axes  : (x, y, z, roll, pitch, yaw)
+	 *   twist_covariance axes : (vx, vy, vz, wx, wy, wz)
+	 * Unobserved planar-base axes carry a large variance sentinel (1e6). */
+	double pose_covariance[36];
+	double twist_covariance[36];
 } OdomData;
 
 typedef struct {
