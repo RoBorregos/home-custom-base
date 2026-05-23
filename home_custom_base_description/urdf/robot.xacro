@@ -65,14 +65,14 @@
     <visual>
       <origin xyz="0 0 0" rpy="0 0 0"/>
       <geometry>
-        <mesh filename="${mesh_dir}/wheel_FL.STL"/>
+        <mesh filename="${mesh_dir}/wheel.STL"/>
       </geometry>
       <material name="home_base_gray"/>
     </visual>
     <collision>
       <origin xyz="0 0 0" rpy="0 0 0"/>
       <geometry>
-        <mesh filename="${mesh_dir}/wheel_FL.STL"/>
+        <mesh filename="${mesh_dir}/wheel.STL"/>
       </geometry>
     </collision>
   </link>
@@ -94,14 +94,14 @@
     <visual>
       <origin xyz="0 0 0" rpy="0 0 0"/>
       <geometry>
-        <mesh filename="${mesh_dir}/wheel_FR.STL"/>
+        <mesh filename="${mesh_dir}/wheel.STL"/>
       </geometry>
       <material name="home_base_gray"/>
     </visual>
     <collision>
       <origin xyz="0 0 0" rpy="0 0 0"/>
       <geometry>
-        <mesh filename="${mesh_dir}/wheel_FR.STL"/>
+        <mesh filename="${mesh_dir}/wheel.STL"/>
       </geometry>
     </collision>
   </link>
@@ -123,14 +123,14 @@
     <visual>
       <origin xyz="0 0 0" rpy="0 0 0"/>
       <geometry>
-        <mesh filename="${mesh_dir}/wheel_RL.STL"/>
+        <mesh filename="${mesh_dir}/wheel.STL"/>
       </geometry>
       <material name="home_base_gray"/>
     </visual>
     <collision>
       <origin xyz="0 0 0" rpy="0 0 0"/>
       <geometry>
-        <mesh filename="${mesh_dir}/wheel_RL.STL"/>
+        <mesh filename="${mesh_dir}/wheel.STL"/>
       </geometry>
     </collision>
   </link>
@@ -152,14 +152,14 @@
     <visual>
       <origin xyz="0 0 0" rpy="0 0 0"/>
       <geometry>
-        <mesh filename="${mesh_dir}/wheel_RR.STL"/>
+        <mesh filename="${mesh_dir}/wheel.STL"/>
       </geometry>
       <material name="home_base_gray"/>
     </visual>
     <collision>
       <origin xyz="0 0 0" rpy="0 0 0"/>
       <geometry>
-        <mesh filename="${mesh_dir}/wheel_RR.STL"/>
+        <mesh filename="${mesh_dir}/wheel.STL"/>
       </geometry>
     </collision>
   </link>
