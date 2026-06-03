@@ -34,10 +34,10 @@
   <!-- =================== base_link =================== -->
   <link name="${prefix}_base_link">
     <inertial>
-      <origin xyz="0.0323013333262494 -9.67443475711848E-05 0.199188228878544" rpy="0 0 0"/>
-      <mass value="23.590093490853"/>
-      <inertia ixx="0.132378675420004" ixy="1.47493862587287E-05" ixz="0.000807393658628412"
-               iyy="0.106153556594811" iyz="-9.34021230034792E-05" izz="0.166366947714662"/>
+      <origin xyz="0.0035289 4.9532E-05 0.18881" rpy="0 0 0"/>
+      <mass value="31.284"/>
+      <inertia ixx="0.16472" ixy="6.3557E-05" ixz="0.00075615"
+               iyy="0.12042" iyz="-0.0002185" izz="0.20341"/>
     </inertial>
     <visual>
       <origin xyz="0 0 0" rpy="0 0 0"/>
@@ -225,6 +225,15 @@
     <parent link="${prefix}_base_link"/>
     <child link="${prefix}_lidar_rear"/>
   </joint>
+
+  <link name="xarm_base" />
+  <joint name="xarm_joint" type="fixed">
+    <origin xyz="0.0410000000000036 -0.00367166302995694 0.520695984178765" rpy="0 0 0" />
+    <parent link="${prefix}_base_link" />
+    <child link="xarm_base" />
+    <axis xyz="0 0 0" />
+  </joint>
+
 
   <!-- =================== Conditionally add simulation components =================== -->
   <xacro:if value="${use_sim_time}">
