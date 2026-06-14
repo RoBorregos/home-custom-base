@@ -10,7 +10,7 @@
   *   ODriveTask state machine runs, queues are exercised, and the BT UART
   *   path works normally.  Set CAN_STUB to 0 when ODrives are connected.
   *
-  * BT PROTOCOL (USART2, 230400 baud, ESP32 UART 15200):
+  * BT PROTOCOL (USART2 @115200 = ESP32 link; USART3 @230400 = ROS dashboard):
   *   Type-3 message from ESP32: "3 <vx> <vy> <wz> <buttons_hex>\r\n"
   *   example: "3 0.5 0.0 0.0 00\r\n"
   *
@@ -186,7 +186,7 @@ volatile float g_bno085_pitch = 0.0f;
 volatile float g_bno085_roll  = 0.0f;
 
 /*
- * Quaternion from SH2_ROTATION_VECTOR.
+ * Quaternion from SH2_GAME_ROTATION_VECTOR (6-axis, no magnetometer).
  * Stored as (qx, qy, qz, qw) where qw is the real (scalar) component, matching
  * the ROS sensor_msgs/Imu convention.
  */
@@ -423,6 +423,14 @@ Error_Handler();
   MX_TIM15_Init();
 //  MX_SPI1_Init();   /* SPI1 unused — BNO085 is on I2C1 */
   MX_I2C1_Init();   /* BNO085 uses I2C1 (PB6=SCL, PB7=SDA, addr 0x4A) */
+  /* Assign ODrive CAN node IDs BEFORE FDCAN RX is activated, so heartbeats are
+   * matched from the very first frame (the RX ISR filters by odrives[].NODE_ID,
+   * which is otherwise 0 until StartODriveTask runs after the scheduler starts).
+   * These must match axis0.config.can.node_id on each S1. */
+  odrives[0].NODE_ID = 36;
+  odrives[1].NODE_ID = 34;
+  odrives[2].NODE_ID = 33;
+  odrives[3].NODE_ID = 40;
   MX_FDCAN1_Init();
   MX_USART2_UART_Init();
   /* USER CODE BEGIN 2 */
@@ -611,7 +619,12 @@ static void MX_FDCAN1_Init(void)
   hfdcan1.Init.AutoRetransmission = DISABLE;
 #else
   hfdcan1.Init.Mode = FDCAN_MODE_NORMAL;
-  hfdcan1.Init.AutoRetransmission = ENABLE;
+  /* One-shot transmit (no auto-retransmit). For 100 Hz periodic setpoints a
+   * frame that is not ACKed (a momentarily absent ODrive / bus glitch) should
+   * be DROPPED and superseded by the next command, NOT retried forever. With
+   * AutoRetransmission ENABLED a single un-ACKed frame pins the (small) TX FIFO
+   * and rapidly drives the Transmit-Error-Counter to BUS-OFF. */
+  hfdcan1.Init.AutoRetransmission = DISABLE;
 #endif
 
   hfdcan1.Init.TransmitPause = DISABLE;
@@ -627,7 +640,7 @@ static void MX_FDCAN1_Init(void)
   hfdcan1.Init.MessageRAMOffset = 0;
   hfdcan1.Init.StdFiltersNbr = 1;
   hfdcan1.Init.ExtFiltersNbr = 0;
-  hfdcan1.Init.RxFifo0ElmtsNbr = 1;
+  hfdcan1.Init.RxFifo0ElmtsNbr = 16;  /* 4 ODrives x (heartbeat+encoder) burst between IRQs */
   hfdcan1.Init.RxFifo0ElmtSize = FDCAN_DATA_BYTES_8;
   hfdcan1.Init.RxFifo1ElmtsNbr = 0;
   hfdcan1.Init.RxFifo1ElmtSize = FDCAN_DATA_BYTES_8;
@@ -635,7 +648,7 @@ static void MX_FDCAN1_Init(void)
   hfdcan1.Init.RxBufferSize = FDCAN_DATA_BYTES_8;
   hfdcan1.Init.TxEventsNbr = 0;
   hfdcan1.Init.TxBuffersNbr = 0;
-  hfdcan1.Init.TxFifoQueueElmtsNbr = 1;
+  hfdcan1.Init.TxFifoQueueElmtsNbr = 8;  /* don't wedge TX on a single stalled frame */
   hfdcan1.Init.TxFifoQueueMode = FDCAN_TX_FIFO_OPERATION;
   hfdcan1.Init.TxElmtSize = FDCAN_DATA_BYTES_8;
   if (HAL_FDCAN_Init(&hfdcan1) != HAL_OK) { Error_Handler(); }
@@ -663,6 +676,11 @@ static void MX_FDCAN1_Init(void)
   }
 
   if (HAL_FDCAN_ActivateNotification(&hfdcan1, FDCAN_IT_RX_FIFO0_NEW_MESSAGE, 0) != HAL_OK) {}
+
+  /* STM32H7 FDCAN does NOT auto-recover from bus-off (it sets CCCR.INIT itself
+   * and halts). Enable the bus-off notification so HAL_FDCAN_ErrorStatusCallback
+   * can flag it; the control task then restarts the peripheral. */
+  HAL_FDCAN_ActivateNotification(&hfdcan1, FDCAN_IT_BUS_OFF, 0);
 
   TxHeader.Identifier = 0x42E;
   TxHeader.IdType = FDCAN_STANDARD_ID;
@@ -1015,7 +1033,7 @@ static void MX_USART2_UART_Init(void)
 static void MX_USART3_UART_Init(void)
 {
   huart3.Instance = USART3;
-  huart3.Init.BaudRate = 230400;
+  huart3.Init.BaudRate = 230400;   /* must match odrive_dashboard.py baud_rate */
   huart3.Init.WordLength = UART_WORDLENGTH_8B;
   huart3.Init.StopBits = UART_STOPBITS_1;
   huart3.Init.Parity = UART_PARITY_NONE;
@@ -1101,14 +1119,54 @@ void HAL_FDCAN_RxFifo0Callback(FDCAN_HandleTypeDef *hfdcan, uint32_t RxFifo0ITs)
 
     if ((RxFifo0ITs & FDCAN_IT_RX_FIFO0_NEW_MESSAGE) != 0)
     {
-        if (HAL_FDCAN_GetRxMessage(hfdcan, FDCAN_RX_FIFO0, &RxHeader, RxData) == HAL_OK)
+        /* Drain ALL pending frames. Four ODrives broadcasting heartbeat +
+         * encoder estimates can queue several frames between interrupts; reading
+         * only one per IRQ lets the RX FIFO overflow and silently drop telemetry
+         * (so axis state/heartbeat appear stale and odometry freezes). */
+        while (HAL_FDCAN_GetRxFifoFillLevel(hfdcan, FDCAN_RX_FIFO0) > 0)
         {
+            if (HAL_FDCAN_GetRxMessage(hfdcan, FDCAN_RX_FIFO0, &RxHeader, RxData) != HAL_OK)
+                break;
             uint8_t node_id = (uint8_t)(RxHeader.Identifier >> 5);
             Axis *target_axis = Find_ODrive_By_NodeID(node_id);
             if (target_axis != NULL)
                 ODrive_RX_CallBack(target_axis, &RxHeader, RxData);
         }
     }
+}
+
+/* Set ONLY by HAL_FDCAN_ErrorStatusCallback on a genuine bus-off IRQ (a TX-FIFO
+ * timeout is NOT bus-off and must not set this). The control task inspects it
+ * (together with PSR.BO) and restarts the peripheral in task context. */
+volatile uint8_t g_can_busoff = 0;
+
+void HAL_FDCAN_ErrorStatusCallback(FDCAN_HandleTypeDef *hfdcan, uint32_t ErrorStatusITs)
+{
+    (void)hfdcan;
+    if ((ErrorStatusITs & FDCAN_IT_BUS_OFF) != 0U)
+        g_can_busoff = 1;   /* defer the heavy restart to task context */
+}
+
+/* If FDCAN is bus-off, restart it. STM32H7 FDCAN sets CCCR.INIT itself on
+ * bus-off and does NOT self-recover; HAL_FDCAN_Stop() (State->READY) then
+ * HAL_FDCAN_Start() clears INIT and begins the 129x11-recessive-bit recovery.
+ * Returns 1 if a recovery was performed. Safe to call every control loop. */
+uint8_t FDCAN_RecoverIfBusOff(void)
+{
+    FDCAN_ProtocolStatusTypeDef ps = {0};
+    HAL_FDCAN_GetProtocolStatus(&hfdcan1, &ps);
+    if (g_can_busoff || ps.BusOff)
+    {
+        printf("FDCAN BUS-OFF detected -- restarting peripheral\r\n");
+        HAL_FDCAN_Stop(&hfdcan1);
+        if (HAL_FDCAN_Start(&hfdcan1) != HAL_OK)
+            printf("FDCAN restart FAILED\r\n");
+        HAL_FDCAN_ActivateNotification(&hfdcan1, FDCAN_IT_RX_FIFO0_NEW_MESSAGE, 0);
+        HAL_FDCAN_ActivateNotification(&hfdcan1, FDCAN_IT_BUS_OFF, 0);
+        g_can_busoff = 0;
+        return 1;
+    }
+    return 0;
 }
 
 /* USER CODE END 4 */
@@ -1200,6 +1258,30 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
         rx_buf2[rx_tail2] = rx_char2;
         rx_tail2 = (rx_tail2 + 1) % RX_BUF2_SIZE;
         HAL_UART_Receive_IT(huart, &rx_char2, 1);
+    }
+}
+
+/**
+ * @brief  Re-arm interrupt RX after ANY UART error.
+ *
+ * On an overrun (ORE) — common at startup, under load, or with line noise — the
+ * STM32 HAL tears down interrupt reception (RxState->READY, RxISR=NULL) and
+ * calls this (otherwise-empty weak) callback WITHOUT re-arming. Since RX is only
+ * re-armed in HAL_UART_RxCpltCallback (which never runs on the error path), the
+ * link would die permanently until reset. Clearing the sticky error flags and
+ * re-issuing HAL_UART_Receive_IT() makes both links self-heal.
+ */
+void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
+{
+    __HAL_UART_CLEAR_OREFLAG(huart);
+    __HAL_UART_CLEAR_FEFLAG(huart);
+    __HAL_UART_CLEAR_NEFLAG(huart);
+    __HAL_UART_CLEAR_PEFLAG(huart);
+
+    if (huart->Instance == USART3) {
+        HAL_UART_Receive_IT(huart, &rx_char, 1);    /* ROS / debug link */
+    } else if (huart->Instance == USART2) {
+        HAL_UART_Receive_IT(huart, &rx_char2, 1);   /* ESP32 / PS5 link */
     }
 }
 
@@ -1381,9 +1463,13 @@ void start_BT_RX_Task(void *argument)
         if (got_any) {
             last_rx_tick = osKernelGetTickCount();
         } else if ((osKernelGetTickCount() - last_rx_tick) >= BT_WATCHDOG_MS) {
-//            printf("BT: no data on USART2 for %u ms (total bytes ever: %lu)\r\n",
-//                   BT_WATCHDOG_MS, total_bytes);
             last_rx_tick = osKernelGetTickCount();
+            /* Self-heal: if interrupt RX was torn down by an error and the
+             * ErrorCallback somehow did not re-arm it, restart it here. */
+            if (huart2.RxState == HAL_UART_STATE_READY) {
+                __HAL_UART_CLEAR_OREFLAG(&huart2);
+                HAL_UART_Receive_IT(&huart2, &rx_char2, 1);
+            }
         }
 
         osDelay(5);
@@ -1399,6 +1485,7 @@ void Start_UART_TX_Task(void *argument)
     ODriveCmdMsg last_cmd = {0};
     ODriveTelemetryMsg telemetryMsg = {0};
     osStatus_t qst1, qst2;
+    uint32_t tx_count = 0;   /* throttles the fat diagnostic line vs the slim high-rate line */
 
     for (;;)
     {
@@ -1421,6 +1508,18 @@ void Start_UART_TX_Task(void *argument)
             esp32_age_ms = (long)(HAL_GetTick() - bt_tick_snap);
         }
 
+        /* High-rate SLIM odom/IMU line -- the EKF's two inputs only. Kept short
+         * so it drains fast and reaches the PC at ~50 Hz, giving the EKF fresh
+         * velocity + heading during quick maneuvers (the fat line below is what
+         * caps throughput, so it is sent less often). Field names match the fat
+         * line so the ROS parser is shared. Sent EVERY cycle. */
+        printf("ODOM_phi=%.3f,ODOM_x=%.3f,ODOM_y=%.3f,"
+               "ODOM_w=%.3f,ODOM_vx=%.3f,ODOM_vy=%.3f,"
+               "IMU_yaw=%.2f,IMU_wz=%.4f\r\n",
+               telemetryMsg.odom.phi, telemetryMsg.odom.x_pos, telemetryMsg.odom.y_pos,
+               telemetryMsg.odom.q_dot[0], telemetryMsg.odom.q_dot[1], telemetryMsg.odom.q_dot[2],
+               telemetryMsg.imu.yaw, telemetryMsg.imu.wz);
+
         /* UART telemetry line.
          * Existing Euler IMU_yaw/roll/pitch fields are preserved for backward
          * compatibility with old consumers; the new IMU_q* / IMU_w* / IMU_a*
@@ -1430,7 +1529,13 @@ void Start_UART_TX_Task(void *argument)
          *   - IMU_ax, IMU_ay, IMU_az          linear acceleration [m/s^2]
          * ESP32_age_ms: ms since the last valid Type-3 message from the ESP32
          * on USART2; -1 means no message has been received yet.
+         *
+         * Throttled to every 5th cycle (~10 Hz): this verbose line is the
+         * throughput bottleneck, so sending it less often lets the slim
+         * high-rate odom/IMU line above run fast. printf() is a single
+         * statement so the `if` needs no braces.
          */
+        if (++tx_count % 5 == 0)
         printf("CMD_vx=%.3lf,CMD_vy=%.3lf,CMD_wz=%.3lf,"
                "IMU_yaw=%.2f,IMU_roll=%.2f,IMU_pitch=%.2f,"
                "IMU_qx=%.6f,IMU_qy=%.6f,IMU_qz=%.6f,IMU_qw=%.6f,"
@@ -1506,19 +1611,25 @@ static void imu_sensor_data_cb(void *cookie, sh2_SensorEvent_t *event)
      * acceptable for robot telemetry at 50 Hz. */
     switch (val.sensorId) {
 
-    case SH2_ROTATION_VECTOR: {
-        /* Cache quaternion components for the ROS sensor_msgs/Imu message.
+    case SH2_GAME_ROTATION_VECTOR: {
+        /* 6-axis orientation (gyro + accel, NO magnetometer). Chosen over the
+         * 9-axis SH2_ROTATION_VECTOR because the ODrive motors' holding current
+         * disturbs the magnetometer even at rest, which yanked the fused yaw
+         * ("flash"/latigazo) at random. The EKF fuses yaw with imu0_relative, so
+         * no absolute-north reference is needed; the only trade-off is slow gyro
+         * yaw drift (a few deg/min), which is harmless for a short run and is
+         * corrected by SLAM scan-matching during navigation.
          * BNO085 reports (i, j, k, real); ROS expects (x, y, z, w). */
-        g_bno085_qx = val.un.rotationVector.i;
-        g_bno085_qy = val.un.rotationVector.j;
-        g_bno085_qz = val.un.rotationVector.k;
-        g_bno085_qw = val.un.rotationVector.real;
+        g_bno085_qx = val.un.gameRotationVector.i;
+        g_bno085_qy = val.un.gameRotationVector.j;
+        g_bno085_qz = val.un.gameRotationVector.k;
+        g_bno085_qw = val.un.gameRotationVector.real;
 
         float yaw, pitch, roll;
-        q_to_ypr(val.un.rotationVector.real,
-                 val.un.rotationVector.i,
-                 val.un.rotationVector.j,
-                 val.un.rotationVector.k,
+        q_to_ypr(val.un.gameRotationVector.real,
+                 val.un.gameRotationVector.i,
+                 val.un.gameRotationVector.j,
+                 val.un.gameRotationVector.k,
                  &yaw, &pitch, &roll);
         g_bno085_yaw   = yaw;
         g_bno085_pitch = pitch;
@@ -1573,7 +1684,7 @@ static void imu_enable_all_reports(void)
 {
     /* Required to populate orientation, angular velocity, and linear
      * acceleration in the ROS sensor_msgs/Imu message. */
-    imu_enable_report(SH2_ROTATION_VECTOR,      "ROTATION_VECTOR");
+    imu_enable_report(SH2_GAME_ROTATION_VECTOR, "GAME_ROTATION_VECTOR");
     imu_enable_report(SH2_GYROSCOPE_CALIBRATED, "GYROSCOPE_CALIBRATED");
     imu_enable_report(SH2_LINEAR_ACCELERATION,  "LINEAR_ACCELERATION");
 }
@@ -1651,6 +1762,30 @@ HAL_StatusTypeDef ODrive_Startup(Axis odrives[], uint8_t num_odrives, FDCAN_TXms
         if (st != HAL_OK) { printf("ODrive startup failed: axis %u Set_Axis_Requested_State\r\n", i); return st; }
     }
     return HAL_OK;
+}
+
+/* Re-issues the arm triplet (clear errors, set velocity mode, request
+ * CLOSED_LOOP_CONTROL) and waits for the HEARTBEAT to confirm the axis actually
+ * reached CLOSED_LOOP_CONTROL — instead of trusting that a queued CAN frame took
+ * effect. Returns 1 on confirmed arm, 0 if it never confirmed within `attempts`.
+ * The ~10 Hz heartbeat keeps axis->AXIS_Current_State fresh via ODrive_RX_CallBack. */
+static uint8_t ODrive_ArmAxisConfirmed(Axis *axis, FDCAN_TXmsg *msg,
+                                       Control_Mode ctrl, Input_Mode in_mode,
+                                       uint8_t attempts)
+{
+    for (uint8_t a = 0; a < attempts; a++) {
+        FDCAN_WAIT_TX_FREE(); Clear_Errors(axis, msg);
+        FDCAN_WAIT_TX_FREE(); Set_Controller_Modes(axis, msg, ctrl, in_mode);
+        FDCAN_WAIT_TX_FREE(); Set_Axis_Requested_State(axis, msg, CLOSED_LOOP_CONTROL);
+        for (uint8_t w = 0; w < 30; w++) {          /* wait up to ~300 ms */
+            osDelay(10);
+            if (axis->AXIS_Current_State == CLOSED_LOOP_CONTROL) return 1;
+        }
+        printf("Arm node %u: state=%u err=0x%08lX (retry %u)\r\n",
+               axis->NODE_ID, axis->AXIS_Current_State,
+               (unsigned long)axis->AXIS_Error, a + 1);
+    }
+    return 0;
 }
 
 
@@ -1910,8 +2045,12 @@ void ODrive_UpdateTelemetryAndOdometry(Axis odrives[], uint8_t num_odrives,
         msg->updated[i]            = odrives[i].UPDATED;
         odrives[i].UPDATED         = 0;
 
-        /* Convert velocity estimate back to rad/s in wheel frame (accounts for gear ratio) */
-        u[i] = wheel_sign[i] * (odrives[i].AXIS_Encoder_Vel / odrives[i].gear_ratio) * 2.0 * PI;
+        /* Convert velocity estimate back to rad/s in wheel frame (accounts for gear ratio).
+         * Guard gear_ratio==0 (e.g. an axis whose NODE_ID never matched a heartbeat)
+         * so we never emit inf/NaN into odometry, which would poison it permanently. */
+        u[i] = (odrives[i].gear_ratio != 0)
+             ? wheel_sign[i] * (odrives[i].AXIS_Encoder_Vel / odrives[i].gear_ratio) * 2.0 * PI
+             : 0.0;
     }
 
     globalSpeedsFromUMecanum(*theta, x_offset, y_offset, radius, u, q_dot);
@@ -2109,6 +2248,16 @@ void StartODriveTask(void *argument)
     const uint32_t CMD_WATCHDOG_TIMEOUT_MS = 500;
     uint32_t last_vel_cmd_tick = osKernelGetTickCount();
     uint8_t  cmd_watchdog_fired = 0;
+    /* While the command watchdog is latched, re-send the zero-velocity stop
+     * periodically (a single stop frame can be lost) — rate-limited so we do
+     * not flood the CAN bus from the 1 ms control loop. */
+    uint32_t last_wd_stop_tick = 0;
+    const uint32_t WD_STOP_RESEND_MS = 50;
+
+    /* Periodic per-axis auto-recovery: re-arm any axis that has fallen out of
+     * CLOSED_LOOP_CONTROL (undervoltage, fault, or its own CAN watchdog). */
+    uint32_t last_rearm_tick = osKernelGetTickCount();
+    const uint32_t REARM_PERIOD_MS = 500;
 
     const uint32_t boot_delay_ms = 3000;
     uint32_t boot_tick = osKernelGetTickCount();
@@ -2131,6 +2280,23 @@ void StartODriveTask(void *argument)
     for (;;)
     {
         now = osKernelGetTickCount();
+
+        /* CAN bus-off recovery FIRST: STM32H7 FDCAN does not self-recover, and
+         * while bus-off NOTHING can be transmitted. Recover the peripheral, then
+         * STAY in SM_RUNNING and let the per-axis re-arm (below) bring any axis
+         * the ODrive watchdog disarmed back to CLOSED_LOOP automatically — do NOT
+         * force SM_IDLE (that would need a manual "start all"). The ODrive on-board
+         * CAN watchdog is the runaway backstop while the bus is down. We send one
+         * zero-velocity so a stale setpoint can't resume the instant the bus is back. */
+        if (FDCAN_RecoverIfBusOff() && sm_state == SM_RUNNING) {
+            ODriveCmdMsg zero_cmd = {0};
+            zero_cmd.type        = ODRIVE_CMD_SET_VEL;
+            zero_cmd.target_mask = 0x0F;
+            ODrive_ProcessCommand(&zero_cmd, odrives, num_odrives, &tx,
+                odrive_odom, x_offset, y_offset, radius,
+                &current_ctrl_mode, &current_input_mode,
+                (double*)wheel_sign, telemetryMsg.IK_computed_wheel_speeds);
+        }
 
         /* Read BNO085 data from IMU_Task shared globals.
          * Each float read is atomic on Cortex-M7 (32-bit aligned load).
@@ -2191,19 +2357,38 @@ void StartODriveTask(void *argument)
                 else if ((now - boot_tick) >= boot_delay_ms) {
                     printf("SM: BOOT->STARTUP (auto)\r\n");
                     sm_state = SM_STARTUP;
-                    HAL_StatusTypeDef st = ODrive_Startup(
-                        odrives, num_odrives, &tx,
-                        VELOCITY_CONTROL, PASSTHROUGH, CLOSED_LOOP_CONTROL);
-                    if (st == HAL_OK) {
-                        current_ctrl_mode  = VELOCITY_CONTROL;
-                        current_input_mode = PASSTHROUGH;
-                        sm_state = SM_RUNNING;
-                        printf("SM: STARTUP->RUNNING\r\n");
-                    } else {
-                        printf("SM: Startup failed, retrying\r\n");
-                        sm_state = SM_BOOT;
-                        boot_tick = osKernelGetTickCount();
+
+                    /* Wait for the first heartbeat from every axis: this proves
+                     * the CAN bus is up AND each S1 finished its own power-on
+                     * before we command CLOSED_LOOP. A fixed delay races the S1
+                     * boot time and silently loses the arm command. AXIS_Current_State
+                     * stays UNDEFINED(0) until a heartbeat arrives; bounded so a
+                     * truly absent S1 cannot hang us forever. */
+                    for (uint16_t hb = 0; hb < 300; hb++) {      /* up to ~3 s */
+                        uint8_t all_seen = 1;
+                        for (uint8_t i = 0; i < num_odrives; i++)
+                            if (odrives[i].AXIS_Current_State == UNDEFINED) all_seen = 0;
+                        if (all_seen) break;
+                        osDelay(10);
                     }
+
+                    /* Arm each axis WITH heartbeat confirmation + retry, instead
+                     * of assuming a queued CAN frame took effect. */
+                    uint8_t all_armed = 1;
+                    for (uint8_t i = 0; i < num_odrives; i++) {
+                        if (!ODrive_ArmAxisConfirmed(&odrives[i], &tx,
+                                 VELOCITY_CONTROL, PASSTHROUGH, 5)) {
+                            printf("SM: axis node %u FAILED to reach CLOSED_LOOP\r\n",
+                                   odrives[i].NODE_ID);
+                            all_armed = 0;
+                        }
+                    }
+                    current_ctrl_mode  = VELOCITY_CONTROL;
+                    current_input_mode = PASSTHROUGH;
+                    sm_state = SM_RUNNING;   /* the SM_RUNNING re-arm block keeps
+                                                retrying any axis not yet armed */
+                    printf("SM: STARTUP->RUNNING (%s)\r\n",
+                           all_armed ? "all armed" : "partial");
                 }
                 break;
             }
@@ -2214,27 +2399,55 @@ void StartODriveTask(void *argument)
 
             case SM_RUNNING:
             {
+                /* Periodic per-axis auto-recovery: if an axis fell out of
+                 * CLOSED_LOOP_CONTROL (undervoltage, latched fault, or its own
+                 * CAN watchdog tripping), clear errors, re-arm it, and zero its
+                 * setpoint so it does not lurch on recovery. Rate-limited so it
+                 * never starves the SET_VEL stream. This also fixes "the S1's
+                 * drop out over time and never come back" without a reset. */
+                if ((now - last_rearm_tick) >= REARM_PERIOD_MS) {
+                    last_rearm_tick = now;
+                    for (uint8_t i = 0; i < num_odrives; i++) {
+                        if (odrives[i].AXIS_Current_State != UNDEFINED &&
+                            odrives[i].AXIS_Current_State != CLOSED_LOOP_CONTROL) {
+                            printf("RE-ARM node %u: state=%u err=0x%08lX\r\n",
+                                   odrives[i].NODE_ID, odrives[i].AXIS_Current_State,
+                                   (unsigned long)odrives[i].AXIS_Error);
+                            FDCAN_WAIT_TX_FREE(); Clear_Errors(&odrives[i], &tx);
+                            FDCAN_WAIT_TX_FREE(); Set_Axis_Requested_State(&odrives[i], &tx, CLOSED_LOOP_CONTROL);
+                            FDCAN_WAIT_TX_FREE(); Set_Input_Vel(&odrives[i], &tx, 0.0f, 0.0f);
+                        }
+                    }
+                }
+
                 /* General command watchdog: if no SET_VEL has arrived from
                  * any source for CMD_WATCHDOG_TIMEOUT_MS, send a single
                  * zero-velocity SET_VEL to all four axes and latch so we
                  * don't repeatedly retransmit on a dead link. The latch
                  * clears as soon as a new SET_VEL arrives (above). */
-                if (!cmd_watchdog_fired &&
-                    (now - last_vel_cmd_tick) >= CMD_WATCHDOG_TIMEOUT_MS) {
-                    printf("CMD watchdog: no SET_VEL for %lu ms — stopping motors\r\n",
-                           (unsigned long)CMD_WATCHDOG_TIMEOUT_MS);
-                    ODriveCmdMsg zero_cmd = {0};
-                    zero_cmd.type        = ODRIVE_CMD_SET_VEL;
-                    zero_cmd.target_mask = 0x0F;
-                    /* robot_twist[] is already zero from the {0} initialiser */
-                    ODrive_ProcessCommand(&zero_cmd, odrives, num_odrives, &tx,
-                        odrive_odom, x_offset, y_offset, radius,
-                        &current_ctrl_mode, &current_input_mode,
-                        (double*)wheel_sign, telemetryMsg.IK_computed_wheel_speeds);
-                    cmd_watchdog_fired = 1;
-                    /* Also clear the BT override state so ROS can immediately
-                     * regain control as soon as packets resume. */
-                    bt_override_active = 0;
+                if ((now - last_vel_cmd_tick) >= CMD_WATCHDOG_TIMEOUT_MS) {
+                    if (!cmd_watchdog_fired) {
+                        printf("CMD watchdog: no SET_VEL for %lu ms -- stopping motors\r\n",
+                               (unsigned long)CMD_WATCHDOG_TIMEOUT_MS);
+                        cmd_watchdog_fired = 1;
+                        /* Release BT override so ROS regains control as soon as
+                         * packets resume. */
+                        bt_override_active = 0;
+                    }
+                    /* Re-send zero velocity periodically (NOT one-shot): a single
+                     * stop frame can be lost and the link may still be dead. The
+                     * motors resume automatically when a fresh SET_VEL arrives
+                     * (which clears the latch, above). */
+                    if ((now - last_wd_stop_tick) >= WD_STOP_RESEND_MS) {
+                        last_wd_stop_tick = now;
+                        ODriveCmdMsg zero_cmd = {0};
+                        zero_cmd.type        = ODRIVE_CMD_SET_VEL;
+                        zero_cmd.target_mask = 0x0F;
+                        ODrive_ProcessCommand(&zero_cmd, odrives, num_odrives, &tx,
+                            odrive_odom, x_offset, y_offset, radius,
+                            &current_ctrl_mode, &current_input_mode,
+                            (double*)wheel_sign, telemetryMsg.IK_computed_wheel_speeds);
+                    }
                 }
 
                 /* BT watchdog: if no BT packet for BT_OVERRIDE_TIMEOUT_MS, stop and release */
@@ -2261,6 +2474,21 @@ void StartODriveTask(void *argument)
                             odrive_odom, x_offset, y_offset, radius,
                             &current_ctrl_mode, &current_input_mode,
                             (double*)wheel_sign, telemetryMsg.IK_computed_wheel_speeds);
+                        sm_state = SM_IDLE;
+                        break;
+                    }
+
+                    /* STOP is a safety command: honor it UNCONDITIONALLY, before
+                     * any source-priority / BT-override masking. Otherwise a web
+                     * "stop" from ROS is silently dropped while a BT controller
+                     * holds the override (the base keeps driving). */
+                    if (cmd.type == ODRIVE_CFG_STOP || cmd.type == ODRIVE_CMD_STOP_ODRIVES) {
+                        printf("SM: RUNNING->IDLE (stop, unconditional)\r\n");
+                        ODrive_ProcessCommand(&cmd, odrives, num_odrives, &tx,
+                            odrive_odom, x_offset, y_offset, radius,
+                            &current_ctrl_mode, &current_input_mode,
+                            (double*)wheel_sign, telemetryMsg.IK_computed_wheel_speeds);
+                        bt_override_active = 0;
                         sm_state = SM_IDLE;
                         break;
                     }

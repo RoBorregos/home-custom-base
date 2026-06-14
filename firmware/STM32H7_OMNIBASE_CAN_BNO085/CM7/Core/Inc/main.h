@@ -104,7 +104,7 @@ typedef struct {
     double roll;
     double pitch;
 
-    /* Orientation quaternion from BNO085 SH2_ROTATION_VECTOR.
+    /* Orientation quaternion from BNO085 SH2_GAME_ROTATION_VECTOR (6-axis, no mag).
      * Standard convention: (qx, qy, qz, qw) with qw being the real component. */
     float qx;
     float qy;
