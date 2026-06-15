@@ -60,3 +60,9 @@ firmware/.metadata
 /omnibase_ws/.claude
 /.vscode
 /.claude
+
+omnibase_ws/src/thk_sim
+diff.txt
+omnibase_ws/src/diff_drive_gz_sim/
+omnibase_ws/src/ekf_optimized/
+omnibase_ws/src/ros2_laser_scan_merger/

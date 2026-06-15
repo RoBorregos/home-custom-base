@@ -1,0 +1,184 @@
+============================================================
+Project Status — home-custom-base
+Last updated: 2026-06-15 (after Major_Update merge)
+============================================================
+
+------------------------------------------------------------
+Current State
+------------------------------------------------------------
+
+Branch main now includes all changes from Major_Update. The merge was
+clean (no conflicts). omnibase_ws/ was preserved from local/main as
+Major_Update did not include it.
+
+Pending tasks:
+  - Remove redundant BT-only watchdog (superseded by general velocity
+    watchdog — to be done after hardware testing confirms stability)
+  - Verify baud rate match: USART3 is now 921600 in firmware, confirm
+    odrive_dashboard.py baud_rate parameter matches
+  - Confirm ODrive node IDs in firmware (33, 34, 36, 40) match
+    axis0.config.can.node_id on each physical S1
+  - mcp2515 files were deleted in merge — confirm nothing depends on them
+
+------------------------------------------------------------
+Firmware Changes Merged (Major_Update → main)
+------------------------------------------------------------
+
+## firmware/Bluetooth_ESP32/Bluetooth_ESP32.ino
+
+  - Added MAX_SPEED_MAX = 0.60f hard cap so repeated SPEED_UP cannot run away
+  - FIXED: Disabled BP32.forgetBluetoothKeys() on boot — this was causing the
+    PS5 controller to require re-pairing after every power cycle
+
+## firmware/STM32H7_OMNIBASE_CAN_BNO085/CM7/Core/Src/main.c
+
+  IMU sensor
+    Before : SH2_ROTATION_VECTOR      (9-axis, uses magnetometer)
+    After  : SH2_GAME_ROTATION_VECTOR (6-axis, no mag — more stable indoors)
+
+  USART3 baud rate
+    Before : 115200
+    After  : 921600 (must match odrive_dashboard.py baud_rate)
+
+  CAN RX FIFO size
+    Before : 1 element
+    After  : 16 elements (prevents frame drops from 4 ODrives broadcasting simultaneously)
+
+  CAN TX FIFO size
+    Before : 1 element
+    After  : 8 elements (prevents TX from wedging on a stalled frame)
+
+  CAN auto-retransmit
+    Before : ENABLED
+    After  : DISABLED (one-shot mode — un-ACKed frames are dropped instead of
+             retried forever, which was driving the TX error counter to BUS-OFF)
+
+  ODrive node ID assignment
+    Before : Not pre-assigned at boot
+    After  : Pre-assigned before FDCAN RX activates (node 36, 34, 33, 40)
+             so heartbeats are matched from the very first CAN frame
+
+  FDCAN bus-off recovery
+    Before : None (peripheral halts permanently on bus-off)
+    After  : HAL_FDCAN_ErrorStatusCallback sets g_can_busoff flag;
+             FDCAN_RecoverIfBusOff() restarts the peripheral from task context
+
+  UART error self-healing
+    Before : None (overrun error (ORE) kills RX permanently until reset)
+    After  : HAL_UART_ErrorCallback clears sticky error flags and re-arms
+             HAL_UART_Receive_IT() so both UART links self-heal
+
+  ESP32 link monitoring (see full design detail below)
+    Before : None
+    After  : g_bt_last_valid_msg_tick tracks last valid ESP32 message;
+             ESP32_age_ms field appended to every telemetry line sent to PC
+
+  Velocity-command watchdog
+    Before : BT-only watchdog (zeros motors only if BT was active and goes silent)
+    After  : General watchdog — zeros ALL motors if no SET_VEL received from ANY
+             source (ROS or BT) for CMD_WATCHDOG_TIMEOUT_MS = 500ms.
+             - Only armed in SM_RUNNING; disarmed in SM_BOOT/STARTUP/IDLE so the
+               watchdog never fires immediately on state transitions.
+             - Fires once and latches (cmd_watchdog_fired = 1) — does not spam
+               CAN bus while link is dead. Re-arms on next SET_VEL received.
+             - Also clears bt_override_active so ROS regains control immediately
+               when packets resume.
+             - Normal operation: ROS streams SET_VEL at ~10 Hz, watchdog resets
+               every packet, never fires. Cost: one 32-bit subtract per loop.
+    Note   : BT-only watchdog is still present but now redundant. Both are
+             independent and idempotent (zeroing motors twice is harmless).
+             Candidate for removal after testing.
+
+  Watchdog verification
+    1. Run robot in VELOCITY_CONTROL with ROS streaming a non-zero cmd_vel.
+    2. Unplug STM32 USB cable (or pkill -f odrive_dashboard).
+    3. Within ~500 ms wheels stop. STM32 prints on debug UART (USART3):
+           CMD watchdog: no SET_VEL for 500 ms — stopping motors
+    4. Reconnect cable and send new cmd_vel — wheels resume.
+
+## firmware/STM32H7_OMNIBASE_CAN_BNO085/STM32H7_OMNIBASE_CAN_BNO085.ioc
+
+  USART3.BaudRate : 115200 → 921600
+
+------------------------------------------------------------
+New Files Added (from Major_Update)
+------------------------------------------------------------
+
+  odrive_config_dump/odrive_node33.json   ODrive S1 config dump, CAN node 33
+  odrive_config_dump/odrive_node34.json   ODrive S1 config dump, CAN node 34
+  odrive_config_dump/odrive_node36.json   ODrive S1 config dump, CAN node 36
+  odrive_config_dump/odrive_node40.json   ODrive S1 config dump, CAN node 40
+  watchdog.txt                            Full design doc for velocity watchdog
+
+------------------------------------------------------------
+Files Removed (from Major_Update)
+------------------------------------------------------------
+
+  firmware/.../CM7/Core/Inc/mcp2515.h         SPI CAN driver header (dead code)
+  firmware/.../CM7/Core/Inc/mcp2515_consts.h  SPI CAN constants (dead code)
+  firmware/.../CM7/Core/Src/mcp2515.c         SPI CAN driver source (dead code)
+
+------------------------------------------------------------
+ESP32 Link Monitoring — Design Detail
+------------------------------------------------------------
+
+Goal: display health of the two robot communication links live on the
+web dashboard using elapsed time since the last valid message.
+
+  Link 1: ESP32 → STM32  (Bluetooth controller, USART2)
+  Link 2: STM32 → PC     (USB-CDC telemetry stream, USART3)
+
+STM32 firmware
+  - volatile uint32_t g_bt_last_valid_msg_tick updated by start_BT_RX_Task
+    every time a Type-3 ESP32 line parses successfully (parsed >= 4).
+  - Start_UART_TX_Task appends ESP32_age_ms=<n> to the telemetry line.
+    Sentinel -1 means "no valid ESP32 message received since boot".
+
+ROS dashboard node (odrive_dashboard.py)
+  - Stamps self._last_raw_msg_time = time.monotonic() on every serial line
+    read (before parsing), so a malformed line still proves the link is alive.
+  - Extracts ESP32_age_ms; maps -1 or missing to None ("unknown").
+  - 4 Hz timer (_tick_link_status) keeps refreshing STM32→PC age on the
+    dashboard even when no new STM32 packets arrive.
+  - _inject_link_ages(telem) adds four keys to every emitted frame:
+      esp32_age_ms / esp32_status   (ESP32→STM32)
+      pc_age_ms    / pc_status      (STM32→PC)
+
+Dashboard status thresholds
+  OK      age < 500 ms    green pill  (.pill.run)
+  WARN    500 ms – 2 s    amber pill  (inline style)
+  LOST    age >= 2 s      red pill    (.pill.err)
+  UNKNOWN no message yet  muted pill  (.pill)
+
+Telemetry field added
+  Field   : ESP32_age_ms
+  Type    : signed integer, milliseconds
+  Position: end of telemetry line, after BT_active, BT_vx, BT_vy, BT_wz
+  Sentinel: -1 = no valid ESP32 message since STM32 boot
+
+------------------------------------------------------------
+Validation Commands
+------------------------------------------------------------
+
+Build and source the workspace:
+
+    cd ~/Github/home-custom-base/omnibase_ws
+    colcon build --packages-select odrive_comm
+    source install/setup.bash
+
+Run the dashboard node:
+
+    ros2 run odrive_comm odrive_dashboard
+
+Verify ESP32_age_ms field in raw stream:
+
+    ros2 topic echo /odrive/raw --once
+
+Verify telemetry publish rate (~100 Hz at 921600 baud):
+
+    ros2 topic hz /odrive/raw
+
+Open dashboard at http://localhost:5000 — check Links block in the
+Odometry card shows ESP32→STM32 and STM32→PC with live age and status pill.
+
+============================================================
