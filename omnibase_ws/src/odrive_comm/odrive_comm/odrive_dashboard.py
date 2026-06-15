@@ -106,6 +106,58 @@ CFG_STOP          = 0x29
 CFG_SET_INPUT_POS = 0x30
 
 # ─────────────────────────────────────────────────────────────────────────────
+#  TELEMETRY FIELD MAP
+#  Mirrors the comment block above the printf() in
+#  firmware/STM32H7_OMNIBASE_CAN_BNO085/CM7/Core/Src/main.c:Start_UART_TX_Task.
+#  The firmware emits each field as `i=value` with `i` the positional index
+#  below; we translate back into the legacy named-key dict so the rest of the
+#  parser doesn't change. If the firmware list is reordered or extended, edit
+#  THIS list and the firmware printf in lock-step.
+# ─────────────────────────────────────────────────────────────────────────────
+TELEM_FIELDS = [
+    # 0..2  CMD twist
+    'CMD_vx', 'CMD_vy', 'CMD_wz',
+    # 3..5  IMU Euler (legacy, degrees)
+    'IMU_yaw', 'IMU_roll', 'IMU_pitch',
+    # 6..9  IMU quaternion
+    'IMU_qx', 'IMU_qy', 'IMU_qz', 'IMU_qw',
+    # 10..12  IMU angular velocity
+    'IMU_wx', 'IMU_wy', 'IMU_wz',
+    # 13..15  IMU linear acceleration
+    'IMU_ax', 'IMU_ay', 'IMU_az',
+    # 16..19  IK wheel speeds
+    'IK_u0', 'IK_u1', 'IK_u2', 'IK_u3',
+    # 20..23  EKF pose
+    'ODOM_phi', 'ODOM_x', 'ODOM_y', 'ODOM_z',
+    # 24..27  EKF orientation quaternion
+    'ODOM_qx', 'ODOM_qy', 'ODOM_qz', 'ODOM_qw',
+    # 28..30  World-frame twist
+    'ODOM_w', 'ODOM_vx', 'ODOM_vy',
+    # 31..32  Body-frame linear twist
+    'ODOM_vxb', 'ODOM_vyb',
+    # 33..35  Pose covariance diagonal
+    'ODOM_var_x', 'ODOM_var_y', 'ODOM_var_yaw',
+    # 36..38  Twist covariance diagonal
+    'ODOM_var_vx', 'ODOM_var_vy', 'ODOM_var_wz',
+    # 39..51  Axis 0 block (N, E, S, C, P, V, Sh, CPR, Vbus, Ibus, IqSet, IqMeas, U)
+    'N0', 'E0', 'S0', 'C0', 'P0', 'V0', 'Sh0', 'CPR0',
+    'Vbus0', 'Ibus0', 'IqSet0', 'IqMeas0', 'U0',
+    # 52..64  Axis 1 block
+    'N1', 'E1', 'S1', 'C1', 'P1', 'V1', 'Sh1', 'CPR1',
+    'Vbus1', 'Ibus1', 'IqSet1', 'IqMeas1', 'U1',
+    # 65..77  Axis 2 block
+    'N2', 'E2', 'S2', 'C2', 'P2', 'V2', 'Sh2', 'CPR2',
+    'Vbus2', 'Ibus2', 'IqSet2', 'IqMeas2', 'U2',
+    # 78..90  Axis 3 block
+    'N3', 'E3', 'S3', 'C3', 'P3', 'V3', 'Sh3', 'CPR3',
+    'Vbus3', 'Ibus3', 'IqSet3', 'IqMeas3', 'U3',
+    # 91..94  BT state
+    'BT_active', 'BT_vx', 'BT_vy', 'BT_wz',
+    # 95  ESP32 age, ms (-1 sentinel = no Type-3 message yet)
+    'ESP32_age_ms',
+]
+
+# ─────────────────────────────────────────────────────────────────────────────
 #  DASHBOARD HTML
 # ─────────────────────────────────────────────────────────────────────────────
 from pathlib import Path
@@ -123,7 +175,7 @@ class ODriveDashboardNode(Node):
         super().__init__('odrive_dashboard_node')
 
         self.declare_parameter('serial_port',         '/dev/ttyACM0')
-        self.declare_parameter('baud_rate',           115200)
+        self.declare_parameter('baud_rate',           921600)
         self.declare_parameter('use_stamped_cmd_vel', True)
         self.declare_parameter('tx_period',           0.1)
         self.declare_parameter('node_ids',            [33, 34, 35, 40])
@@ -169,6 +221,16 @@ class ODriveDashboardNode(Node):
         self._latest_telem: Dict[str, Any] = self._empty_telem()
         self._sio = None
 
+        # ── connection-link monitoring ───────────────────────────────────
+        # Monotonic-time (seconds) when the most recent /odrive/raw line was
+        # received from the STM32. None means "no line yet". Read & written
+        # only from this process; the dashboard's STM32→PC age is computed
+        # from this value.
+        self._last_raw_msg_time: float | None = None
+        # Latest ESP32→STM32 age (ms) as reported by the firmware. -1 sentinel
+        # (or None) means "the STM32 has never received an ESP32 message".
+        self._latest_esp32_age_ms: int | None = None
+
         # publishers
         self.pub_raw         = self.create_publisher(String,            'odrive/raw',               10)
         self.pub_debug       = self.create_publisher(String,            'odrive/debug',             10)
@@ -209,6 +271,11 @@ class ODriveDashboardNode(Node):
                                  self._cb_config_cmd, 10)
 
         self.create_timer(self.tx_period, self._send_control_cmd)
+        # Periodic refresh for the connection-status widget: recomputes the
+        # ESP32→STM32 and STM32→PC ages from the cached timestamps and pushes
+        # them to the web dashboard. Runs even when no UART data is arriving,
+        # so the "STM32→PC" reading grows visibly during a disconnect.
+        self.create_timer(0.25, self._tick_link_status)
         threading.Thread(target=self._receiver, daemon=True).start()
 
         if enable_web:
@@ -449,14 +516,87 @@ class ODriveDashboardNode(Node):
                 continue
             if not line:
                 continue
+            # Stamp the STM32→PC link timestamp on every line we successfully
+            # read off the serial port, independently of whether the parser
+            # later finds usable fields. A malformed line still proves the
+            # link is alive.
+            self._last_raw_msg_time = time.monotonic()
             self.pub_raw.publish(String(data=line))
             self._parse_and_publish(line)
 
+    # ── link-status helpers ──────────────────────────────────────────────────
+
+    # Thresholds (seconds). The default ROS<->STM32 telemetry rate is ~100 Hz
+    # (firmware Start_UART_TX_Task: osDelay(10)); the ESP32 heartbeat runs
+    # well above 2 Hz. 0.5 s already represents many missed packets at either
+    # rate, so OK / WARN / LOST is a sensible split.
+    _LINK_OK_S   = 0.5
+    _LINK_WARN_S = 2.0
+
+    @classmethod
+    def _link_status_label(cls, age_s):
+        if age_s is None:
+            return 'UNKNOWN'
+        if age_s < cls._LINK_OK_S:
+            return 'OK'
+        if age_s < cls._LINK_WARN_S:
+            return 'WARN'
+        return 'LOST'
+
+    def _inject_link_ages(self, telem: dict) -> None:
+        """Populate ESP32->STM32 and STM32->PC link ages on the telemetry dict.
+
+        The dict gets four fields:
+          esp32_age_ms / esp32_status : ESP32→STM32 link, from the firmware.
+          pc_age_ms    / pc_status    : STM32→PC link, measured here.
+
+        Ages are integer milliseconds, or `None` when no message has ever
+        been observed (rendered as "unknown" on the dashboard).
+        """
+        # ESP32→STM32 — the firmware sends -1 when no ESP32 message has been
+        # received yet; _parse_and_publish() converts that to None.
+        esp32_ms = self._latest_esp32_age_ms
+        # PC age — time.monotonic is robust across system-clock jumps.
+        if self._last_raw_msg_time is None:
+            pc_ms = None
+        else:
+            pc_ms = int((time.monotonic() - self._last_raw_msg_time) * 1000)
+        telem['esp32_age_ms'] = esp32_ms
+        telem['pc_age_ms']    = pc_ms
+        telem['esp32_status'] = self._link_status_label(
+            None if esp32_ms is None else esp32_ms / 1000.0)
+        telem['pc_status']    = self._link_status_label(
+            None if pc_ms is None else pc_ms / 1000.0)
+
+    def _tick_link_status(self) -> None:
+        """ROS timer callback: refresh link ages in the cached telemetry and
+        push to the web dashboard so the displayed values keep advancing even
+        when the STM32 stops sending data."""
+        self._inject_link_ages(self._latest_telem)
+        if self._sio:
+            self._sio.emit('telemetry', self._latest_telem)
+
     def _parse_and_publish(self, line: str):
         try:
+            # Firmware emits the compact form `i=value` (see TELEM_FIELDS).
+            # \w+ accepts the leading digit prefix too; we translate the
+            # numeric keys back to legacy named keys so the body of this
+            # function stays identical to the pre-compaction parser.
             matches = re.findall(
                 r'(\w+)=([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)', line)
-            data = {k: float(v) for k, v in matches}
+            if not matches:
+                return
+            data: dict = {}
+            for k, v in matches:
+                if k.isdigit():
+                    idx = int(k)
+                    if 0 <= idx < len(TELEM_FIELDS):
+                        data[TELEM_FIELDS[idx]] = float(v)
+                else:
+                    # Forward-compat: accept either compact (digit) or named
+                    # keys, so a half-flashed setup (old firmware + new node,
+                    # or vice-versa) still produces a usable telemetry frame.
+                    data[k] = float(v)
             if not data:
                 return
 
@@ -504,6 +644,17 @@ class ODriveDashboardNode(Node):
             o_y    = f(data.get('ODOM_y'));   o_w = f(data.get('ODOM_w'))
             o_vx   = f(data.get('ODOM_vx')); o_vy = f(data.get('ODOM_vy'))
             bt_active = i(data.get('BT_active'))
+
+            # ESP32→STM32 link age, reported in milliseconds by the firmware.
+            # The STM32 sends -1 when no ESP32 message has ever arrived; we
+            # carry that through as `None` for the dashboard so it can show
+            # "unknown" instead of a misleading number. A missing field
+            # (older firmware) is also treated as unknown.
+            if 'ESP32_age_ms' in data:
+                esp32_raw = i(data.get('ESP32_age_ms'))
+                self._latest_esp32_age_ms = (
+                    None if esp32_raw < 0 else esp32_raw)
+            # else: keep the previous cached value (no overwrite).
 
             def _f32(l): m=Float32MultiArray(); m.data=l; return m
             def _i32(l): m=Int32MultiArray();   m.data=l; return m
@@ -634,6 +785,9 @@ class ODriveDashboardNode(Node):
                 'iq_setpoint': iq_set, 'iq_measured': iq_meas,
                 'bt_active': bt_active,
             }
+            # Fold the current link ages into the dict so the per-packet
+            # emit is consistent with what the 4 Hz timer would publish.
+            self._inject_link_ages(telem)
             self._latest_telem = telem
             if self._sio:
                 self._sio.emit('telemetry', telem)
@@ -658,7 +812,11 @@ class ODriveDashboardNode(Node):
                     pos_est=z4f, vel_est=z4f,
                     bus_voltage=z4f, bus_current=z4f,
                     iq_setpoint=z4f, iq_measured=z4f,
-                    bt_active=0)
+                    bt_active=0,
+                    # Link ages start as "unknown" — the first periodic tick
+                    # or first received line will overwrite these.
+                    esp32_age_ms=None, esp32_status='UNKNOWN',
+                    pc_age_ms=None,    pc_status='UNKNOWN')
 
     @staticmethod
     def _sf(v) -> float:
