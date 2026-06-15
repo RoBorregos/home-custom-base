@@ -1,0 +1,137 @@
+============================================================
+StartODriveTask velocity-command watchdog — analysis & changes
+============================================================
+
+Question
+--------
+Does StartODriveTask have a watchdog that zeroes the motor velocities
+when it doesn't receive commands for a while?
+
+Answer (before this change)
+---------------------------
+Not really. The task had only a *BT-source-priority* watchdog:
+
+    firmware/.../CM7/Core/Src/main.c::StartODriveTask
+    --------------------------------------------------
+    const uint32_t BT_OVERRIDE_TIMEOUT_MS = 500;
+    if (bt_override_active && (now - last_bt_tick) >= BT_OVERRIDE_TIMEOUT_MS) {
+        /* zero SET_VEL, clear bt_override_active */
+    }
+
+This only fires when:
+  - BT had been actively driving the robot, AND
+  - the BT link goes silent for ≥500 ms.
+
+Its purpose is to release the BT→ROS source priority handover, not to act
+as a general safety net. In particular, if the ROS dashboard node stops
+sending control messages (USB cable unplugged, ROS node crashed, host
+machine froze) and BT was never active, the ODrives keep running at their
+last commanded velocity indefinitely. The robot does not stop.
+
+A separate general watchdog was needed.
+
+------------------------------------------------------------
+Change implemented
+------------------------------------------------------------
+
+A new "general velocity-command watchdog" was added that operates
+independently of the BT override logic. If no ODRIVE_CMD_SET_VEL message
+has been received from ANY source for CMD_WATCHDOG_TIMEOUT_MS = 500 ms,
+the firmware sends one zero-velocity SET_VEL to all four axes
+(target_mask = 0x0F) and then latches until a new SET_VEL re-arrives, so
+it does not spam the CAN bus while the link is still dead.
+
+The watchdog is only armed in state SM_RUNNING; in SM_BOOT / SM_STARTUP /
+SM_IDLE the timestamp is continuously refreshed so the watchdog never
+fires immediately on resuming.
+
+------------------------------------------------------------
+Files changed
+------------------------------------------------------------
+
+firmware/STM32H7_OMNIBASE_CAN_BNO085/CM7/Core/Src/main.c
+
+  1. Inside StartODriveTask(), next to the existing BT-override
+     constants, three new locals were added:
+
+         const uint32_t CMD_WATCHDOG_TIMEOUT_MS = 500;
+         uint32_t last_vel_cmd_tick = osKernelGetTickCount();
+         uint8_t  cmd_watchdog_fired = 0;
+
+  2. Right before the state-machine `switch (sm_state)`:
+
+         /* Disarm the watchdog while not driving so the next
+          * BOOT/STARTUP/IDLE → RUNNING transition starts fresh. */
+         if (sm_state != SM_RUNNING) {
+             last_vel_cmd_tick  = now;
+             cmd_watchdog_fired = 0;
+         }
+
+         /* Refresh on any incoming SET_VEL (proves the upstream link
+          * is alive even if the command is later dropped by the BT
+          * override logic). */
+         if (qst == osOK && cmd.type == ODRIVE_CMD_SET_VEL) {
+             last_vel_cmd_tick  = now;
+             cmd_watchdog_fired = 0;
+         }
+
+  3. At the top of `case SM_RUNNING:` (before the existing BT watchdog
+     block):
+
+         if (!cmd_watchdog_fired &&
+             (now - last_vel_cmd_tick) >= CMD_WATCHDOG_TIMEOUT_MS) {
+             printf("CMD watchdog: no SET_VEL for %lu ms — stopping motors\r\n",
+                    (unsigned long)CMD_WATCHDOG_TIMEOUT_MS);
+             ODriveCmdMsg zero_cmd = {0};
+             zero_cmd.type        = ODRIVE_CMD_SET_VEL;
+             zero_cmd.target_mask = 0x0F;
+             ODrive_ProcessCommand(&zero_cmd, odrives, num_odrives, &tx,
+                 odrive_odom, x_offset, y_offset, radius,
+                 &current_ctrl_mode, &current_input_mode,
+                 (double*)wheel_sign, telemetryMsg.IK_computed_wheel_speeds);
+             cmd_watchdog_fired = 1;
+             /* Also release BT override so ROS can immediately regain
+              * control as soon as packets resume. */
+             bt_override_active = 0;
+         }
+
+No other files (ROS node, headers) were touched — the watchdog is purely
+internal to the firmware state machine.
+
+------------------------------------------------------------
+Behavioural notes
+------------------------------------------------------------
+
+- Normal operation: the ROS dashboard streams SET_VEL at ~10 Hz (default
+  tx_period = 0.1 s). The watchdog timer is reset on every packet, so it
+  never fires while ROS is alive. Cost is ~one extra 32-bit subtract per
+  loop iteration.
+
+- ROS dies / cable unplugged: 500 ms after the last packet, the watchdog
+  fires once, sends a zero SET_VEL to all axes (the controller halts), and
+  latches. No more CAN traffic from the watchdog until a fresh SET_VEL
+  arrives, at which point it re-arms automatically.
+
+- BT was driving and goes silent: the existing BT watchdog still fires at
+  the same 500 ms boundary, AND the new general watchdog fires (also
+  zeroing the motors). The two are independent and idempotent — sending a
+  zero SET_VEL twice is harmless.
+
+- Control mode not VELOCITY_CONTROL: ODrive_ProcessCommand() rejects
+  SET_VEL silently in that case (existing behaviour), so the watchdog
+  cannot accidentally interfere with torque/position modes.
+
+- 500 ms is the same threshold the BT path uses. Adjustable via the local
+  constant `CMD_WATCHDOG_TIMEOUT_MS`.
+
+------------------------------------------------------------
+Quick way to verify
+------------------------------------------------------------
+
+  1. Run the robot in VELOCITY_CONTROL with the ROS dashboard streaming
+     a non-zero `cmd_vel`.
+  2. Unplug the STM32's USB cable (or `pkill -f odrive_dashboard`).
+  3. Within ~500 ms, the four wheels stop. Reconnect the cable and send
+     a new cmd_vel — the wheels resume. The STM32 prints
+         CMD watchdog: no SET_VEL for 500 ms — stopping motors
+     on the debug UART (USART3).

@@ -25,6 +25,7 @@
 #define MAX_SPEED_DEFAULT  0.12f
 #define MAX_SPEED_STEP     0.03f
 #define MAX_SPEED_MIN      0.03f
+#define MAX_SPEED_MAX      0.60f   // hard cap so repeated SPEED_UP can't run away
 
 // ── STM32 UART ────────────────────────────────────────────────────────────────
 // ESP32 GPIO17 TX → STM32 PD6 USART2 RX
@@ -151,6 +152,8 @@ void processGamepad(ControllerPtr ctl) {
     // ── Speed scaling buttons ────────────────────────────────────────────────
     if (speed_up_pressed) {
         current_max_speed += MAX_SPEED_STEP;
+        if (current_max_speed > MAX_SPEED_MAX)
+            current_max_speed = MAX_SPEED_MAX;
         Serial.printf("Max speed increased: %.2f\n", current_max_speed);
     }
 
@@ -236,7 +239,11 @@ void setup() {
 #else
     Serial.printf("Firmware: %s\n", BP32.firmwareVersion());
     BP32.setup(&onConnectedController, &onDisconnectedController);
-    BP32.forgetBluetoothKeys();
+    /* Do NOT forget pairing keys on every boot — that forces the PS5 controller
+     * to be re-paired after each power cycle (a common "the controller doesn't
+     * move the base" symptom). Only clear keys deliberately (e.g. hold a button
+     * at boot) when you actually want to re-pair a different controller. */
+    // BP32.forgetBluetoothKeys();
     BP32.enableVirtualDevice(false);
     Serial.printf("Default max speed: %.2f\n", current_max_speed);
     Serial.printf("Buttons: SPEED_DOWN=0x%02X TOGGLE=0x%02X ESTOP=0x%02X SPEED_UP=0x%02X\n",
