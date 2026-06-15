@@ -47,7 +47,7 @@ def generate_launch_description():
     declared_arguments.append(
         DeclareLaunchArgument(
             "prefix",
-            default_value="home_base",
+            default_value="",
             description="Prefix for robot link/joint names"
         )
     )

@@ -2,12 +2,14 @@
 <robot name="home_base" xmlns:xacro="http://ros.org/wiki/xacro">
 
   <!-- Launch arguments -->
-  <xacro:arg name="use_sim_time" default="true"/>
+  <xacro:arg name="use_sim_time" default="false"/>
   <xacro:arg name="robot_type" default="real"/>
-  <xacro:arg name="prefix" default="home_base"/>
+  <xacro:arg name="prefix" default=""/>
+  <xacro:arg name="imu_frame" default="imu_link"/>
 
   <xacro:property name="prefix" value="$(arg prefix)"/>
   <xacro:property name="use_sim_time" value="$(arg use_sim_time)"/>
+  <xacro:property name="imu_frame" value="$(arg imu_frame)"/>
   <xacro:property name="mesh_dir" value="package://home_custom_base_description/meshes/visual"/>
 
   <!-- Conditionally include simulation files -->
@@ -23,16 +25,16 @@
   </material>
 
   <!-- =================== base_footprint (root) =================== -->
-  <link name="${prefix}_base_footprint"/>
+  <link name="${prefix}base_footprint"/>
 
-  <joint name="${prefix}_base_footprint_joint" type="fixed">
+  <joint name="${prefix}base_footprint_joint" type="fixed">
     <origin xyz="0 0 0.0385" rpy="0 0 0"/>
-    <parent link="${prefix}_base_footprint"/>
-    <child link="${prefix}_base_link"/>
+    <parent link="${prefix}base_footprint"/>
+    <child link="${prefix}base_link"/>
   </joint>
 
   <!-- =================== base_link =================== -->
-  <link name="${prefix}_base_link">
+  <link name="${prefix}base_link">
     <inertial>
       <origin xyz="0.0323013333262494 -9.67443475711848E-05 0.199188228878544" rpy="0 0 0"/>
       <mass value="23.590093490853"/>
@@ -55,7 +57,7 @@
   </link>
 
   <!-- =================== wheel_FL =================== -->
-  <link name="${prefix}_wheel_FL">
+  <link name="${prefix}wheel_FL">
     <inertial>
       <origin xyz="-2.01760275153617E-11 -1.2648801422932E-08 -0.000225751978378957" rpy="0 0 0"/>
       <mass value="0.316522165409144"/>
@@ -78,13 +80,13 @@
   </link>
   <joint name="${prefix}_wheel_FL_joint" type="continuous">
     <origin xyz="0.184790699909997 0.219394995052441 0.0376959841787657" rpy="-1.5707963267949 0 0"/>
-    <parent link="${prefix}_base_link"/>
-    <child link="${prefix}_wheel_FL"/>
+    <parent link="${prefix}base_link"/>
+    <child link="${prefix}wheel_FL"/>
     <axis xyz="0 0 1"/>
   </joint>
 
   <!-- =================== wheel_FR =================== -->
-  <link name="${prefix}_wheel_FR">
+  <link name="${prefix}wheel_FR">
     <inertial>
       <origin xyz="1.08346649985158E-08 2.62530414074647E-09 -0.000243946115891319" rpy="0 0 0"/>
       <mass value="0.316802369656036"/>
@@ -105,15 +107,15 @@
       </geometry>
     </collision>
   </link>
-  <joint name="${prefix}_wheel_FR_joint" type="continuous">
+  <joint name="${prefix}wheel_FR_joint" type="continuous">
     <origin xyz="0.184790699909996 -0.219395004947559 0.0376959841787653" rpy="-1.5707963267949 0 0"/>
-    <parent link="${prefix}_base_link"/>
-    <child link="${prefix}_wheel_FR"/>
+    <parent link="${prefix}base_link"/>
+    <child link="${prefix}wheel_FR"/>
     <axis xyz="0 0 1"/>
   </joint>
 
   <!-- =================== wheel_RL =================== -->
-  <link name="${prefix}_wheel_RL">
+  <link name="${prefix}wheel_RL">
     <inertial>
       <origin xyz="6.27955468179842E-09 -8.84368271322766E-09 -0.000243945799877326" rpy="0 0 0"/>
       <mass value="0.316802379932942"/>
@@ -134,15 +136,15 @@
       </geometry>
     </collision>
   </link>
-  <joint name="${prefix}_wheel_RL_joint" type="continuous">
+  <joint name="${prefix}wheel_RL_joint" type="continuous">
     <origin xyz="-0.184790699909991 0.219394995052441 0.0376959841787652" rpy="-1.5707963267949 0 0"/>
-    <parent link="${prefix}_base_link"/>
-    <child link="${prefix}_wheel_RL"/>
+    <parent link="${prefix}base_link"/>
+    <child link="${prefix}wheel_RL"/>
     <axis xyz="0 0 1"/>
   </joint>
 
   <!-- =================== wheel_RR =================== -->
-  <link name="${prefix}_wheel_RR">
+  <link name="${prefix}wheel_RR">
     <inertial>
       <origin xyz="1.54742141322828E-09 1.26432938458987E-08 -0.000225751989580358" rpy="0 0 0"/>
       <mass value="0.316522156157189"/>
@@ -163,15 +165,15 @@
       </geometry>
     </collision>
   </link>
-  <joint name="${prefix}_wheel_RR_joint" type="continuous">
+  <joint name="${prefix}wheel_RR_joint" type="continuous">
     <origin xyz="-0.184790699909991 -0.219395004947559 0.0376959841787661" rpy="-1.5707963267949 0 0"/>
-    <parent link="${prefix}_base_link"/>
-    <child link="${prefix}_wheel_RR"/>
+    <parent link="${prefix}base_link"/>
+    <child link="${prefix}wheel_RR"/>
     <axis xyz="0 0 1"/>
   </joint>
 
   <!-- =================== lidar_front =================== -->
-  <link name="${prefix}_lidar_front">
+  <link name="${prefix}lidar_front">
     <inertial>
       <origin xyz="-0.000159118177998852 3.36756577745678E-06 -0.00515345431268351" rpy="0 0 0"/>
       <mass value="0.100467493631956"/>
@@ -192,14 +194,14 @@
       </geometry>
     </collision>
   </link>
-  <joint name="${prefix}_lidar_front_joint" type="fixed">
-    <origin xyz="0.287749512711774 -0.207249957761446 0.135795984178765" rpy="0 0 -1.5707963267949"/>
-    <parent link="${prefix}_base_link"/>
-    <child link="${prefix}_lidar_front"/>
+  <joint name="${prefix}lidar_front_joint" type="fixed">
+    <origin xyz="0.287749512711774 -0.207249957761446 0.135795984178765" rpy="0 0 1.57"/>
+    <parent link="${prefix}base_link"/>
+    <child link="${prefix}lidar_front"/>
   </joint>
 
   <!-- =================== lidar_rear =================== -->
-  <link name="${prefix}_lidar_rear">
+  <link name="${prefix}lidar_rear">
     <inertial>
       <origin xyz="-0.000159118177998907 3.36756577740127E-06 -0.00515345431268352" rpy="0 0 0"/>
       <mass value="0.100467493631956"/>
@@ -220,10 +222,19 @@
       </geometry>
     </collision>
   </link>
-  <joint name="${prefix}_lidar_rear_joint" type="fixed">
-    <origin xyz="-0.287749512711767 0.207249947866326 0.135795984178765" rpy="0 0 1.5707963267949"/>
-    <parent link="${prefix}_base_link"/>
-    <child link="${prefix}_lidar_rear"/>
+  <joint name="${prefix}lidar_rear_joint" type="fixed">
+    <origin xyz="-0.287749512711767 0.207249947866326 0.135795984178765" rpy="0 0 -1.57"/>
+    <parent link="${prefix}base_link"/>
+    <child link="${prefix}lidar_rear"/>
+  </joint>
+
+  <!-- =================== imu (base_link -> imu_frame) =================== -->
+  <!-- Replaces the base_to_imu static_transform_publisher node -->
+  <link name="${prefix}${imu_frame}"/>
+  <joint name="${prefix}base_to_imu" type="fixed">
+    <origin xyz="0 0 0" rpy="0 0 0"/>
+    <parent link="${prefix}base_link"/>
+    <child link="${prefix}${imu_frame}"/>
   </joint>
 
   <!-- =================== Conditionally add simulation components =================== -->
