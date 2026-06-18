@@ -52,10 +52,11 @@ from ament_index_python import get_package_share_directory
 import rclpy
 from rcl_interfaces.msg import SetParametersResult
 from rclpy.node import Node
-from geometry_msgs.msg import Twist, TwistStamped, Quaternion
+from geometry_msgs.msg import Twist, TwistStamped, Quaternion, TransformStamped
 from std_msgs.msg import Float32MultiArray, Int32MultiArray, String
 from sensor_msgs.msg import Imu
 from nav_msgs.msg import Odometry
+from tf2_ros import TransformBroadcaster
 import serial
 import serial.tools.list_ports
 
@@ -106,13 +107,22 @@ CFG_STOP          = 0x29
 CFG_SET_INPUT_POS = 0x30
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  TELEMETRY FIELD MAP
-#  Mirrors the comment block above the printf() in
+#  TELEMETRY FIELD INDEX MAP
+#  Mirrors the comment block above the printf()s in
 #  firmware/STM32H7_OMNIBASE_CAN_BNO085/CM7/Core/Src/main.c:Start_UART_TX_Task.
+#
 #  The firmware emits each field as `i=value` with `i` the positional index
-#  below; we translate back into the legacy named-key dict so the rest of the
-#  parser doesn't change. If the firmware list is reordered or extended, edit
-#  THIS list and the firmware printf in lock-step.
+#  below; the parser translates back to legacy named keys via this table so
+#  the rest of _parse_and_publish stays unchanged.
+#
+#  Two line shapes share the same numbering:
+#    SLIM line (every cycle): emits indices 3, 12, 20..38 — 21 fields, the
+#                             EKF output + the two raw-IMU fields that feed
+#                             /odrive/imu and /odrive/odom at high rate.
+#    FAT  line (every 5th):   emits indices 0..95 — full diagnostic snapshot.
+#
+#  If the firmware printf is reordered or extended, edit THIS list and the
+#  firmware in lock-step, then `colcon build --packages-select odrive_comm`.
 # ─────────────────────────────────────────────────────────────────────────────
 TELEM_FIELDS = [
     # 0..2  CMD twist
@@ -185,6 +195,12 @@ class ODriveDashboardNode(Node):
         self.declare_parameter('odom_frame_id',       'odom')
         self.declare_parameter('base_frame_id',       'base_link')
         self.declare_parameter('imu_frame_id',        'imu_link')
+        # When True, the dashboard broadcasts the odom -> base_link TF — this
+        # replaces robot_localization's `publish_tf: True` in home2's
+        # omni_basics.launch.py. Set to False when running an external EKF
+        # (e.g. robot_localization) alongside, to avoid two publishers fighting
+        # over the same transform.
+        self.declare_parameter('publish_tf',          True)
 
         port             = _find_stm_port(self.get_parameter('serial_port').value)
         baud             = self.get_parameter('baud_rate').value
@@ -197,6 +213,11 @@ class ODriveDashboardNode(Node):
         self.odom_frame_id = self.get_parameter('odom_frame_id').value
         self.base_frame_id = self.get_parameter('base_frame_id').value
         self.imu_frame_id  = self.get_parameter('imu_frame_id').value
+        self.publish_tf    = self.get_parameter('publish_tf').value
+        # TF broadcaster for odom -> base_link. Created unconditionally because
+        # `publish_tf` is a parameter that can be flipped at runtime via the
+        # on-set-parameters callback below.
+        self._tf_broadcaster = TransformBroadcaster(self)
 
         self.add_on_set_parameters_callback(self._on_params_changed)
 
@@ -408,6 +429,8 @@ class ODriveDashboardNode(Node):
         for p in params:
             if p.name == 'tx_period':
                 self.tx_period = p.value
+            elif p.name == 'publish_tf':
+                self.publish_tf = p.value
         return SetParametersResult(successful=True)
 
     # ── subscribers ───────────────────────────────────────────────────────────
@@ -643,6 +666,31 @@ class ODriveDashboardNode(Node):
             o_phi  = f(data.get('ODOM_phi')); o_x = f(data.get('ODOM_x'))
             o_y    = f(data.get('ODOM_y'));   o_w = f(data.get('ODOM_w'))
             o_vx   = f(data.get('ODOM_vx')); o_vy = f(data.get('ODOM_vy'))
+            # EKF-extended fields emitted by the firmware after the
+            # on-MCU EKF lands (post-merged_major_update). All are
+            # optional — older firmware just leaves them as 0.0.
+            o_z    = f(data.get('ODOM_z'))
+            o_qx   = f(data.get('ODOM_qx')); o_qy = f(data.get('ODOM_qy'))
+            o_qz   = f(data.get('ODOM_qz')); o_qw = f(data.get('ODOM_qw'))
+            o_vxb  = f(data.get('ODOM_vxb')); o_vyb = f(data.get('ODOM_vyb'))
+            # Covariance diagonal (only the values the firmware actually
+            # estimates — z, roll, pitch, wx, wy are advertised as 1e9
+            # below so downstream filters know they're unknown).
+            o_var_x   = f(data.get('ODOM_var_x'))
+            o_var_y   = f(data.get('ODOM_var_y'))
+            o_var_yaw = f(data.get('ODOM_var_yaw'))
+            o_var_vx  = f(data.get('ODOM_var_vx'))
+            o_var_vy  = f(data.get('ODOM_var_vy'))
+            o_var_wz  = f(data.get('ODOM_var_wz'))
+            # Detect "EKF firmware present" once per packet — if all the
+            # ODOM_q*/ODOM_var_* fields are missing we fall back to the
+            # legacy yaw-derived quaternion and the old placeholder
+            # covariance so the topic shape stays valid for any consumer.
+            ekf_quat_present = any(k in data for k in
+                                   ('ODOM_qx', 'ODOM_qy', 'ODOM_qz', 'ODOM_qw'))
+            ekf_cov_present  = any(k in data for k in
+                                   ('ODOM_var_x', 'ODOM_var_y', 'ODOM_var_yaw',
+                                    'ODOM_var_vx', 'ODOM_var_vy', 'ODOM_var_wz'))
             bt_active = i(data.get('BT_active'))
 
             # ESP32→STM32 link age, reported in milliseconds by the firmware.
@@ -708,33 +756,89 @@ class ODriveDashboardNode(Node):
             self.pub_imu.publish(imu_msg)
 
             # ── nav_msgs/Odometry ───────────────────────────────────────────
-            # ODOM_x/ODOM_y in meters, ODOM_phi in radians (heading),
-            # ODOM_vx/ODOM_vy in m/s (body-frame linear), ODOM_w in rad/s.
+            # ODOM_x / ODOM_y / ODOM_z in meters (z = 0 on a planar base),
+            # ODOM_phi in radians (heading), and:
+            #   - ODOM_q*    EKF orientation quaternion (preferred); falls
+            #                back to a yaw-derived quaternion when the EKF
+            #                firmware hasn't been flashed yet.
+            #   - ODOM_vxb / ODOM_vyb : body-frame linear twist — what
+            #     nav_msgs/Odometry expects under `child_frame_id`. When the
+            #     EKF firmware is absent, ODOM_vx / ODOM_vy carry the
+            #     legacy world-frame twist and we fall back to those.
+            #   - ODOM_var_* : EKF covariance diagonal mapped into the ROS
+            #     [x, y, z, roll, pitch, yaw] / [vx, vy, vz, wx, wy, wz]
+            #     layout. Unestimated entries (z / roll / pitch / wx / wy)
+            #     are marked with 1e9 so downstream filters treat them as
+            #     "unknown" rather than "tightly zero".
             odom_msg = Odometry()
             odom_msg.header.stamp = imu_msg.header.stamp
             odom_msg.header.frame_id = self.odom_frame_id
             odom_msg.child_frame_id  = self.base_frame_id
             odom_msg.pose.pose.position.x = o_x
             odom_msg.pose.pose.position.y = o_y
-            odom_msg.pose.pose.position.z = 0.0
-            odom_msg.pose.pose.orientation = _yaw_to_quaternion(o_phi)
-            odom_msg.twist.twist.linear.x  = o_vx
-            odom_msg.twist.twist.linear.y  = o_vy
+            odom_msg.pose.pose.position.z = o_z
+            if ekf_quat_present and (o_qx or o_qy or o_qz or o_qw):
+                odom_msg.pose.pose.orientation = Quaternion(
+                    x=o_qx, y=o_qy, z=o_qz, w=o_qw)
+            else:
+                odom_msg.pose.pose.orientation = _yaw_to_quaternion(o_phi)
+            # Twist in the child_frame (base_link / body). Use the EKF body
+            # twist when available; otherwise fall back to ODOM_vx/vy (which
+            # on pre-EKF firmware were world-frame — a known shape break for
+            # downstream consumers that we just have to accept on legacy
+            # firmware).
+            if ekf_quat_present or ekf_cov_present or ('ODOM_vxb' in data):
+                odom_msg.twist.twist.linear.x  = o_vxb
+                odom_msg.twist.twist.linear.y  = o_vyb
+            else:
+                odom_msg.twist.twist.linear.x  = o_vx
+                odom_msg.twist.twist.linear.y  = o_vy
             odom_msg.twist.twist.linear.z  = 0.0
             odom_msg.twist.twist.angular.z = o_w
-            # Pose/twist covariances are not yet characterised. Use small
-            # placeholders on the diagonal.
+
+            _LARGE = 1.0e9
             _pose_cov = [0.0] * 36
-            _pose_cov[0]  = 0.05  # x
-            _pose_cov[7]  = 0.05  # y
-            _pose_cov[35] = 0.05  # yaw
-            odom_msg.pose.covariance = _pose_cov
             _twist_cov = [0.0] * 36
-            _twist_cov[0]  = 0.05  # vx
-            _twist_cov[7]  = 0.05  # vy
-            _twist_cov[35] = 0.05  # wz
+            if ekf_cov_present:
+                _pose_cov[0]  = o_var_x      # x
+                _pose_cov[7]  = o_var_y      # y
+                _pose_cov[14] = _LARGE       # z   (not estimated)
+                _pose_cov[21] = _LARGE       # roll
+                _pose_cov[28] = _LARGE       # pitch
+                _pose_cov[35] = o_var_yaw    # yaw
+                _twist_cov[0]  = o_var_vx    # vx
+                _twist_cov[7]  = o_var_vy    # vy
+                _twist_cov[14] = _LARGE      # vz
+                _twist_cov[21] = _LARGE      # wx
+                _twist_cov[28] = _LARGE      # wy
+                _twist_cov[35] = o_var_wz    # wz
+            else:
+                # Legacy firmware — no covariance emitted. Keep the previous
+                # small placeholders so consumers see a positive-definite
+                # diagonal.
+                _pose_cov[0] = _pose_cov[7] = _pose_cov[35] = 0.05
+                _twist_cov[0] = _twist_cov[7] = _twist_cov[35] = 0.05
+            odom_msg.pose.covariance  = _pose_cov
             odom_msg.twist.covariance = _twist_cov
             self.pub_odom.publish(odom_msg)
+
+            # ── TF: odom -> base_link ──────────────────────────────────────
+            # Mirrors robot_localization's `publish_tf: True` for the home2
+            # omnibase config (omni_basics.launch.py). The orientation is the
+            # same quaternion that just went into the odom message so the TF
+            # tree and the message agree exactly. Disable at runtime via
+            # `publish_tf:=False` if you ever want to run an external EKF
+            # alongside.
+            if self.publish_tf:
+                tf_msg = TransformStamped()
+                tf_msg.header.stamp = odom_msg.header.stamp
+                tf_msg.header.frame_id = self.odom_frame_id
+                tf_msg.child_frame_id  = self.base_frame_id
+                tf_msg.transform.translation.x = odom_msg.pose.pose.position.x
+                tf_msg.transform.translation.y = odom_msg.pose.pose.position.y
+                tf_msg.transform.translation.z = odom_msg.pose.pose.position.z
+                tf_msg.transform.rotation      = odom_msg.pose.pose.orientation
+                self._tf_broadcaster.sendTransform(tf_msg)
             self.pub_node_ids   .publish(_i32(node_ids))
             self.pub_axis_errors.publish(_i32(axis_errors))
             self.pub_axis_states.publish(_i32(axis_states))

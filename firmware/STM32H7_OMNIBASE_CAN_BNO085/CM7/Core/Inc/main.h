@@ -145,10 +145,27 @@ typedef struct {
 } EncoderData;
 
 typedef struct {
+	/* Legacy fields (kept so existing slim/fat printf paths stay valid). */
 	double x_pos;
 	double y_pos;
 	double phi;
 	double q_dot[3]; // <- Inertial x_dot, y_dot, z_dot
+
+	/* EKF-shaped output (ROS nav_msgs/Odometry friendly).
+	 * z_pos and roll/pitch are not estimated — they are kept here for
+	 * struct-shape compatibility with downstream ROS messages only. */
+	double z_pos;
+	float  qx, qy, qz, qw;          /* orientation from EKF yaw (flat ground) */
+	double vx_body, vy_body, vz_body;
+	float  wx, wy, wz;              /* wz = EKF omega; wx/wy not estimated */
+
+	/* Full 6x6 covariance matrices (row-major, ROS layout).
+	 * Pose order : [ x,  y,  z,  roll, pitch, yaw ]
+	 * Twist order: [ vx, vy, vz, wx,   wy,    wz ]
+	 * Unestimated states carry a large variance on the diagonal so any
+	 * downstream filter treats them as effectively "unknown". */
+	double pose_covariance[36];
+	double twist_covariance[36];
 } OdomData;
 
 typedef struct {
