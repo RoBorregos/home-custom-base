@@ -1,7 +1,131 @@
 ============================================================
 Project Status — home-custom-base
-Last updated: 2026-06-15 (after Major_Update merge)
+Last updated: 2026-06-20 (EKF + firmware error reporting + CAN param access)
 ============================================================
+
+------------------------------------------------------------
+Latest Changes (2026-06-20)
+------------------------------------------------------------
+
+Branch: merged_major_update_ekf
+
+1. On-MCU 6-state EKF (firmware/.../ekf.c, ekf.h)
+   - Replaces the previous (x, y, theta) Euler dead-reckoning with a
+     proper EKF fusing wheel odometry + BNO085 IMU (yaw, omega_z).
+   - State: [x, y, yaw, vx_body, vy_body, omega_z]. Full 6x6 pose/twist
+     covariance is computed and sent in the telemetry stream.
+   - EKF_STUB (main.c) — 1 injects a synthetic constant velocity for
+     bench testing without ODrives/IMU; 0 = real correction. Currently 0.
+   - odrive_dashboard.py / dashboard.html consume the EKF quaternion and
+     covariance, and publish the odom -> base_link TF directly (replaces
+     robot_localization for the omnibase config). See
+     firmware/STM32H7_OMNIBASE_CAN_BNO085/CM7/omnibase_documentation.md
+     section 11 for full design detail and known gaps (no
+     pitch/roll, no IMU outlier rejection on omega_z, no IMU staleness
+     watchdog yet, no on-MCU gyro bias estimation).
+   - NOTE: the home2 `omnidriver` dashboard fork still needs ~60 lines
+     of changes to consume this firmware correctly (baud rate, drop
+     manual world->body un-rotation, drop yaw inversion, prefer EKF
+     quaternion/covariance, add TransformBroadcaster). Not done yet.
+
+2. Firmware error reporting pipeline (FirmwareError struct, ERR_QueueHandle)
+   - All non-TX tasks now route diagnostics through FirmwareError_Push()
+     into a 16-deep queue instead of calling printf() directly — only
+     Start_UART_TX_Task is allowed to call printf().
+   - TX task drains the queue and emits `E=<code>,<axis>,<detail>\r\n`
+     per error and `ELOST=<n>\r\n` if the queue overflowed.
+   - Covers: CAN TX timeout/bus-off/RX fail, ODrive startup/arm
+     failures, axis fault transitions, heartbeat timeout, command
+     watchdog, IMU init/reset/config failures, BT queue/parse failures,
+     stack watermark (configCHECK_FOR_STACK_OVERFLOW=2 now enabled),
+     stack overflow hook.
+   - Dashboard shows these in a dedicated "Firmware errors" panel,
+     separate from the general activity log (FERR_DESCRIPTIONS in
+     odrive_dashboard.py).
+   - Fixed: FERR_ARM_TIMEOUT was logging axis->NODE_ID (36/34/33/40)
+     instead of the 0-3 array index every other error code uses.
+   - Fixed: boot-time heartbeat-wait loop (SM_BOOT, up to 3s) now drains
+     URX_2_CAN_QueueHandle every tick instead of leaving it untouched —
+     previously an active BT stream during that window flooded
+     FERR_BT_QUEUE_FULL / ELOST on every boot (queue depth is only 3).
+
+3. ESTOP release hold timer
+   - Separate from the existing ~90ms press/release debounce
+     (ESTOP_DEBOUNCE_MS), the firmware now requires ESTOP_RELEASE_HOLD_MS
+     (currently 150ms) of continuous release before re-arming, to avoid
+     re-arming on a noisy/bouncy release edge. Any re-press during the
+     hold window cancels the pending re-arm.
+
+4. Default input mode switched from PASSTHROUGH to VEL_RAMP
+   - Both the firmware's boot-time auto-arm and the dashboard's Startup
+     selector now default to VEL_RAMP instead of PASSTHROUGH, to smooth
+     velocity setpoint jumps (tuning for arm-vibration reduction).
+   - vel_ramp_rate=25.0 (turn/s)/s is pushed to all 4 axes at boot via
+     the new RxSdo parameter-write path (see below). Was 10.0 previously
+     (too low — caused sluggish response, not too aggressive as
+     initially assumed; vel_ramp_rate is an acceleration LIMIT, bigger =
+     faster ramp). odrive_config/odrive_node*.json updated to match (note:
+     editing those JSONs does NOT push the value to hardware — it's
+     just our local backup record; the live ODrives are set via the
+     boot-time CAN write or odrivetool/USB).
+
+5. Arbitrary ODrive parameter access over CAN (RxSdo/TxSdo)
+   - New Set_Param_Float() in ODrive.c/.h sends an 8-byte RxSdo
+     OPCODE_WRITE frame (cmd_id 0x004) to set any float32 endpoint in
+     the ODrive's flat parameter tree by its flat_endpoints.json ID —
+     fw v0.6.12 confirmed on these ODrives.
+   - Wired through ODRIVE_CFG_SET_PARAM_FLOAT (sub_type 31), the
+     dashboard's "Advanced param (RxSdo)" box, and
+     send_set_param_float() in odrive_dashboard.py.
+   - No TxSdo read-back is implemented — fire-and-forget like every
+     other Set_* CAN helper. Confirm via odrivetool/USB if you need
+     certainty that a write landed.
+   - Endpoint IDs are firmware-build-specific; re-verify against
+     flat_endpoints.json if any ODrive is reflashed to a different
+     firmware version.
+   - odrive_config/flat_endpoints.json (fw v0.6.12, matching these 4
+     ODrives) is now checked into the repo. Use it to look up the
+     endpoint_id for ANY axis0.controller.config.* (or other) parameter
+     you want to set via the dashboard's "Advanced param (RxSdo)" box —
+     not just vel_ramp_rate. Re-download/replace this file if any
+     ODrive is ever reflashed to a different firmware version.
+
+6. Dashboard gain-slider limits widened
+   - Pos gain slider: 1-200 -> -20 to 20.
+   - Vel / Int gain sliders: 0.01-2 / 0.01-4 -> -10 to 10 (both).
+   - Confirmed: gains are never sent automatically on dashboard
+     connect/startup — only when "Apply gains" is clicked. The
+     displayed numbers are static HTML defaults, not a readback of the
+     ODrive's actual configured gains (ODrive's CANSimple protocol has
+     no GET_VEL_GAINS/GET_POSITION_GAIN; gains are write-only over the
+     fixed command set).
+
+7. Dashboard slim/fat telemetry-line bug fix
+   - odrive_dashboard.py's _parse_and_publish had no fast-path guard
+     for the high-rate slim odom/IMU line (sent every cycle, no per-axis
+     fields). Every slim line was falling through to the full per-axis
+     parser and defaulting axis_states/node_ids/pos_est/etc. to zero,
+     overwriting the good values from the last fat line — visible as
+     the dashboard flickering between real telemetry and
+     UNDEFINED/0.000 defaults. Fixed by adding the same fast-path the
+     home2 dashboard already had: when 'N0' is absent from the parsed
+     line, only patch odom/IMU/sm_state fields onto a copy of the
+     cached telemetry dict instead of rebuilding the whole thing.
+
+Known open items (not yet done, flagged during this session):
+  - No IMU staleness watchdog — if the BNO085 stops producing samples,
+    the EKF silently falls back to wheel-only dead-reckoning with no
+    error pushed and no dashboard indicator (unlike the ESP32/PC link
+    status rows, which do have explicit age/status tracking).
+  - home2 omnidriver dashboard not yet updated for EKF firmware
+    compatibility (see omnibase_documentation.md section 12).
+  - Recurring CAN bus-off / axis-fault / mass-arm-timeout events seen
+    in one test run — likely a wiring/termination/connector issue,
+    possibly vibration-induced; not a firmware bug. Investigate
+    hardware before trusting PID-tuning data collected during a run
+    where these appeared.
+  - Dashboard's Axis Lab tab (per-motor inspection/control/calibration)
+    is untested — has not been validated against real hardware.
 
 ------------------------------------------------------------
 Current State
@@ -104,10 +228,14 @@ Firmware Changes Merged (Major_Update → main)
 New Files Added (from Major_Update)
 ------------------------------------------------------------
 
-  odrive_config_dump/odrive_node33.json   ODrive S1 config dump, CAN node 33
-  odrive_config_dump/odrive_node34.json   ODrive S1 config dump, CAN node 34
-  odrive_config_dump/odrive_node36.json   ODrive S1 config dump, CAN node 36
-  odrive_config_dump/odrive_node40.json   ODrive S1 config dump, CAN node 40
+  odrive_config/odrive_node33.json   ODrive S1 config dump, CAN node 33
+  odrive_config/odrive_node34.json   ODrive S1 config dump, CAN node 34
+  odrive_config/odrive_node36.json   ODrive S1 config dump, CAN node 36
+  odrive_config/odrive_node40.json   ODrive S1 config dump, CAN node 40
+  odrive_config/flat_endpoints.json  ODrive fw v0.6.12 CAN endpoint-ID map
+                                      (RxSdo/TxSdo arbitrary-parameter
+                                      access — see omnibase_documentation.md
+                                      section 10.2/10.3)
   watchdog.txt                            Full design doc for velocity watchdog
 
 ------------------------------------------------------------
