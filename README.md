@@ -15,7 +15,7 @@ RoBorregos custom omnidirectional base — firmware and ROS2 interface for a fou
 | BNO085 IMU — 6-axis quaternion (GAME_ROTATION_VECTOR), 50 Hz | Working |
 | PS5 / Dualshock4 via ESP32 Bluetooth | Working |
 | Telemetry CSV to ROS computer @ ~50/10 Hz (slim/fat lines) | Working |
-| On-MCU 6-state EKF (wheel odom + IMU fusion), replaces robot_localization for omnibase | Working — see `firmware/STM32H7_OMNIBASE_CAN_BNO085/CM7/omnibase_documentation.md` §11 |
+| On-MCU 6-state EKF (wheel odom + IMU fusion), replaces robot_localization for omnibase* | Working |
 | `odom -> base_link` TF published directly by the dashboard | Working |
 | Firmware error reporting (queued, dashboard "Firmware errors" panel) | Working |
 | Web dashboard (`localhost:5000`) with link status monitoring | Working |
@@ -27,8 +27,11 @@ RoBorregos custom omnidirectional base — firmware and ROS2 interface for a fou
 | ESTOP hardware input with separate press/release debounce + re-arm hold | Working |
 | Stack overflow detection (`configCHECK_FOR_STACK_OVERFLOW=2`) + periodic watermark check | Working |
 | ControlTask (heading controller / path planner) | **Pending** — scaffolded, body empty |
-| home2 `omnidriver` dashboard EKF compatibility | **Pending** — see `firmware/STM32H7_OMNIBASE_CAN_BNO085/CM7/omnibase_documentation.md` §12 |
+| home2 `omnidriver` dashboard EKF compatibility** | **Pending** |
 | IMU staleness watchdog | **Pending** — silent fallback to dead-reckoning if BNO085 stops producing samples |
+
+\* see `firmware/STM32H7_OMNIBASE_CAN_BNO085/CM7/omnibase_documentation.md` §11
+\*\* see `firmware/STM32H7_OMNIBASE_CAN_BNO085/CM7/omnibase_documentation.md` §12
 
 ---
 
