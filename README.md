@@ -31,6 +31,7 @@ RoBorregos custom omnidirectional base — firmware and ROS2 interface for a fou
 | IMU staleness watchdog | **Pending** — silent fallback to dead-reckoning if BNO085 stops producing samples |
 
 \* see `firmware/STM32H7_OMNIBASE_CAN_BNO085/CM7/omnibase_documentation.md` §11
+
 \*\* see `firmware/STM32H7_OMNIBASE_CAN_BNO085/CM7/omnibase_documentation.md` §12
 
 ---
