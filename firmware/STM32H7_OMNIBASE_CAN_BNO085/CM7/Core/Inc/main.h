@@ -224,6 +224,9 @@ typedef enum {
     ODRIVE_CFG_SET_TORQUE          = 0x28,
     ODRIVE_CFG_STOP                = 0x29,
     ODRIVE_CFG_SET_INPUT_POS       = 0x30,
+    /* Arbitrary parameter write (RxSdo) -- endpoint_id + float value.
+     * See RXSDO_CMD_ID in ODrive.h. Endpoint IDs are firmware-build-specific. */
+    ODRIVE_CFG_SET_PARAM_FLOAT     = 0x31,
 } ODriveCmdType;
 
 typedef enum {
@@ -260,6 +263,8 @@ typedef struct {
     float input_pos_target;
     float input_pos_vel_ff;
     float input_pos_trq_ff;
+    uint16_t param_endpoint_id;  // used by ODRIVE_CFG_SET_PARAM_FLOAT
+    float    param_value;        // used by ODRIVE_CFG_SET_PARAM_FLOAT
     uint8_t  source;
     uint16_t buttons;
 } ODriveCmdMsg;

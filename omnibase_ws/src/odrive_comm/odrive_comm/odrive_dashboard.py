@@ -40,6 +40,13 @@ Serial Protocol (PC -> STM32)
               28 set_torque        <torque>
               29 stop
               30 set_input_pos     <pos> <vel_ff> <torque_ff>
+              31 set_param_float   <endpoint_id> <value>
+                    Arbitrary ODrive parameter write over CAN (RxSdo,
+                    OPCODE_WRITE). endpoint_id is firmware-build-specific --
+                    look it up in the flat_endpoints.json shipped with the
+                    ODrive's exact firmware release (e.g.
+                    axis0.controller.config.vel_ramp_rate). Only float32
+                    endpoints are supported by this command.
 """
 
 import math
@@ -105,6 +112,7 @@ CFG_REBOOT        = 0x27
 CFG_SET_TORQUE    = 0x28
 CFG_STOP          = 0x29
 CFG_SET_INPUT_POS = 0x30
+CFG_SET_PARAM_FLOAT = 0x31
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  TELEMETRY FIELD INDEX MAP
@@ -451,6 +459,15 @@ class ODriveDashboardNode(Node):
             self._serial_write(
                 f"2 {CFG_SET_INPUT_POS} {mhex} {pos:.4f} {vff:.4f} {tff:.4f}")
 
+        elif cmd == 'set_param_float':
+            # Arbitrary ODrive parameter write over CAN (RxSdo). endpoint_id
+            # is firmware-build-specific -- look it up in the flat_endpoints.json
+            # for the ODrive's exact firmware release.
+            endpoint_id = int(data.get('endpoint_id', 0))
+            value = float(data.get('value', 0.0))
+            self._serial_write(
+                f"2 {CFG_SET_PARAM_FLOAT} {mhex} {endpoint_id} {value:.6f}")
+
         else:
             self.get_logger().warn(f"Unknown web command: {cmd}")
 
@@ -513,6 +530,13 @@ class ODriveDashboardNode(Node):
 
     def send_set_vel_gains(self, vg, vi, mask=0x0F):
         self._serial_write(f"2 {CFG_SET_VEL_GAINS} {mask:#04x} {vg:.4f} {vi:.4f}")
+
+    def send_set_param_float(self, endpoint_id, value, mask=0x0F):
+        """Write an arbitrary ODrive float32 parameter over CAN (RxSdo).
+        endpoint_id comes from the flat_endpoints.json matching the ODrive's
+        exact firmware release (e.g. axis0.controller.config.vel_ramp_rate)."""
+        self._serial_write(
+            f"2 {CFG_SET_PARAM_FLOAT} {mask:#04x} {int(endpoint_id)} {value:.6f}")
 
     def send_set_controller_mode(self, cm, im, mask=0x0F):
         self._serial_write(f"2 {CFG_SET_CTRL_MODE} {mask:#04x} {cm} {im}")
@@ -686,6 +710,37 @@ class ODriveDashboardNode(Node):
                 return
 
             f, i = self._sf, self._si
+
+            # FAST PATH: the slim high-rate line (sent every cycle, fields
+            # 3, 12, 20..38, 96 — see the index map above main.c's printf)
+            # carries no per-axis block (no 'N0='). Falling through to the
+            # full path below would default every axis/Vbus/etc. field to 0
+            # and overwrite the good values from the last fat line, making
+            # the dashboard flicker between real data and zeros/UNDEFINED.
+            # Just refresh the IMU/EKF-odom fields on the cached telemetry
+            # and emit that instead.
+            if 'N0' not in data:
+                telem = dict(self._latest_telem)
+                if 'IMU_yaw' in data:
+                    telem['imu_yaw'] = f(data.get('IMU_yaw'))
+                if 'IMU_wz' in data:
+                    telem['imu_wz'] = f(data.get('IMU_wz'))
+                if 'ODOM_phi' in data:
+                    telem['odom_phi'] = f(data.get('ODOM_phi'))
+                    telem['odom_x']   = f(data.get('ODOM_x'))
+                    telem['odom_y']   = f(data.get('ODOM_y'))
+                    telem['odom_w']   = f(data.get('ODOM_w'))
+                    telem['odom_vx']  = f(data.get('ODOM_vx'))
+                    telem['odom_vy']  = f(data.get('ODOM_vy'))
+                if 'SM_state' in data:
+                    sm_state = int(data['SM_state'])
+                    telem['sm_state']       = sm_state
+                    telem['sm_state_label'] = SM_STATE_LABELS.get(sm_state, 'UNKNOWN')
+                self._inject_link_ages(telem)
+                self._latest_telem = telem
+                if self._sio:
+                    self._sio.emit('telemetry', telem)
+                return
 
             node_ids    = [i(data.get(f'N{j}'))        for j in range(4)]
             axis_errors = [i(data.get(f'E{j}'))        for j in range(4)]

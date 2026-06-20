@@ -277,19 +277,33 @@ select:focus{outline:none;border-color:var(--acc)}
                the same numbers so the GUI starts in sync. Keep them aligned
                when tuning. -->
           <div class="sr">
-            <div class="slb"><label>Pos</label><input type="number" class="numinp" id="pgv" value="20.00" min="1" max="200" step="1"></div>
-            <input type="range" id="slpg" min="1" max="200" step="1" value="20">
+            <div class="slb"><label>Pos</label><input type="number" class="numinp" id="pgv" value="20.00" min="-20" max="20" step="0.01"></div>
+            <input type="range" id="slpg" min="-20" max="20" step="0.01" value="20">
           </div>
           <div class="sr">
-            <div class="slb"><label>Vel</label><input type="number" class="numinp" id="vgv" value="0.160" min="0.01" max="2" step="0.01"></div>
-            <input type="range" id="slvg" min="0.01" max="2" step="0.01" value="0.16">
+            <div class="slb"><label>Vel</label><input type="number" class="numinp" id="vgv" value="0.160" min="-10" max="10" step="0.01"></div>
+            <input type="range" id="slvg" min="-10" max="10" step="0.01" value="0.16">
           </div>
           <div class="sr">
-            <div class="slb"><label>Int</label><input type="number" class="numinp" id="vigv" value="0.320" min="0.01" max="4" step="0.01"></div>
-            <input type="range" id="slvi" min="0.01" max="4" step="0.01" value="0.32">
+            <div class="slb"><label>Int</label><input type="number" class="numinp" id="vigv" value="0.320" min="-10" max="10" step="0.01"></div>
+            <input type="range" id="slvi" min="-10" max="10" step="0.01" value="0.32">
           </div>
           <button class="btn" id="bapg" style="width:100%;margin-top:2px">Apply gains</button>
         </div>
+      </div>
+      <div style="margin-top:8px">
+        <div class="ct">Advanced param (RxSdo)</div>
+        <!-- Writes an arbitrary ODrive float32 parameter over CAN, e.g.
+             axis0.controller.config.vel_ramp_rate. endpoint_id is
+             firmware-build-specific -- look it up in the flat_endpoints.json
+             shipped with the ODrive's exact firmware release. -->
+        <div class="sr">
+          <div class="slb"><label>Endpoint ID</label><input type="number" class="numinp" id="pep" value="0" min="0" max="65535" step="1"></div>
+        </div>
+        <div class="sr">
+          <div class="slb"><label>Value</label><input type="number" class="numinp" id="pepv" value="0" step="0.01"></div>
+        </div>
+        <button class="btn" id="bapparam" style="width:100%;margin-top:2px">Set param</button>
       </div>
       <div style="margin-top:8px;display:flex;align-items:center;gap:6px;padding:5px 8px;background:var(--surf);border-radius:6px;flex-shrink:0">
         <span style="font-size:10px;color:var(--mut);font-weight:600;white-space:nowrap">Bluetooth control:</span>
@@ -301,7 +315,7 @@ select:focus{outline:none;border-color:var(--acc)}
     <div class="card">
       <div class="ct">Controller mode</div>
       <div class="sr"><select id="sctrl"><option value="2">Velocity</option><option value="3">Position</option><option value="1">Torque</option></select></div>
-      <div class="sr"><select id="sinp"><option value="1">Passthrough</option><option value="2">Vel ramp</option><option value="3">Pos filter</option><option value="5">Trap traj</option></select></div>
+      <div class="sr"><select id="sinp"><option value="1">Passthrough</option><option value="2" selected>Vel ramp</option><option value="3">Pos filter</option><option value="5">Trap traj</option></select></div>
       <button class="btn" id="bsm" style="width:100%;margin-bottom:8px">Set mode</button>
 
       <div class="ct">Global actions</div>
@@ -617,9 +631,9 @@ link('ovy','ovyv',v=>v.toFixed(2),-0.5,0.5);
 link('owz','owzv',v=>v.toFixed(2),-0.5,0.5);
 link('slvl','vlv', v=>v.toFixed(2),0.5,50);
 link('slcl','clv', v=>v.toFixed(2),1,60);
-link('slpg','pgv', v=>v.toFixed(2),1,200);
-link('slvg','vgv', v=>v.toFixed(3),0.01,2);
-link('slvi','vigv',v=>v.toFixed(3),0.01,4);
+link('slpg','pgv', v=>v.toFixed(2),-20,20);
+link('slvg','vgv', v=>v.toFixed(3),-10,10);
+link('slvi','vigv',v=>v.toFixed(3),-10,10);
 
 // Link status helpers — render the ESP32→STM32 and STM32→PC ages with
 // an OK / WARN / LOST / UNKNOWN pill.  Thresholds match the Python side:
@@ -760,6 +774,7 @@ g('bapg').onclick=()=>{
   send({type:'set_pos_gain',mask,pos_gain:parseFloat(g('pgv').value)});
   send({type:'set_vel_gains',mask,vel_gain:parseFloat(g('vgv').value),vel_int_gain:parseFloat(g('vigv').value)});
 };
+g('bapparam').onclick=()=>send({type:'set_param_float',mask,endpoint_id:parseInt(g('pep').value),value:parseFloat(g('pepv').value)});
 g('bsm').onclick=()=>{
   const cm=parseInt(g('sctrl').value),im=parseInt(g('sinp').value);
   send({type:'stop',mask});

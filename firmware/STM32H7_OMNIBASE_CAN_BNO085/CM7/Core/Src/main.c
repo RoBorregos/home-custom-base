@@ -72,17 +72,17 @@
    FDCAN switches to INTERNAL_LOOPBACK: TX completes without external ACK so
    nothing blocks.  The state machine and BT/UART paths work normally.
    Set to 0 for real hardware with ODrives connected. */
-#define CAN_STUB 1
+#define CAN_STUB 0
 
 /* Set to 1 when the BNO055 IMU is physically connected on I2C1.
    Set to 0 to skip I2C1 init and all bno085 calls (euler stays {0,0,0}). */
-#define IMU_ENABLED 0
+#define IMU_ENABLED 1
 
 /* Set to 1 to inject a synthetic constant body-frame velocity into the EKF
    instead of computing it from ODrive feedback.  Combined with CAN_STUB=1 and
    IMU_ENABLED=0 this lets the full predict+correct pipeline run on a bare
    STM32 with nothing connected.  EKF_STUB_VX/VY/WZ are in m/s and rad/s. */
-#define EKF_STUB    1
+#define EKF_STUB    0
 #define EKF_STUB_VX  0.1   /* forward at 0.1 m/s */
 #define EKF_STUB_VY  0.0
 #define EKF_STUB_WZ  0.0
@@ -1943,7 +1943,15 @@ void StartIMUTask(void *argument)
  * write is RAM-only on the ODrive side. Update both this define and every
  * odrive_node*.json in lock-step if the tuned values change. */
 #define ODRIVE_STARTUP_VEL_GAIN     0.3333f
-#define ODRIVE_STARTUP_VEL_INT_GAIN 0.706f
+#define ODRIVE_STARTUP_VEL_INT_GAIN 5.658f
+
+/* axis0.controller.config.vel_ramp_rate, written via RxSdo (Set_Param_Float).
+ * Endpoint ID is from flat_endpoints.json for fw v0.6.12 -- re-check this ID
+ * if any ODrive is ever reflashed to a different firmware version, since IDs
+ * are not guaranteed stable across firmware releases. RAM-only write, same
+ * caveat as the gains above: re-applied every boot, not save_configuration()'d. */
+#define ODRIVE_VEL_RAMP_RATE_ENDPOINT_ID 398
+#define ODRIVE_STARTUP_VEL_RAMP_RATE     25.0f
 
 HAL_StatusTypeDef ODrive_Startup(Axis odrives[], uint8_t num_odrives, FDCAN_TXmsg *msg,
                                   Control_Mode control_mode, Input_Mode input_mode,
@@ -1986,10 +1994,10 @@ HAL_StatusTypeDef ODrive_Startup(Axis odrives[], uint8_t num_odrives, FDCAN_TXms
  * the state machine transitions normally during bench testing. */
 static uint8_t ODrive_ArmAxisConfirmed(Axis *axis, FDCAN_TXmsg *msg,
                                        Control_Mode ctrl, Input_Mode in_mode,
-                                       uint8_t attempts)
+                                       uint8_t attempts, uint8_t axis_idx)
 {
 #if CAN_STUB
-    (void)attempts;
+    (void)attempts; (void)axis_idx;
     FDCAN_WAIT_TX_FREE(); Clear_Errors(axis, msg);
     FDCAN_WAIT_TX_FREE(); Set_Controller_Modes(axis, msg, ctrl, in_mode);
     FDCAN_WAIT_TX_FREE(); Set_Axis_Requested_State(axis, msg, CLOSED_LOOP_CONTROL);
@@ -2005,7 +2013,9 @@ static uint8_t ODrive_ArmAxisConfirmed(Axis *axis, FDCAN_TXmsg *msg,
         }
         (void)a;
     }
-    FirmwareError_Push(FERR_ARM_TIMEOUT, axis->NODE_ID, (uint8_t)axis->AXIS_Current_State);
+    /* axis_idx (0-3), not NODE_ID, so this matches every other error code's
+     * axis numbering convention. */
+    FirmwareError_Push(FERR_ARM_TIMEOUT, axis_idx, (uint8_t)axis->AXIS_Current_State);
     return 0;
 #endif
 }
@@ -2225,6 +2235,18 @@ void ODrive_ProcessCommand(const ODriveCmdMsg *cmd, Axis odrives[], uint8_t num_
                          cmd->input_pos_target,
                          (int16_t)(cmd->input_pos_vel_ff * 1000.0f),
                          (int16_t)(cmd->input_pos_trq_ff * 1000.0f));
+                (void)st;
+            }
+            break;
+        }
+
+        case ODRIVE_CFG_SET_PARAM_FLOAT:
+        {
+            for (uint8_t i = 0; i < num_odrives; i++) {
+                if (!(cmd->target_mask & (1 << i))) continue;
+                FDCAN_WAIT_TX_FREE();
+                st = Set_Param_Float(&odrives[i], tx,
+                         cmd->param_endpoint_id, cmd->param_value);
                 (void)st;
             }
             break;
@@ -2492,6 +2514,14 @@ void UART_RX_ParseLine(const char *line_buf, ODriveCmdMsg *odrive_cmd,
                 cfg_cmd.input_pos_trq_ff = tff;
                 break;
             }
+            case ODRIVE_CFG_SET_PARAM_FLOAT: {
+                unsigned int endpoint_id = 0;
+                float value = 0.0f;
+                sscanf(line_buf, "%*d %*d %*x %u %f", &endpoint_id, &value);
+                cfg_cmd.param_endpoint_id = (uint16_t)endpoint_id;
+                cfg_cmd.param_value       = value;
+                break;
+            }
             default:
                 break;
         }
@@ -2659,7 +2689,7 @@ void StartODriveTask(void *argument)
                 for (uint8_t i = 0; i < num_odrives; i++) {
                     ODrive_ArmAxisConfirmed(&odrives[i], &tx,
                                            current_ctrl_mode,
-                                           current_input_mode, 5);
+                                           current_input_mode, 5, i);
                 }
                 sm_state          = SM_RUNNING;
                 g_estop_active    = 0;
@@ -2767,6 +2797,17 @@ void StartODriveTask(void *argument)
                         for (uint8_t i = 0; i < num_odrives; i++)
                             if (odrives[i].AXIS_Current_State == UNDEFINED) all_seen = 0;
                         if (all_seen) break;
+                        /* Drain (not just ignore) any BT/ROS command that
+                         * arrives during the wait. URX_2_CAN_QueueHandle is
+                         * depth 3 and nothing else reads it while we're stuck
+                         * in this loop -- without this, an active BT stream
+                         * fills it almost instantly and floods FERR_BT_QUEUE_FULL
+                         * every boot. Commands during arming are expected to
+                         * be dropped, so this is a silent discard, not an error. */
+                        {
+                            ODriveCmdMsg discard;
+                            while (osMessageQueueGet(URX_2_CAN_QueueHandle, &discard, NULL, 0) == osOK) {}
+                        }
                         osDelay(10);
                     }
 #endif
@@ -2784,13 +2825,23 @@ void StartODriveTask(void *argument)
                                      ODRIVE_STARTUP_VEL_INT_GAIN);
                     }
 
+                    /* Push the tuned vel_ramp_rate (RxSdo arbitrary-parameter
+                     * write) before arming, same RAM-only/every-boot pattern
+                     * as the gains above. */
+                    for (uint8_t i = 0; i < num_odrives; i++) {
+                        FDCAN_WAIT_TX_FREE();
+                        Set_Param_Float(&odrives[i], &tx,
+                                       ODRIVE_VEL_RAMP_RATE_ENDPOINT_ID,
+                                       ODRIVE_STARTUP_VEL_RAMP_RATE);
+                    }
+
                     /* Arm each axis WITH heartbeat confirmation + retry, instead
                      * of assuming a queued CAN frame took effect. */
                     for (uint8_t i = 0; i < num_odrives; i++)
                         ODrive_ArmAxisConfirmed(&odrives[i], &tx,
-                                               VELOCITY_CONTROL, PASSTHROUGH, 5);
+                                               VELOCITY_CONTROL, VEL_RAMP, 5, i);
                     current_ctrl_mode  = VELOCITY_CONTROL;
-                    current_input_mode = PASSTHROUGH;
+                    current_input_mode = VEL_RAMP;
                     sm_state = SM_RUNNING;
                 }
                 break;
