@@ -175,7 +175,7 @@ class ODriveDashboardNode(Node):
         super().__init__('odrive_dashboard_node')
 
         self.declare_parameter('serial_port',         '/dev/ttyACM0')
-        self.declare_parameter('baud_rate',           921600)
+        self.declare_parameter('baud_rate',           230400)
         self.declare_parameter('use_stamped_cmd_vel', True)
         self.declare_parameter('tx_period',           0.1)
         self.declare_parameter('node_ids',            [33, 34, 35, 40])
@@ -601,6 +601,31 @@ class ODriveDashboardNode(Node):
                 return
 
             f, i = self._sf, self._si
+
+            # FAST PATH: the slim high-rate odom/IMU line (sent every cycle)
+            # carries no per-axis fields (no 'N0='). Falling through to the
+            # full path below would default every axis field to 0 and
+            # overwrite the good values from the last fat line, making the
+            # dashboard flicker between real data and zeros. Just refresh the
+            # odom/IMU fields on the cached telemetry and emit that.
+            if 'N0' not in data:
+                telem = dict(self._latest_telem)
+                if 'ODOM_phi' in data:
+                    telem['odom_phi'] = f(data.get('ODOM_phi'))
+                    telem['odom_x']   = f(data.get('ODOM_x'))
+                    telem['odom_y']   = f(data.get('ODOM_y'))
+                    telem['odom_w']   = f(data.get('ODOM_w'))
+                    telem['odom_vx']  = f(data.get('ODOM_vx'))
+                    telem['odom_vy']  = f(data.get('ODOM_vy'))
+                if 'IMU_yaw' in data:
+                    telem['imu_yaw'] = f(data.get('IMU_yaw'))
+                if 'IMU_wz' in data:
+                    telem['imu_wz'] = f(data.get('IMU_wz'))
+                self._inject_link_ages(telem)
+                self._latest_telem = telem
+                if self._sio:
+                    self._sio.emit('telemetry', telem)
+                return
 
             node_ids    = [i(data.get(f'N{j}'))        for j in range(4)]
             axis_errors = [i(data.get(f'E{j}'))        for j in range(4)]
