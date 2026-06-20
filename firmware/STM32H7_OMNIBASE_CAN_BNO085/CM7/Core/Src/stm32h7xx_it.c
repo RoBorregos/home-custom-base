@@ -163,6 +163,21 @@ void DebugMon_Handler(void)
 /******************************************************************************/
 
 /**
+  * @brief EXTI line 2 — hardware e-stop input (PE2).
+  *
+  * Trampolines into HAL_GPIO_EXTI_IRQHandler which clears the pending bit
+  * and calls HAL_GPIO_EXTI_Callback(ESTOP_PIN) defined in main.c.
+  */
+void EXTI2_IRQHandler(void)
+{
+  /* USER CODE BEGIN EXTI2_IRQn 0 */
+  /* USER CODE END EXTI2_IRQn 0 */
+  HAL_GPIO_EXTI_IRQHandler(GPIO_PIN_2);
+  /* USER CODE BEGIN EXTI2_IRQn 1 */
+  /* USER CODE END EXTI2_IRQn 1 */
+}
+
+/**
   * @brief This function handles FDCAN1 interrupt 0.
   */
 void FDCAN1_IT0_IRQHandler(void)

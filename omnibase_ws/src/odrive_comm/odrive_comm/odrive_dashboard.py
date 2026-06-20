@@ -165,7 +165,41 @@ TELEM_FIELDS = [
     'BT_active', 'BT_vx', 'BT_vy', 'BT_wz',
     # 95  ESP32 age, ms (-1 sentinel = no Type-3 message yet)
     'ESP32_age_ms',
+    # 96  Firmware SM state — distinguishes SM_IDLE (commanded) from
+    #     SM_ESTOP (hardware button held) which both leave axis_state=IDLE
+    #     0=BOOT, 1=STARTUP, 2=RUNNING, 3=IDLE, 4=ESTOP
+    'SM_state',
 ]
+
+# Pretty labels for telemetry pills / logs. Must match firmware ODriveSMState.
+SM_STATE_LABELS = {
+    0: 'BOOT',
+    1: 'STARTUP',
+    2: 'RUNNING',
+    3: 'IDLE',
+    4: 'ESTOP',
+}
+
+# Firmware error code descriptions — must match FERR_* defines in main.h
+FERR_DESCRIPTIONS = {
+    0x01: 'CAN TX timeout',
+    0x02: 'CAN bus-off recovered',
+    0x03: 'CAN RX read fail',
+    0x10: 'ODrive startup failed',
+    0x20: 'Arm timeout (all retries failed)',
+    0x21: 'Axis fell out of CLOSED_LOOP — auto-rearm issued',
+    0x30: 'ODrive axis fault (AXIS_Error non-zero)',
+    0x31: 'Command watchdog fired — no SET_VEL received',
+    0x32: 'Heartbeat timeout — axis stopped responding',
+    0x40: 'IMU sh2_open failed',
+    0x41: 'IMU setSensorCallback failed',
+    0x42: 'IMU setSensorConfig failed',
+    0x43: 'IMU reset detected — re-configuring',
+    0x50: 'BT queue full',
+    0x51: 'BT parse fail',
+    0x60: 'Stack watermark low',
+    0x61: 'Stack overflow detected',
+}
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  DASHBOARD HTML
@@ -185,7 +219,7 @@ class ODriveDashboardNode(Node):
         super().__init__('odrive_dashboard_node')
 
         self.declare_parameter('serial_port',         '/dev/ttyACM0')
-        self.declare_parameter('baud_rate',           921600)
+        self.declare_parameter('baud_rate',           230400)
         self.declare_parameter('use_stamped_cmd_vel', True)
         self.declare_parameter('tx_period',           0.1)
         self.declare_parameter('node_ids',            [33, 34, 35, 40])
@@ -601,6 +635,34 @@ class ODriveDashboardNode(Node):
 
     def _parse_and_publish(self, line: str):
         try:
+            # Firmware error event:  E=<code>,<axis>,<detail>
+            if line.startswith('E='):
+                parts = line[2:].split(',')
+                if len(parts) == 3:
+                    code, axis, detail = int(parts[0]), int(parts[1]), int(parts[2])
+                    desc = FERR_DESCRIPTIONS.get(code, f'Unknown error 0x{code:02X}')
+                    axis_s = 'sys' if axis == 255 else f'axis {axis}'
+                    msg = f'[FW ERR] {desc} ({axis_s}, detail={detail})'
+                    self.get_logger().warn(msg)
+                    if self._sio:
+                        self._sio.emit('firmware_error', {
+                            'code': code, 'axis': axis, 'detail': detail,
+                            'desc': desc, 'text': msg,
+                        })
+                return
+
+            # Lost-error counter:  ELOST=<n>
+            if line.startswith('ELOST='):
+                n = int(line[6:])
+                msg = f'[FW ERR] {n} firmware error(s) were lost (queue overflow)'
+                self.get_logger().error(msg)
+                if self._sio:
+                    self._sio.emit('firmware_error', {
+                        'code': 0xFF, 'axis': 255, 'detail': n,
+                        'desc': 'Errors lost', 'text': msg,
+                    })
+                return
+
             # Firmware emits the compact form `i=value` (see TELEM_FIELDS).
             # \w+ accepts the leading digit prefix too; we translate the
             # numeric keys back to legacy named keys so the body of this
@@ -872,6 +934,18 @@ class ODriveDashboardNode(Node):
             self.pub_states_str.publish(String(data="\n".join(lines)))
             self.pub_debug     .publish(String(data="\n".join(lines)))
 
+            # Firmware SM state — index 96 is the last field in both slim and
+            # fat frames. A truncated serial read drops it first. When absent,
+            # preserve the last known state so the dashboard pill doesn't
+            # momentarily flash UNKNOWN on the re-arm gap after ESTOP release.
+            sm_raw = data.get('SM_state')
+            if sm_raw is not None:
+                sm_state = int(sm_raw)
+                sm_label = SM_STATE_LABELS.get(sm_state, 'UNKNOWN')
+            else:
+                sm_state = self._latest_telem.get('sm_state')
+                sm_label = self._latest_telem.get('sm_state_label', 'UNKNOWN')
+
             telem = {
                 'cmd_vx': cmd_vx, 'cmd_vy': cmd_vy, 'cmd_wz': cmd_wz,
                 'imu_yaw': imu_y, 'imu_roll': imu_r, 'imu_pitch': imu_p,
@@ -888,6 +962,7 @@ class ODriveDashboardNode(Node):
                 'bus_voltage': vbus, 'bus_current': ibus,
                 'iq_setpoint': iq_set, 'iq_measured': iq_meas,
                 'bt_active': bt_active,
+                'sm_state': sm_state, 'sm_state_label': sm_label,
             }
             # Fold the current link ages into the dict so the per-packet
             # emit is consistent with what the 4 Hz timer would publish.
@@ -920,7 +995,8 @@ class ODriveDashboardNode(Node):
                     # Link ages start as "unknown" — the first periodic tick
                     # or first received line will overwrite these.
                     esp32_age_ms=None, esp32_status='UNKNOWN',
-                    pc_age_ms=None,    pc_status='UNKNOWN')
+                    pc_age_ms=None,    pc_status='UNKNOWN',
+                    sm_state=None,     sm_state_label='UNKNOWN')
 
     @staticmethod
     def _sf(v) -> float:

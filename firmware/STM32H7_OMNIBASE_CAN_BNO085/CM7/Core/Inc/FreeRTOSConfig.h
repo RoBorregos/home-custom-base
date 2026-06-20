@@ -166,7 +166,9 @@ standard names. */
  #define USE_CUSTOM_SYSTICK_HANDLER_IMPLEMENTATION 0
 
 /* USER CODE BEGIN Defines */
-/* Section where parameter definitions can be added (for instance, to override default ones in FreeRTOS.h) */
+/* Pattern-based stack overflow detection — calls vApplicationStackOverflowHook
+ * if the end of any task stack is found corrupted at context-switch time. */
+#define configCHECK_FOR_STACK_OVERFLOW  2
 /* USER CODE END Defines */
 
 #endif /* FREERTOS_CONFIG_H */

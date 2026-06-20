@@ -45,6 +45,12 @@ body{background:var(--bg);color:var(--txt);
 .pill{font-size:9px;font-weight:700;padding:2px 7px;border-radius:20px;background:var(--surf);color:var(--mut)}
 .pill.run{background:rgba(26,154,96,.12);color:var(--grn)}
 .pill.err{background:rgba(201,64,64,.12);color:var(--red)}
+/* Larger pill used for the top-bar SM-state indicator. Same colour palette
+ * as the per-axis pills, just typographically louder. */
+.pill.sm{font-size:11px;padding:3px 11px;letter-spacing:.5px}
+.pill.sm.boot,.pill.sm.startup{background:rgba(217,154,40,.18);color:var(--amb)}
+.pill.sm.estop{background:rgba(201,64,64,.18);color:var(--red);
+               box-shadow:0 0 0 1px rgba(201,64,64,.35) inset}
 
 /* metrics */
 .mr3{display:grid;grid-template-columns:repeat(3,1fr);gap:4px;margin-bottom:5px}
@@ -162,6 +168,13 @@ select:focus{outline:none;border-color:var(--acc)}
   <div style="display:flex;align-items:center;gap:14px">
     <div><span class="dot" id="dot"></span><span style="font-size:11px;color:var(--mut)" id="cl">Disconnected</span></div>
     <div style="font-size:10px;color:var(--mut)">ROS: <span id="rs" style="color:var(--amb)">waiting</span></div>
+    <!-- Firmware state-machine indicator. Distinguishes SM_IDLE (commanded
+         stop) from SM_ESTOP (hardware button held) — both leave per-axis
+         state=IDLE so the per-axis pills cannot tell them apart. -->
+    <div style="display:flex;align-items:center;gap:5px">
+      <span style="font-size:10px;color:var(--mut)">SM:</span>
+      <span id="smst" class="pill sm">UNKNOWN</span>
+    </div>
   </div>
 </div>
 
@@ -301,6 +314,9 @@ select:focus{outline:none;border-color:var(--acc)}
 
       <div class="ct">Activity log</div>
       <div class="log" id="log"></div>
+
+      <div class="ct" style="margin-top:8px">Firmware errors</div>
+      <div class="log" id="fw-err-log" style="max-height:120px;border-left:3px solid var(--red)"></div>
     </div>
 
   </div><!-- .cfgrow -->
@@ -634,6 +650,25 @@ function updateLink(prefix, ageMs, status){
   applyLinkPill(g('lnk'+prefix+'p'), status||'UNKNOWN');
 }
 
+// Map the firmware ODriveSMState enum to a colour-class on the SM pill.
+// Labels are computed Python-side and arrive in d.sm_state_label, but the
+// CSS classes need a hook from the numeric state so we don't have to keep
+// the colour palette in two places.
+function updateSmStatePill(label, num){
+  const el = g('smst');
+  if(!el) return;
+  el.textContent = label || 'UNKNOWN';
+  el.classList.remove('run','err','boot','startup','idle','estop');
+  switch(num){
+    case 0: el.classList.add('boot');    break;
+    case 1: el.classList.add('startup'); break;
+    case 2: el.classList.add('run');     break;
+    case 3: el.classList.add('idle');    break;  // muted default
+    case 4: el.classList.add('estop');   break;
+    default: /* UNKNOWN — keep the muted default */
+  }
+}
+
 // telemetry
 socket.on('telemetry',(d)=>{
   g('rs').textContent='live'; g('rs').style.color='var(--grn)';
@@ -643,6 +678,7 @@ socket.on('telemetry',(d)=>{
   // when the STM32 has gone silent.
   updateLink('esp', d.esp32_age_ms, d.esp32_status);
   updateLink('pc',  d.pc_age_ms,    d.pc_status);
+  updateSmStatePill(d.sm_state_label, d.sm_state);
   g('cvx').textContent=d.cmd_vx.toFixed(3);
   g('cvy').textContent=d.cmd_vy.toFixed(3);
   g('cwz').textContent=d.cmd_wz.toFixed(3);
@@ -681,6 +717,15 @@ socket.on('telemetry',(d)=>{
 });
 
 socket.on('log',(m)=>appendLog(m.text,m.level||'i'));
+
+socket.on('firmware_error',(m)=>{
+  const now=new Date().toLocaleTimeString('en-GB',{hour12:false});
+  const log=g('fw-err-log');
+  const axisStr = m.axis===255 ? 'sys' : 'ax'+m.axis;
+  log.insertAdjacentHTML('beforeend',
+    `<div class="e">[${now}] 0x${m.code.toString(16).padStart(2,'0')} ${axisStr} d=${m.detail}: ${m.desc}</div>`);
+  log.scrollTop=log.scrollHeight;
+});
 function appendLog(t,lv){
   const now=new Date().toLocaleTimeString('en-GB',{hour12:false});
   const log=g('log');

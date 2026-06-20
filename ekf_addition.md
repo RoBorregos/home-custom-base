@@ -380,9 +380,10 @@ Multiples-of-115 200 bandwidth budget for these rates (10-bit framing):
 | 460 800 | 46 080 B/s | 44 % | sustainable, comfortable |
 | 921 600 | 92 160 B/s | 22 % | luxurious |
 
-Firmware ships at **921 600** for headroom; **460 800** is the floor for
-50 Hz slim with the kind of margin you want on a USB-CDC link that's also
-carrying control inputs in the opposite direction.
+Firmware currently runs at **230 400** (set in `MX_USART3_UART_Init`). At
+89 % utilisation there is no burst headroom — if you add fields or raise
+slim cadence, bump to **460 800** first. **921 600** is the comfortable
+ceiling for a short USB-CDC cable.
 
 ### Slim/fat detection on the host
 

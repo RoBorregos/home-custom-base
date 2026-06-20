@@ -72,11 +72,20 @@
    FDCAN switches to INTERNAL_LOOPBACK: TX completes without external ACK so
    nothing blocks.  The state machine and BT/UART paths work normally.
    Set to 0 for real hardware with ODrives connected. */
-#define CAN_STUB 0
+#define CAN_STUB 1
 
 /* Set to 1 when the BNO055 IMU is physically connected on I2C1.
-   Set to 0 to skip I2C1 init and all bno055 calls (euler stays {0,0,0}). */
-#define IMU_ENABLED 1
+   Set to 0 to skip I2C1 init and all bno085 calls (euler stays {0,0,0}). */
+#define IMU_ENABLED 0
+
+/* Set to 1 to inject a synthetic constant body-frame velocity into the EKF
+   instead of computing it from ODrive feedback.  Combined with CAN_STUB=1 and
+   IMU_ENABLED=0 this lets the full predict+correct pipeline run on a bare
+   STM32 with nothing connected.  EKF_STUB_VX/VY/WZ are in m/s and rad/s. */
+#define EKF_STUB    1
+#define EKF_STUB_VX  0.1   /* forward at 0.1 m/s */
+#define EKF_STUB_VY  0.0
+#define EKF_STUB_WZ  0.0
 
 /* USER CODE END PD */
 
@@ -89,7 +98,7 @@
     uint32_t _t0 = osKernelGetTickCount(); \
     while (HAL_FDCAN_GetTxFifoFreeLevel(&hfdcan1) == 0) { \
         if ((osKernelGetTickCount() - _t0) > 50u) { \
-            printf("CAN TX timeout\r\n"); break; \
+            FirmwareError_Push(FERR_CAN_TX_TIMEOUT, FERR_NO_AXIS, 0); break; \
         } \
         osDelay(1); \
     } \
@@ -219,6 +228,23 @@ volatile float g_bno085_az = 0.0f;
  * overflow is harmless: the EKF only checks for inequality, not ordering. */
 volatile uint32_t g_bno085_seq = 0;
 
+/* Hardware e-stop debounce — sample-after-delay approach.
+ *
+ * Any edge on ESTOP_PIN (rising or falling) sets g_estop_sample_pending and
+ * records the tick. The ODrive task waits ESTOP_DEBOUNCE_MS then reads the
+ * actual pin level and acts on that — no edge counting, no separate press/
+ * release flags. This is immune to contact bounce on both press and release
+ * because 250 ms is far beyond any mechanical settle time (~5–20 ms).
+ *
+ * If another edge arrives before the 250 ms window expires, the tick is
+ * refreshed and the window restarts — so rapid toggles don't leave stale
+ * state. */
+#define ESTOP_DEBOUNCE_MS      90u
+#define ESTOP_RELEASE_HOLD_MS  150u  /* button must be released this long before re-arming */
+volatile uint8_t  g_estop_sample_pending = 0;
+volatile uint32_t g_estop_sample_tick    = 0;
+volatile uint8_t  g_estop_active         = 0;
+
 /* IMU trust flag for the EKF — set to 0 to drop the BNO085 corrections at run
  * time (the filter then runs as a wheel-only kinematic EKF, behaviour close to
  * the old dead-reckoning but with proper covariance). Default: trust the IMU. */
@@ -267,6 +293,12 @@ const osMessageQueueAttr_t URX_2_CAN_Queue_attributes = {
   .name = "URX_2_CAN_Queue"
 };
 
+/* Firmware error queue — depth 16, drained by TX task, written by any task. */
+osMessageQueueId_t ERR_QueueHandle;
+static const osMessageQueueAttr_t ERR_Queue_attributes = { .name = "ERR_Queue" };
+volatile uint8_t g_errors_lost = 0;           /* lost-error counter (non-atomic, diagnostic only) */
+volatile uint8_t g_stack_overflow_detected = 0; /* set by vApplicationStackOverflowHook */
+
 FDCAN_FilterTypeDef sFilterConfig;
 FDCAN_TxHeaderTypeDef TxHeader;
 FDCAN_RxHeaderTypeDef RxHeader;
@@ -282,6 +314,7 @@ Axis odrives[ODRIVE_COUNT] = {0};
 void SystemClock_Config(void);
 void PeriphCommonClock_Config(void);
 static void MX_GPIO_Init(void);
+static void MX_GPIO_Estop_Init(void);
 static void MX_USART3_UART_Init(void);
 static void MX_TIM1_Init(void);
 static void MX_TIM2_Init(void);
@@ -308,7 +341,7 @@ void start_BT_RX_Task(void *argument);  /* ESP32 Bluetooth UART receiver */
 void StartIMUTask(void *argument);      /* BNO085 SH2 service loop        */
 
 /* USER CODE BEGIN PFP */
-
+static void FirmwareError_Push(uint8_t code, uint8_t axis, uint8_t detail);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -446,6 +479,7 @@ Error_Handler();
   /* USER CODE END SysInit */
 
   MX_GPIO_Init();
+  MX_GPIO_Estop_Init();   /* hardware e-stop input on PE2 — see ESTOP_PIN in main.h */
   MX_USART3_UART_Init();
   MX_TIM1_Init();
   MX_TIM2_Init();
@@ -536,18 +570,10 @@ Error_Handler();
   /* USER CODE END RTOS_TIMERS */
 
   /* USER CODE BEGIN RTOS_QUEUES */
-  UART_QueueHandle     = osMessageQueueNew(3, sizeof(ODriveCmdMsg),      &UART_Queue_attributes);
-  CAN_2_UTX_QueueHandle = osMessageQueueNew(3, sizeof(ODriveTelemetryMsg), &CAN_2_UTX_Queue_attributes);
-  URX_2_CAN_QueueHandle = osMessageQueueNew(3, sizeof(ODriveCmdMsg),      &URX_2_CAN_Queue_attributes);
-
-  printf("UART_QueueHandle    = %p\r\n", UART_QueueHandle);
-  printf("CAN_2_UTX_QueueHandle = %p\r\n", CAN_2_UTX_QueueHandle);
-  printf("URX_2_CAN_QueueHandle = %p\r\n", URX_2_CAN_QueueHandle);
-
-  if (UART_QueueHandle == NULL)     printf("UART_QueueHandle creation failed\r\n");
-  if (CAN_2_UTX_QueueHandle == NULL) printf("CAN_2_UTX_QueueHandle creation failed\r\n");
-  if (URX_2_CAN_QueueHandle == NULL) printf("URX_2_CAN_QueueHandle creation failed\r\n");
-
+  UART_QueueHandle      = osMessageQueueNew(3,  sizeof(ODriveCmdMsg),      &UART_Queue_attributes);
+  CAN_2_UTX_QueueHandle = osMessageQueueNew(3,  sizeof(ODriveTelemetryMsg), &CAN_2_UTX_Queue_attributes);
+  URX_2_CAN_QueueHandle = osMessageQueueNew(3,  sizeof(ODriveCmdMsg),      &URX_2_CAN_Queue_attributes);
+  ERR_QueueHandle       = osMessageQueueNew(16, sizeof(FirmwareError),     &ERR_Queue_attributes);
   /* USER CODE END RTOS_QUEUES */
 
   /* creation of UART_RX_Task */
@@ -1135,6 +1161,55 @@ static void MX_GPIO_Init(void)
   (void)GPIO_InitStruct;
 }
 
+/**
+  * @brief Init the hardware e-stop input pin (PE2) and its EXTI line.
+  *
+  * Internal pull-up + rising/falling edge trigger. ISR priority 5 is at
+  * the FreeRTOS configMAX_SYSCALL_INTERRUPT_PRIORITY boundary; safe even
+  * if a future change makes the ISR call *FromISR APIs. Today the ISR
+  * only writes volatile flags so even priority 0 would be technically OK.
+  */
+static void MX_GPIO_Estop_Init(void)
+{
+  __HAL_RCC_GPIOE_CLK_ENABLE();      /* idempotent — MX_GPIO_Init already did it */
+
+  GPIO_InitTypeDef gi = {0};
+
+  /* PE2 — ESTOP input, NC button to GND, internal pull-up, both edges. */
+  gi.Pin   = ESTOP_PIN;
+  gi.Mode  = GPIO_MODE_IT_RISING_FALLING;
+  gi.Pull  = GPIO_PULLUP;
+  gi.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(ESTOP_PORT, &gi);
+
+  /* PE0 — ESTOP LED output, push-pull, starts LOW (off). */
+  gi.Pin   = ESTOP_LED_PIN;
+  gi.Mode  = GPIO_MODE_OUTPUT_PP;
+  gi.Pull  = GPIO_NOPULL;
+  gi.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(ESTOP_LED_PORT, &gi);
+  HAL_GPIO_WritePin(ESTOP_LED_PORT, ESTOP_LED_PIN, GPIO_PIN_RESET);
+
+  HAL_NVIC_SetPriority(ESTOP_EXTI_IRQn, 5, 0);
+  HAL_NVIC_EnableIRQ(ESTOP_EXTI_IRQn);
+}
+
+/**
+  * @brief HAL EXTI callback — any edge on ESTOP_PIN starts the debounce window.
+  *
+  * Does NOT decide press vs. release here. Simply records that something
+  * changed and when. ODriveTask samples the pin after ESTOP_DEBOUNCE_MS and
+  * acts on the actual level — immune to contact bounce on both edges.
+  * If another edge arrives before the window expires the tick is refreshed.
+  */
+void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
+{
+  if (GPIO_Pin == ESTOP_PIN) {
+    g_estop_sample_tick    = HAL_GetTick();
+    g_estop_sample_pending = 1;
+  }
+}
+
 /* USER CODE BEGIN 4 */
 
 static Axis* Find_ODrive_By_NodeID(uint8_t node_id)
@@ -1146,6 +1221,10 @@ static Axis* Find_ODrive_By_NodeID(uint8_t node_id)
     }
     return NULL;
 }
+
+/* Set by HAL_FDCAN_ErrorStatusCallback (bit 0 = bus-off) or RxFifo0Callback
+ * (bit 1 = RX read fail). Cleared in task context by FDCAN_RecoverIfBusOff(). */
+volatile uint8_t g_can_busoff = 0;
 
 void HAL_FDCAN_RxFifo0Callback(FDCAN_HandleTypeDef *hfdcan, uint32_t RxFifo0ITs)
 {
@@ -1160,8 +1239,10 @@ void HAL_FDCAN_RxFifo0Callback(FDCAN_HandleTypeDef *hfdcan, uint32_t RxFifo0ITs)
          * (so axis state/heartbeat appear stale and odometry freezes). */
         while (HAL_FDCAN_GetRxFifoFillLevel(hfdcan, FDCAN_RX_FIFO0) > 0)
         {
-            if (HAL_FDCAN_GetRxMessage(hfdcan, FDCAN_RX_FIFO0, &RxHeader, RxData) != HAL_OK)
+            if (HAL_FDCAN_GetRxMessage(hfdcan, FDCAN_RX_FIFO0, &RxHeader, RxData) != HAL_OK) {
+                g_can_busoff |= 0x02;   /* low bit = bus-off, bit1 = RX read fail; checked in task context */
                 break;
+            }
             uint8_t node_id = (uint8_t)(RxHeader.Identifier >> 5);
             Axis *target_axis = Find_ODrive_By_NodeID(node_id);
             if (target_axis != NULL)
@@ -1170,16 +1251,11 @@ void HAL_FDCAN_RxFifo0Callback(FDCAN_HandleTypeDef *hfdcan, uint32_t RxFifo0ITs)
     }
 }
 
-/* Set ONLY by HAL_FDCAN_ErrorStatusCallback on a genuine bus-off IRQ (a TX-FIFO
- * timeout is NOT bus-off and must not set this). The control task inspects it
- * (together with PSR.BO) and restarts the peripheral in task context. */
-volatile uint8_t g_can_busoff = 0;
-
 void HAL_FDCAN_ErrorStatusCallback(FDCAN_HandleTypeDef *hfdcan, uint32_t ErrorStatusITs)
 {
     (void)hfdcan;
     if ((ErrorStatusITs & FDCAN_IT_BUS_OFF) != 0U)
-        g_can_busoff = 1;   /* defer the heavy restart to task context */
+        g_can_busoff |= 0x01;  /* bit0=bus-off, bit1=RX-read-fail; cleared in task context */
 }
 
 /* If FDCAN is bus-off, restart it. STM32H7 FDCAN sets CCCR.INIT itself on
@@ -1188,20 +1264,44 @@ void HAL_FDCAN_ErrorStatusCallback(FDCAN_HandleTypeDef *hfdcan, uint32_t ErrorSt
  * Returns 1 if a recovery was performed. Safe to call every control loop. */
 uint8_t FDCAN_RecoverIfBusOff(void)
 {
+    /* Check and clear the RX-read-fail flag set by the ISR (bit 1). */
+    if (g_can_busoff & 0x02) {
+        g_can_busoff &= ~0x02;
+        FirmwareError_Push(FERR_CAN_RX_FAIL, FERR_NO_AXIS, 0);
+    }
+
     FDCAN_ProtocolStatusTypeDef ps = {0};
     HAL_FDCAN_GetProtocolStatus(&hfdcan1, &ps);
-    if (g_can_busoff || ps.BusOff)
+    if (g_can_busoff & 0x01 || ps.BusOff)
     {
-        printf("FDCAN BUS-OFF detected -- restarting peripheral\r\n");
         HAL_FDCAN_Stop(&hfdcan1);
-        if (HAL_FDCAN_Start(&hfdcan1) != HAL_OK)
-            printf("FDCAN restart FAILED\r\n");
+        HAL_FDCAN_Start(&hfdcan1);
         HAL_FDCAN_ActivateNotification(&hfdcan1, FDCAN_IT_RX_FIFO0_NEW_MESSAGE, 0);
         HAL_FDCAN_ActivateNotification(&hfdcan1, FDCAN_IT_BUS_OFF, 0);
-        g_can_busoff = 0;
+        g_can_busoff &= ~0x01;
+        FirmwareError_Push(FERR_CAN_BUSOFF, FERR_NO_AXIS, 0);
         return 1;
     }
     return 0;
+}
+
+/* Push one FirmwareError into the error queue. If full, increment lost counter. */
+static void FirmwareError_Push(uint8_t code, uint8_t axis, uint8_t detail)
+{
+    FirmwareError err = {code, axis, detail};
+    if (osMessageQueuePut(ERR_QueueHandle, &err, 0, 0) != osOK)
+        g_errors_lost++;
+}
+
+/* Stack overflow hook — called at context-switch if a task's stack guard pattern
+ * is corrupted. Cannot use any FreeRTOS API here; drive the ESTOP LED directly
+ * as a visual indicator and record the flag for TX task reporting if it survives. */
+void vApplicationStackOverflowHook(TaskHandle_t xTask, char *pcTaskName)
+{
+    (void)xTask; (void)pcTaskName;
+    g_stack_overflow_detected = 1;
+    HAL_GPIO_WritePin(ESTOP_LED_PORT, ESTOP_LED_PIN, GPIO_PIN_SET);
+    for (;;);   /* system is corrupted — halt */
 }
 
 /* USER CODE END 4 */
@@ -1211,51 +1311,7 @@ uint8_t FDCAN_RecoverIfBusOff(void)
 void StartDefaultTask(void *argument)
 {
   /* USER CODE BEGIN 5 */
-    odrives[0].NODE_ID = 33;
-    odrives[1].NODE_ID = 34;
-    odrives[2].NODE_ID = 35;
-    odrives[3].NODE_ID = 36;
-
-    printf("\nODrive CAN TEST\r\n");
-
-    FDCAN_TXmsg tx = {0};
-    TxHeader.ErrorStateIndicator = FDCAN_ESI_ACTIVE;
-    TxHeader.BitRateSwitch       = FDCAN_BRS_OFF;
-    TxHeader.FDFormat            = FDCAN_CLASSIC_CAN;
-    TxHeader.TxEventFifoControl  = FDCAN_NO_TX_EVENTS;
-    TxHeader.MessageMarker       = 0;
-
-    HAL_StatusTypeDef st;
-    for (int i = 0; i < ODRIVE_COUNT; i++) {
-        FDCAN_WAIT_TX_FREE();
-        st = Set_Axis_Requested_State(&odrives[i], &tx, 8);
-        if (st != HAL_OK) printf("state fail %d \n\r", i);
-        else              printf("state succ %d \n\r", i);
-    }
-    osDelay(100);
-
-    for(;;)
-    {
-        float vels[4] = {0.5f, 1.2f, 1.0f, 1.25f};
-        for (int i = 0; i < 4; i++) {
-            FDCAN_WAIT_TX_FREE();
-            st = Set_Input_Vel(&odrives[i], &tx, vels[i], 0.0f);
-            if (st != HAL_OK)
-                printf("Velocity set fail [%d], err=0x%08lX\r\n", i, hfdcan1.ErrorCode);
-        }
-        for (int i = 0; i < ODRIVE_COUNT; i++) {
-            if (odrives[i].UPDATED) {
-                odrives[i].UPDATED = 0;
-                printf("ODrive Node %u | Err=%lu | State=%u | Ctrl=%u | Pos=%.3f | Vel=%.3f | Shadow=%ld | CPR=%ld | Vbus=%.3f | Ibus=%.3f | IqSet=%.3f | IqMeas=%.3f\r\n",
-                       odrives[i].NODE_ID, odrives[i].AXIS_Error, odrives[i].AXIS_Current_State,
-                       odrives[i].Controller_Status, odrives[i].AXIS_Encoder_Pos, odrives[i].AXIS_Encoder_Vel,
-                       odrives[i].AXIS_Encoder_Shadow, odrives[i].AXIS_Encoder_CPR,
-                       odrives[i].AXIS_Bus_Voltage, odrives[i].AXIS_Bus_Current,
-                       odrives[i].AXIS_Iq_Setpoint, odrives[i].AXIS_Iq_Measured);
-            }
-        }
-        osDelay(100);
-    }
+    for (;;) osDelay(1000);   /* dead legacy task — kept to avoid CubeMX regen conflicts */
   /* USER CODE END 5 */
 }
 
@@ -1347,7 +1403,6 @@ void start_UART_RX_Task(void *argument)
             } else {
                 line_index = 0;
                 memset(line_buf, 0, sizeof(line_buf));
-                printf("Line buffer overflowed and reset.\r\n");
             }
         }
         osDelay(5);
@@ -1380,7 +1435,6 @@ void start_BT_RX_Task(void *argument)
     uint32_t BT_WATCHDOG_MS = 1000;
 
     HAL_UART_Receive_IT(&huart2, &rx_char2, 1);
-    printf("BT_RX_Task started — waiting for USART2 data\r\n");
 
     for (;;) {
         uint8_t got_any = 0;
@@ -1429,7 +1483,6 @@ void start_BT_RX_Task(void *argument)
                             if (controll_state != BT_active) {
                                 uint8_t prev = BT_active;
                                 BT_active = controll_state;
-                                printf("BT: state %u->%u\r\n", prev, BT_active);
 
                                 /*
                                  * Transitioning OUT of Active: send one stop command so
@@ -1448,7 +1501,7 @@ void start_BT_RX_Task(void *argument)
                                     qst = osMessageQueuePut(URX_2_CAN_QueueHandle,
                                                             &stop_cmd, 0, 0);
                                     if (qst != osOK)
-                                        printf("BT: failed to queue stop cmd\r\n");
+                                        FirmwareError_Push(FERR_BT_QUEUE_FULL, FERR_NO_AXIS, 0);
                                 }
                             }
 
@@ -1476,12 +1529,10 @@ void start_BT_RX_Task(void *argument)
 
                             qst = osMessageQueuePut(URX_2_CAN_QueueHandle, &bt_cmd, 0, 0);
                             if (qst != osOK)
-                                printf("BT: failed to queue cmd\r\n");
+                                FirmwareError_Push(FERR_BT_QUEUE_FULL, FERR_NO_AXIS, 1);
                         } else {
-                            printf("BT: parse fail: \"%s\"\r\n", line_buf2);
+                            FirmwareError_Push(FERR_BT_PARSE_FAIL, FERR_NO_AXIS, 0);
                         }
-                    } else {
-                        printf("BT: unexpected type %d in \"%s\"\r\n", msg_type, line_buf2);
                     }
                 }
                 line_index2 = 0;
@@ -1491,7 +1542,7 @@ void start_BT_RX_Task(void *argument)
             } else {
                 line_index2 = 0;
                 memset(line_buf2, 0, sizeof(line_buf2));
-                printf("BT: line buffer overflow\r\n");
+                FirmwareError_Push(FERR_BT_QUEUE_FULL, FERR_NO_AXIS, 2);
             }
         }
 
@@ -1592,6 +1643,12 @@ void Start_UART_TX_Task(void *argument)
          *      93   BT_vy            BT commanded body-y velocity  [m/s]
          *      94   BT_wz            BT commanded yaw rate         [rad/s]
          *      95   ESP32_age_ms     ms since last valid ESP32 msg [ms]
+         *      96   SM_state         firmware state machine        [enum]
+         *                              0 = SM_BOOT      (waiting to arm)
+         *                              1 = SM_STARTUP   (arming axes)
+         *                              2 = SM_RUNNING   (normal operation)
+         *                              3 = SM_IDLE      (commanded stop)
+         *                              4 = SM_ESTOP     (hardware button held)
          * ──────────────────────────────────────────────────────────────── */
 
         /* SLIM line — sent every cycle. ~225 chars at ~50 Hz ≈ 11 kB/s. */
@@ -1601,7 +1658,8 @@ void Start_UART_TX_Task(void *argument)
                "28=%.3f,29=%.3f,30=%.3f,"
                "31=%.3f,32=%.3f,"
                "33=%.5f,34=%.5f,35=%.5f,"
-               "36=%.5f,37=%.5f,38=%.5f\r\n",
+               "36=%.5f,37=%.5f,38=%.5f,"
+               "96=%u\r\n",
                telemetryMsg.imu.yaw, telemetryMsg.imu.wz,
                telemetryMsg.odom.phi, telemetryMsg.odom.x_pos, telemetryMsg.odom.y_pos,
                telemetryMsg.odom.z_pos,
@@ -1614,7 +1672,8 @@ void Start_UART_TX_Task(void *argument)
                telemetryMsg.odom.pose_covariance[5 * 6 + 5],
                telemetryMsg.odom.twist_covariance[0 * 6 + 0],
                telemetryMsg.odom.twist_covariance[1 * 6 + 1],
-               telemetryMsg.odom.twist_covariance[5 * 6 + 5]);
+               telemetryMsg.odom.twist_covariance[5 * 6 + 5],
+               telemetryMsg.sm_state);
 
         /* FAT line — every 5th slim cycle. ~990 chars at ~10 Hz ≈ 10 kB/s. */
         if (++tx_count % 5 == 0)
@@ -1635,7 +1694,7 @@ void Start_UART_TX_Task(void *argument)
                "65=%u,66=%lu,67=%u,68=%u,69=%.3f,70=%.3f,71=%ld,72=%ld,73=%.3f,74=%.3f,75=%.3f,76=%.3f,77=%u,"
                "78=%u,79=%lu,80=%u,81=%u,82=%.3f,83=%.3f,84=%ld,85=%ld,86=%.3f,87=%.3f,88=%.3f,89=%.3f,90=%u,"
                "91=%u,92=%.3f,93=%.3f,94=%.3f,"
-               "95=%ld\r\n",
+               "95=%ld,96=%u\r\n",
                last_cmd.robot_twist[0], last_cmd.robot_twist[1], last_cmd.robot_twist[2],
                telemetryMsg.imu.yaw, telemetryMsg.imu.roll, telemetryMsg.imu.pitch,
                telemetryMsg.imu.qx, telemetryMsg.imu.qy, telemetryMsg.imu.qz, telemetryMsg.imu.qw,
@@ -1668,7 +1727,44 @@ void Start_UART_TX_Task(void *argument)
                telemetryMsg.pos_est[3], telemetryMsg.vel_est[3], telemetryMsg.encoder_shadow[3], telemetryMsg.encoder_cpr[3],
                telemetryMsg.bus_voltage[3], telemetryMsg.bus_current[3], telemetryMsg.iq_setpoint[3], telemetryMsg.iq_measured[3], telemetryMsg.updated[3],
                telemetryMsg.bt_active, telemetryMsg.bt_vx, telemetryMsg.bt_vy, telemetryMsg.bt_wz,
-               esp32_age_ms);
+               esp32_age_ms,
+               telemetryMsg.sm_state);
+
+        /* Drain the firmware error queue — emit each entry before the next
+         * telemetry line so host can correlate errors with the preceding state. */
+        {
+            FirmwareError ferr;
+            while (osMessageQueueGet(ERR_QueueHandle, &ferr, NULL, 0) == osOK)
+                printf("E=%u,%u,%u\r\n", ferr.code, ferr.axis, ferr.detail);
+
+            if (g_errors_lost > 0) {
+                uint8_t lost = g_errors_lost;
+                g_errors_lost = 0;
+                printf("ELOST=%u\r\n", lost);
+            }
+        }
+
+        /* Periodic stack watermark check (~5 s interval at 20 ms/cycle).
+         * Pushes FERR_STACK_LOW with axis = task index, detail = remaining words. */
+        {
+            static uint16_t wm_ctr = 0;
+            if (++wm_ctr >= 250) {
+                wm_ctr = 0;
+                struct { osThreadId_t h; uint8_t idx; } tasks[] = {
+                    {ODriveTaskHandle,  0},
+                    {UART_TX_TaskHandle,1},
+                    {IMU_TaskHandle,    2},
+                    {BT_RX_TaskHandle,  3},
+                    {UART_RX_TaskHandle,4},
+                };
+                for (uint8_t t = 0; t < 5; t++) {
+                    if (tasks[t].h == NULL) continue;
+                    UBaseType_t wm = uxTaskGetStackHighWaterMark(tasks[t].h);
+                    if (wm < 128)
+                        FirmwareError_Push(FERR_STACK_LOW, tasks[t].idx, (uint8_t)(wm > 255 ? 255 : wm));
+                }
+            }
+        }
 
         osDelay(10);
     }
@@ -1772,13 +1868,13 @@ static void imu_service_ms(uint32_t ms)
 
 static void imu_enable_report(sh2_SensorId_t sensor_id, const char *name)
 {
+    (void)name;
     sh2_SensorConfig_t cfg;
     __builtin_memset(&cfg, 0, sizeof(cfg));
     cfg.reportInterval_us = BNO085_REPORT_INTERVAL_US;
     int rc = sh2_setSensorConfig(sensor_id, &cfg);
-    if (rc != SH2_OK) {
-        printf("BNO085: setSensorConfig(%s) failed rc=%d\r\n", name, rc);
-    }
+    if (rc != SH2_OK)
+        FirmwareError_Push(FERR_IMU_REPORT_CFG, FERR_NO_AXIS, (uint8_t)(rc & 0xFF));
 }
 
 static void imu_enable_all_reports(void)
@@ -1792,16 +1888,15 @@ static void imu_enable_all_reports(void)
 
 void StartIMUTask(void *argument)
 {
-
-    /* Wait for other AboveNormal tasks (ODriveTask) to finish their startup
-     * prints before we call printf — huart3 has no TX mutex and HAL_UART_Transmit
-     * returns HAL_BUSY silently when preempted mid-print at the same priority. */
+#if !IMU_ENABLED
+    /* IMU disabled at compile time — skip all SH2/I2C initialisation. */
+    for (;;) osDelay(1000);
+#else
     osDelay(500);
-    printf("IMU_Task: starting BNO085 init\r\n");
 
     int rc = sh2_open(BNO085_GetHal(), imu_async_event_cb, NULL);
     if (rc != SH2_OK) {
-        printf("IMU_Task: sh2_open failed rc=%d — halting\r\n", rc);
+        FirmwareError_Push(FERR_IMU_OPEN, FERR_NO_AXIS, (uint8_t)(rc & 0xFF));
         for (;;) osDelay(1000);
     }
 
@@ -1809,9 +1904,8 @@ void StartIMUTask(void *argument)
     imu_service_ms(200);
 
     rc = sh2_setSensorCallback(imu_sensor_data_cb, NULL);
-    if (rc != SH2_OK) {
-        printf("IMU_Task: setSensorCallback failed rc=%d\r\n", rc);
-    }
+    if (rc != SH2_OK)
+        FirmwareError_Push(FERR_IMU_SET_CALLBACK, FERR_NO_AXIS, (uint8_t)(rc & 0xFF));
 
     /* Give SH2 time to process control/startup packets before config */
     imu_service_ms(100);
@@ -1821,15 +1915,13 @@ void StartIMUTask(void *argument)
     /* Clear any spurious reset flag that arrived during sh2_open startup */
     g_bno085_sensor_ready = 0;
 
-    printf("IMU_Task: BNO085 running at 50 Hz\r\n");
-
     for (;;) {
         sh2_service();
 
         /* If the sensor reset (e.g. power glitch), re-enable the rotation vector */
         if (g_bno085_sensor_ready) {
             g_bno085_sensor_ready = 0;
-            printf("IMU_Task: BNO085 reset detected — re-configuring\r\n");
+            FirmwareError_Push(FERR_IMU_RESET, FERR_NO_AXIS, 0);
             imu_service_ms(200);
             imu_enable_all_reports();
         }
@@ -1839,9 +1931,19 @@ void StartIMUTask(void *argument)
          * hammering the I2C bus (I2C only transacts when INT is LOW). */
         osDelay(2);
     }
+#endif /* IMU_ENABLED */
 }
 
 /* USER CODE BEGIN Header_StartODriveTask */
+
+/* Tuned velocity-loop gains pushed into every ODrive at bring-up so the live
+ * runtime values match the snapshots in odrive_config_dump/odrive_node*.json.
+ * The ODrives have NOT been save_configuration()'d with these values, so the
+ * STM32 re-applies them on each boot via the SET_VEL_GAINS CAN frame — the
+ * write is RAM-only on the ODrive side. Update both this define and every
+ * odrive_node*.json in lock-step if the tuned values change. */
+#define ODRIVE_STARTUP_VEL_GAIN     0.3333f
+#define ODRIVE_STARTUP_VEL_INT_GAIN 0.706f
 
 HAL_StatusTypeDef ODrive_Startup(Axis odrives[], uint8_t num_odrives, FDCAN_TXmsg *msg,
                                   Control_Mode control_mode, Input_Mode input_mode,
@@ -1852,15 +1954,23 @@ HAL_StatusTypeDef ODrive_Startup(Axis odrives[], uint8_t num_odrives, FDCAN_TXms
     {
         FDCAN_WAIT_TX_FREE();
         st = Clear_Errors(&odrives[i], msg);
-        if (st != HAL_OK) { printf("ODrive startup failed: axis %u Clear_Errors\r\n", i); return st; }
+        if (st != HAL_OK) return st;
 
         FDCAN_WAIT_TX_FREE();
         st = Set_Controller_Modes(&odrives[i], msg, control_mode, input_mode);
-        if (st != HAL_OK) { printf("ODrive startup failed: axis %u Set_Controller_Modes\r\n", i); return st; }
+        if (st != HAL_OK) return st;
+
+        /* Push the project-tuned velocity-loop gains BEFORE arming, so the
+         * controller uses them on its very first SET_INPUT_VEL frame.
+         * SET_VEL_GAINS doesn't reset axis state — safe to issue anytime. */
+        FDCAN_WAIT_TX_FREE();
+        st = Set_Vel_Gains(&odrives[i], msg,
+                           ODRIVE_STARTUP_VEL_GAIN, ODRIVE_STARTUP_VEL_INT_GAIN);
+        if (st != HAL_OK) return st;
 
         FDCAN_WAIT_TX_FREE();
         st = Set_Axis_Requested_State(&odrives[i], msg, requested_state);
-        if (st != HAL_OK) { printf("ODrive startup failed: axis %u Set_Axis_Requested_State\r\n", i); return st; }
+        if (st != HAL_OK) return st;
     }
     return HAL_OK;
 }
@@ -1869,11 +1979,22 @@ HAL_StatusTypeDef ODrive_Startup(Axis odrives[], uint8_t num_odrives, FDCAN_TXms
  * CLOSED_LOOP_CONTROL) and waits for the HEARTBEAT to confirm the axis actually
  * reached CLOSED_LOOP_CONTROL — instead of trusting that a queued CAN frame took
  * effect. Returns 1 on confirmed arm, 0 if it never confirmed within `attempts`.
- * The ~10 Hz heartbeat keeps axis->AXIS_Current_State fresh via ODrive_RX_CallBack. */
+ * The ~10 Hz heartbeat keeps axis->AXIS_Current_State fresh via ODrive_RX_CallBack.
+ *
+ * CAN_STUB=1: loopback does not fake heartbeat responses, so AXIS_Current_State
+ * never updates. Skip the confirmation loop and return success immediately so
+ * the state machine transitions normally during bench testing. */
 static uint8_t ODrive_ArmAxisConfirmed(Axis *axis, FDCAN_TXmsg *msg,
                                        Control_Mode ctrl, Input_Mode in_mode,
                                        uint8_t attempts)
 {
+#if CAN_STUB
+    (void)attempts;
+    FDCAN_WAIT_TX_FREE(); Clear_Errors(axis, msg);
+    FDCAN_WAIT_TX_FREE(); Set_Controller_Modes(axis, msg, ctrl, in_mode);
+    FDCAN_WAIT_TX_FREE(); Set_Axis_Requested_State(axis, msg, CLOSED_LOOP_CONTROL);
+    return 1;
+#else
     for (uint8_t a = 0; a < attempts; a++) {
         FDCAN_WAIT_TX_FREE(); Clear_Errors(axis, msg);
         FDCAN_WAIT_TX_FREE(); Set_Controller_Modes(axis, msg, ctrl, in_mode);
@@ -1882,11 +2003,11 @@ static uint8_t ODrive_ArmAxisConfirmed(Axis *axis, FDCAN_TXmsg *msg,
             osDelay(10);
             if (axis->AXIS_Current_State == CLOSED_LOOP_CONTROL) return 1;
         }
-        printf("Arm node %u: state=%u err=0x%08lX (retry %u)\r\n",
-               axis->NODE_ID, axis->AXIS_Current_State,
-               (unsigned long)axis->AXIS_Error, a + 1);
+        (void)a;
     }
+    FirmwareError_Push(FERR_ARM_TIMEOUT, axis->NODE_ID, (uint8_t)axis->AXIS_Current_State);
     return 0;
+#endif
 }
 
 
@@ -1903,10 +2024,7 @@ void ODrive_ProcessCommand(const ODriveCmdMsg *cmd, Axis odrives[], uint8_t num_
     {
         case ODRIVE_CMD_SET_VEL:
         {
-            if (*current_ctrl_mode != VELOCITY_CONTROL) {
-                printf("CMD_SET_VEL rejected: not in VELOCITY_CONTROL\r\n");
-                break;
-            }
+            if (*current_ctrl_mode != VELOCITY_CONTROL) break;
             x_dot   = cmd->robot_twist[0];
             y_dot   = cmd->robot_twist[1];
             phi_dot = cmd->robot_twist[2];
@@ -1916,7 +2034,7 @@ void ODrive_ProcessCommand(const ODriveCmdMsg *cmd, Axis odrives[], uint8_t num_
                 FDCAN_WAIT_TX_FREE();
                 st = Set_Input_Vel(&odrives[i], tx,
                          wheel_sign[i] * (float)((u[i] * odrives[i].gear_ratio) / (2*PI)), 0.0f);
-                if (st != HAL_OK) printf("CMD_SET_VEL failed on axis %u\r\n", i);
+                (void)st;
             }
             break;
         }
@@ -1927,7 +2045,7 @@ void ODrive_ProcessCommand(const ODriveCmdMsg *cmd, Axis odrives[], uint8_t num_
                 if (!(cmd->target_mask & (1 << i))) continue;
                 FDCAN_WAIT_TX_FREE();
                 st = Clear_Errors(&odrives[i], tx);
-                if (st != HAL_OK) printf("Clear_Errors failed axis %u\r\n", i);
+                (void)st;
             }
             break;
         }
@@ -1938,7 +2056,7 @@ void ODrive_ProcessCommand(const ODriveCmdMsg *cmd, Axis odrives[], uint8_t num_
                 if (!(cmd->target_mask & (1 << i))) continue;
                 FDCAN_WAIT_TX_FREE();
                 st = Set_Axis_Requested_State(&odrives[i], tx, cmd->axis_state);
-                if (st != HAL_OK) printf("Set_State failed axis %u\r\n", i);
+                (void)st;
             }
             break;
         }
@@ -1950,7 +2068,7 @@ void ODrive_ProcessCommand(const ODriveCmdMsg *cmd, Axis odrives[], uint8_t num_
                 FDCAN_WAIT_TX_FREE();
                 st = Set_Controller_Modes(&odrives[i], tx,
                          (Control_Mode)cmd->control_mode, (Input_Mode)cmd->input_mode);
-                if (st != HAL_OK) printf("Set_Controller_Mode failed axis %u\r\n", i);
+                (void)st;
             }
             *current_ctrl_mode  = (Control_Mode)cmd->control_mode;
             *current_input_mode = (Input_Mode)cmd->input_mode;
@@ -1963,13 +2081,13 @@ void ODrive_ProcessCommand(const ODriveCmdMsg *cmd, Axis odrives[], uint8_t num_
                 if (!(cmd->target_mask & (1 << i))) continue;
                 FDCAN_WAIT_TX_FREE();
                 st = Set_Input_Vel(&odrives[i], tx, 0.0f, 0.0f);
-                if (st != HAL_OK) printf("STOP_ODRIVES vel 0 failed on axis %u\r\n", i);
+                (void)st;
             }
             for (uint8_t i = 0; i < num_odrives; i++) {
                 if (!(cmd->target_mask & (1 << i))) continue;
                 FDCAN_WAIT_TX_FREE();
                 st = Set_Axis_Requested_State(&odrives[i], tx, IDLE);
-                if (st != HAL_OK) printf("STOP_ODRIVES idle failed on axis %u\r\n", i);
+                (void)st;
             }
             break;
         }
@@ -1980,7 +2098,7 @@ void ODrive_ProcessCommand(const ODriveCmdMsg *cmd, Axis odrives[], uint8_t num_
                 if (!(cmd->target_mask & (1 << i))) continue;
                 FDCAN_WAIT_TX_FREE();
                 st = Clear_Errors(&odrives[i], tx);
-                if (st != HAL_OK) printf("CFG:Clear_Errors failed axis %u\r\n", i);
+                (void)st;
             }
             break;
         }
@@ -1991,7 +2109,7 @@ void ODrive_ProcessCommand(const ODriveCmdMsg *cmd, Axis odrives[], uint8_t num_
                 if (!(cmd->target_mask & (1 << i))) continue;
                 FDCAN_WAIT_TX_FREE();
                 st = Set_Axis_Requested_State(&odrives[i], tx, cmd->axis_state);
-                if (st != HAL_OK) printf("CFG:SetState failed axis %u\r\n", i);
+                (void)st;
             }
             break;
         }
@@ -2003,7 +2121,7 @@ void ODrive_ProcessCommand(const ODriveCmdMsg *cmd, Axis odrives[], uint8_t num_
                 FDCAN_WAIT_TX_FREE();
                 st = Set_Controller_Modes(&odrives[i], tx,
                          (Control_Mode)cmd->control_mode, (Input_Mode)cmd->input_mode);
-                if (st != HAL_OK) printf("CFG:SetCtrlMode failed axis %u\r\n", i);
+                (void)st;
             }
             *current_ctrl_mode  = (Control_Mode)cmd->control_mode;
             *current_input_mode = (Input_Mode)cmd->input_mode;
@@ -2016,7 +2134,7 @@ void ODrive_ProcessCommand(const ODriveCmdMsg *cmd, Axis odrives[], uint8_t num_
                 if (!(cmd->target_mask & (1 << i))) continue;
                 FDCAN_WAIT_TX_FREE();
                 st = Set_Limits(&odrives[i], tx, cmd->vel_limit, cmd->curr_limit);
-                if (st != HAL_OK) printf("CFG:SetLimits failed axis %u\r\n", i);
+                (void)st;
             }
             break;
         }
@@ -2027,7 +2145,7 @@ void ODrive_ProcessCommand(const ODriveCmdMsg *cmd, Axis odrives[], uint8_t num_
                 if (!(cmd->target_mask & (1 << i))) continue;
                 FDCAN_WAIT_TX_FREE();
                 st = Set_Position_Gain(&odrives[i], tx, cmd->pos_gain);
-                if (st != HAL_OK) printf("CFG:SetPosGain failed axis %u\r\n", i);
+                (void)st;
             }
             break;
         }
@@ -2038,7 +2156,7 @@ void ODrive_ProcessCommand(const ODriveCmdMsg *cmd, Axis odrives[], uint8_t num_
                 if (!(cmd->target_mask & (1 << i))) continue;
                 FDCAN_WAIT_TX_FREE();
                 st = Set_Vel_Gains(&odrives[i], tx, cmd->vel_gain, cmd->vel_int_gain);
-                if (st != HAL_OK) printf("CFG:SetVelGains failed axis %u\r\n", i);
+                (void)st;
             }
             break;
         }
@@ -2050,11 +2168,11 @@ void ODrive_ProcessCommand(const ODriveCmdMsg *cmd, Axis odrives[], uint8_t num_
                 (Control_Mode)cmd->control_mode,
                 (Input_Mode)cmd->input_mode,
                 cmd->axis_state);
-            if (startup_st != HAL_OK)
-                printf("CFG:Startup failed\r\n");
-            else {
+            if (startup_st == HAL_OK) {
                 *current_ctrl_mode  = (Control_Mode)cmd->control_mode;
                 *current_input_mode = (Input_Mode)cmd->input_mode;
+            } else {
+                FirmwareError_Push(FERR_STARTUP_FAILED, FERR_NO_AXIS, (uint8_t)startup_st);
             }
             break;
         }
@@ -2065,7 +2183,7 @@ void ODrive_ProcessCommand(const ODriveCmdMsg *cmd, Axis odrives[], uint8_t num_
                 if (!(cmd->target_mask & (1 << i))) continue;
                 FDCAN_WAIT_TX_FREE();
                 st = Reboot_ODrive(&odrives[i], tx);
-                if (st != HAL_OK) printf("CFG:Reboot failed axis %u\r\n", i);
+                (void)st;
             }
             break;
         }
@@ -2076,7 +2194,7 @@ void ODrive_ProcessCommand(const ODriveCmdMsg *cmd, Axis odrives[], uint8_t num_
                 if (!(cmd->target_mask & (1 << i))) continue;
                 FDCAN_WAIT_TX_FREE();
                 st = Set_Input_Torque(&odrives[i], tx, cmd->torque_ff[i]);
-                if (st != HAL_OK) printf("CFG:SetTorque failed axis %u\r\n", i);
+                (void)st;
             }
             break;
         }
@@ -2099,10 +2217,7 @@ void ODrive_ProcessCommand(const ODriveCmdMsg *cmd, Axis odrives[], uint8_t num_
 
         case ODRIVE_CFG_SET_INPUT_POS:
         {
-            if (*current_ctrl_mode != POSITION_CONTROL) {
-                printf("CFG:SetInputPos rejected: not in POSITION_CONTROL\r\n");
-                break;
-            }
+            if (*current_ctrl_mode != POSITION_CONTROL) break;
             for (uint8_t i = 0; i < num_odrives; i++) {
                 if (!(cmd->target_mask & (1 << i))) continue;
                 FDCAN_WAIT_TX_FREE();
@@ -2110,13 +2225,12 @@ void ODrive_ProcessCommand(const ODriveCmdMsg *cmd, Axis odrives[], uint8_t num_
                          cmd->input_pos_target,
                          (int16_t)(cmd->input_pos_vel_ff * 1000.0f),
                          (int16_t)(cmd->input_pos_trq_ff * 1000.0f));
-                if (st != HAL_OK) printf("CFG:SetInputPos failed axis %u\r\n", i);
+                (void)st;
             }
             break;
         }
 
         default:
-            printf("Unknown ODrive command type\r\n");
             break;
     }
 }
@@ -2159,11 +2273,17 @@ void ODrive_UpdateTelemetryAndOdometry(Axis odrives[], uint8_t num_odrives,
     /* 1. Predict — propagate state + covariance forward by dt. */
     ekf_predict(ekf, dt_s);
 
-    /* 2. Correct on the wheel-derived body twist (mecanum FK, body frame). */
+    /* 2. Correct on the wheel-derived body twist (mecanum FK, body frame).
+     *    EKF_STUB=1 injects a synthetic constant velocity so the filter can
+     *    be exercised on a bare board with no ODrives attached. */
+#if EKF_STUB
+    ekf_correct_wheel_twist(ekf, EKF_STUB_VX, EKF_STUB_VY, EKF_STUB_WZ);
+#else
     double vx_body, vy_body, phi_dot_body;
     bodySpeedsFromUMecanum(x_offset, y_offset, radius, u,
                            &vx_body, &vy_body, &phi_dot_body);
     ekf_correct_wheel_twist(ekf, vx_body, vy_body, phi_dot_body);
+#endif
 
     /* 3. Correct on the BNO085 (yaw + omega_z), gated by sequence # so each
      *    fresh IMU sample is consumed at most once. ekf_correct_imu() also
@@ -2285,10 +2405,7 @@ void UART_RX_ParseLine(const char *line_buf, ODriveCmdMsg *odrive_cmd,
     int msg_type = 0;
     osStatus_t qst;
 
-    if (sscanf(line_buf, "%d", &msg_type) != 1) {
-        printf("Parse error (no type): \"%s\"\r\n", line_buf);
-        return;
-    }
+    if (sscanf(line_buf, "%d", &msg_type) != 1) return;
 
     if (msg_type == 1) {
         double vx = 0.0, vy = 0.0, wz = 0.0;
@@ -2303,23 +2420,15 @@ void UART_RX_ParseLine(const char *line_buf, ODriveCmdMsg *odrive_cmd,
             odrive_cmd->robot_twist[2] = wz;
             for (int i = 0; i < 4; i++) odrive_cmd->torque_ff[i] = 0.0f;
 
-            qst = osMessageQueuePut(UART_QueueHandle_arg, odrive_cmd, 0, 0);
-            if (qst != osOK) printf("Failed to queue ctrl to UTX\r\n");
-
-            qst = osMessageQueuePut(URX_2_CAN_QueueHandle_arg, odrive_cmd, 0, 0);
-            if (qst != osOK) printf("Failed to queue ctrl to CAN\r\n");
-        } else {
-            printf("Type-1 parse fail: \"%s\"\r\n", line_buf);
+            osMessageQueuePut(UART_QueueHandle_arg, odrive_cmd, 0, 0);
+            osMessageQueuePut(URX_2_CAN_QueueHandle_arg, odrive_cmd, 0, 0);
         }
 
     } else if (msg_type == 2) {
         int sub_type = 0;
         unsigned int mask_u = 0x0F;
 
-        if (sscanf(line_buf, "%*d %d %x", &sub_type, &mask_u) < 2) {
-            printf("Type-2 parse fail (sub/mask): \"%s\"\r\n", line_buf);
-            return;
-        }
+        if (sscanf(line_buf, "%*d %d %x", &sub_type, &mask_u) < 2) return;
 
         ODriveCmdMsg cfg_cmd = {0};
         cfg_cmd.type        = (uint8_t)sub_type;
@@ -2387,11 +2496,8 @@ void UART_RX_ParseLine(const char *line_buf, ODriveCmdMsg *odrive_cmd,
                 break;
         }
 
-        qst = osMessageQueuePut(URX_2_CAN_QueueHandle_arg, &cfg_cmd, 0, 0);
-        if (qst != osOK) printf("Failed to queue cfg to CAN\r\n");
+        osMessageQueuePut(URX_2_CAN_QueueHandle_arg, &cfg_cmd, 0, 0);
 
-    } else {
-        printf("Unknown msg_type %d: \"%s\"\r\n", msg_type, line_buf);
     }
 }
 
@@ -2400,8 +2506,6 @@ void UART_RX_ParseLine(const char *line_buf, ODriveCmdMsg *odrive_cmd,
 void StartODriveTask(void *argument)
 {
   /* USER CODE BEGIN StartODriveTask */
-
-    printf("\nODrive Task (State Machine)\r\n");
 
     const uint8_t num_odrives   = 4;
     const double  x_offset      = 0.195;
@@ -2449,6 +2553,17 @@ void StartODriveTask(void *argument)
     uint32_t last_rearm_tick = osKernelGetTickCount();
     const uint32_t REARM_PERIOD_MS = 500;
 
+    /* Error-detection state — not involved in control, purely diagnostic. */
+    uint32_t prev_axis_error[4]      = {0};        /* axis_error register transition detector */
+    uint32_t last_hb_tick[4]         = {0};        /* last tick each axis sent a heartbeat */
+    uint8_t  hb_timeout_reported[4]  = {0};        /* one-shot per timeout event */
+    const uint32_t HB_TIMEOUT_MS     = 500;
+
+    /* ESTOP release hold: the button must stay released for ESTOP_RELEASE_HOLD_MS
+     * continuously before we re-arm. Any re-press during the hold cancels the timer. */
+    uint8_t  estop_release_pending = 0;
+    uint32_t estop_release_tick    = 0;
+
     const uint32_t boot_delay_ms = 3000;
     uint32_t boot_tick = osKernelGetTickCount();
 
@@ -2482,6 +2597,87 @@ void StartODriveTask(void *argument)
     for (;;)
     {
         now = osKernelGetTickCount();
+
+        /* ───── HARDWARE E-STOP (PE2 button) ─────────────────────────────
+         * Sample-after-delay debounce: any edge on ESTOP_PIN sets
+         * g_estop_sample_pending in the ISR. The task waits ESTOP_DEBOUNCE_MS
+         * (250 ms) then reads the actual pin level. This is immune to contact
+         * bounce on both press and release — no edge counting, no separate
+         * press/release flags.  If another edge arrives before the window
+         * expires the tick refreshes and the window restarts.
+         *
+         * Pin HIGH (NC opens = button pressed): enter SM_ESTOP, idle all axes.
+         * Pin LOW  (NC closes = button released): re-arm all axes, SM_RUNNING. */
+        if (g_estop_sample_pending &&
+            (now - g_estop_sample_tick) >= ESTOP_DEBOUNCE_MS)
+        {
+            g_estop_sample_pending = 0;
+
+            if (HAL_GPIO_ReadPin(ESTOP_PORT, ESTOP_PIN) == GPIO_PIN_SET) {
+                /* Button is pressed — engage ESTOP immediately, cancel any
+                 * pending release timer. */
+                estop_release_pending = 0;
+                if (sm_state != SM_ESTOP) {
+                    for (uint8_t i = 0; i < num_odrives; i++) {
+                        FDCAN_WAIT_TX_FREE();
+                        Set_Input_Vel(&odrives[i], &tx, 0.0f, 0.0f);
+                    }
+                    for (uint8_t i = 0; i < num_odrives; i++) {
+                        FDCAN_WAIT_TX_FREE();
+                        Set_Axis_Requested_State(&odrives[i], &tx, IDLE);
+                    }
+                    sm_state           = SM_ESTOP;
+                    g_estop_active     = 1;
+                    cmd_watchdog_fired = 0;
+                    last_vel_cmd_tick  = now;
+                    HAL_GPIO_WritePin(ESTOP_LED_PORT, ESTOP_LED_PIN, GPIO_PIN_SET);
+                }
+            } else {
+                /* Button is released — start the hold timer. Re-arm only after
+                 * ESTOP_RELEASE_HOLD_MS of continuous release (checked below). */
+                if (sm_state == SM_ESTOP) {
+                    estop_release_pending = 1;
+                    estop_release_tick    = now;
+                }
+            }
+        }
+
+        /* ESTOP release hold: re-arm once the button has been released
+         * continuously for ESTOP_RELEASE_HOLD_MS. Final pin read confirms
+         * release is stable. Any re-press cancels estop_release_pending above. */
+        if (estop_release_pending &&
+            sm_state == SM_ESTOP &&
+            (now - estop_release_tick) >= ESTOP_RELEASE_HOLD_MS)
+        {
+            estop_release_pending = 0;
+            if (HAL_GPIO_ReadPin(ESTOP_PORT, ESTOP_PIN) == GPIO_PIN_RESET) {
+                for (uint8_t i = 0; i < num_odrives; i++) {
+                    FDCAN_WAIT_TX_FREE();
+                    Set_Input_Pos(&odrives[i], &tx,
+                                  odrives[i].AXIS_Encoder_Pos, 0, 0);
+                }
+                for (uint8_t i = 0; i < num_odrives; i++) {
+                    ODrive_ArmAxisConfirmed(&odrives[i], &tx,
+                                           current_ctrl_mode,
+                                           current_input_mode, 5);
+                }
+                sm_state          = SM_RUNNING;
+                g_estop_active    = 0;
+                last_vel_cmd_tick = now;
+                HAL_GPIO_WritePin(ESTOP_LED_PORT, ESTOP_LED_PIN, GPIO_PIN_RESET);
+            }
+        }
+
+        /* While in SM_ESTOP the rest of the loop is still allowed to run,
+         * but every branch that could un-IDLE the axes is gated:
+         *   - CAN bus-off recovery: already guarded on sm_state == SM_RUNNING.
+         *   - SM_RUNNING auto-rearm block: lives inside case SM_RUNNING, so
+         *     the switch's case SM_ESTOP (no-op) skips it.
+         *   - Command queue gets consumed but the switch ignores it.
+         * The telemetry path at the bottom still runs, so the dashboard sees
+         * live EKF + axis data during the e-stop — useful for diagnosing
+         * "what happened?" and for visualising the operator pushing the base. */
+        /* ───────────────────────────────────────────────────────────────── */
 
         /* CAN bus-off recovery FIRST: STM32H7 FDCAN does not self-recover, and
          * while bus-off NOTHING can be transmitted. Recover the peripheral, then
@@ -2548,7 +2744,6 @@ void StartODriveTask(void *argument)
             case SM_BOOT:
             {
                 if (qst == osOK && cmd.type == ODRIVE_CFG_STARTUP) {
-                    printf("SM: BOOT->STARTUP (cmd)\r\n");
                     sm_state = SM_STARTUP;
                     ODrive_ProcessCommand(&cmd, odrives, num_odrives, &tx,
                         odrive_odom, x_offset, y_offset, radius,
@@ -2557,7 +2752,6 @@ void StartODriveTask(void *argument)
                     sm_state = SM_RUNNING;
                 }
                 else if ((now - boot_tick) >= boot_delay_ms) {
-                    printf("SM: BOOT->STARTUP (auto)\r\n");
                     sm_state = SM_STARTUP;
 
                     /* Wait for the first heartbeat from every axis: this proves
@@ -2565,7 +2759,9 @@ void StartODriveTask(void *argument)
                      * before we command CLOSED_LOOP. A fixed delay races the S1
                      * boot time and silently loses the arm command. AXIS_Current_State
                      * stays UNDEFINED(0) until a heartbeat arrives; bounded so a
-                     * truly absent S1 cannot hang us forever. */
+                     * truly absent S1 cannot hang us forever.
+                     * CAN_STUB=1: loopback never produces heartbeats — skip. */
+#if !CAN_STUB
                     for (uint16_t hb = 0; hb < 300; hb++) {      /* up to ~3 s */
                         uint8_t all_seen = 1;
                         for (uint8_t i = 0; i < num_odrives; i++)
@@ -2573,24 +2769,29 @@ void StartODriveTask(void *argument)
                         if (all_seen) break;
                         osDelay(10);
                     }
+#endif
+
+                    /* Push the project-tuned velocity-loop gains before arming.
+                     * The auto-arm path uses ODrive_ArmAxisConfirmed which only
+                     * touches Clear_Errors / Set_Controller_Modes / Set_Axis_
+                     * Requested_State — it does NOT carry gains. Setting them
+                     * here (after heartbeats prove the bus + each S1 are alive)
+                     * means the first SET_INPUT_VEL frame sees the tuned gains. */
+                    for (uint8_t i = 0; i < num_odrives; i++) {
+                        FDCAN_WAIT_TX_FREE();
+                        Set_Vel_Gains(&odrives[i], &tx,
+                                     ODRIVE_STARTUP_VEL_GAIN,
+                                     ODRIVE_STARTUP_VEL_INT_GAIN);
+                    }
 
                     /* Arm each axis WITH heartbeat confirmation + retry, instead
                      * of assuming a queued CAN frame took effect. */
-                    uint8_t all_armed = 1;
-                    for (uint8_t i = 0; i < num_odrives; i++) {
-                        if (!ODrive_ArmAxisConfirmed(&odrives[i], &tx,
-                                 VELOCITY_CONTROL, PASSTHROUGH, 5)) {
-                            printf("SM: axis node %u FAILED to reach CLOSED_LOOP\r\n",
-                                   odrives[i].NODE_ID);
-                            all_armed = 0;
-                        }
-                    }
+                    for (uint8_t i = 0; i < num_odrives; i++)
+                        ODrive_ArmAxisConfirmed(&odrives[i], &tx,
+                                               VELOCITY_CONTROL, PASSTHROUGH, 5);
                     current_ctrl_mode  = VELOCITY_CONTROL;
                     current_input_mode = PASSTHROUGH;
-                    sm_state = SM_RUNNING;   /* the SM_RUNNING re-arm block keeps
-                                                retrying any axis not yet armed */
-                    printf("SM: STARTUP->RUNNING (%s)\r\n",
-                           all_armed ? "all armed" : "partial");
+                    sm_state = SM_RUNNING;
                 }
                 break;
             }
@@ -2612,9 +2813,8 @@ void StartODriveTask(void *argument)
                     for (uint8_t i = 0; i < num_odrives; i++) {
                         if (odrives[i].AXIS_Current_State != UNDEFINED &&
                             odrives[i].AXIS_Current_State != CLOSED_LOOP_CONTROL) {
-                            printf("RE-ARM node %u: state=%u err=0x%08lX\r\n",
-                                   odrives[i].NODE_ID, odrives[i].AXIS_Current_State,
-                                   (unsigned long)odrives[i].AXIS_Error);
+                            FirmwareError_Push(FERR_AXIS_REARM, i,
+                                               (uint8_t)odrives[i].AXIS_Current_State);
                             FDCAN_WAIT_TX_FREE(); Clear_Errors(&odrives[i], &tx);
                             FDCAN_WAIT_TX_FREE(); Set_Axis_Requested_State(&odrives[i], &tx, CLOSED_LOOP_CONTROL);
                             FDCAN_WAIT_TX_FREE(); Set_Input_Vel(&odrives[i], &tx, 0.0f, 0.0f);
@@ -2629,9 +2829,8 @@ void StartODriveTask(void *argument)
                  * clears as soon as a new SET_VEL arrives (above). */
                 if ((now - last_vel_cmd_tick) >= CMD_WATCHDOG_TIMEOUT_MS) {
                     if (!cmd_watchdog_fired) {
-                        printf("CMD watchdog: no SET_VEL for %lu ms -- stopping motors\r\n",
-                               (unsigned long)CMD_WATCHDOG_TIMEOUT_MS);
                         cmd_watchdog_fired = 1;
+                        FirmwareError_Push(FERR_CMD_WATCHDOG, FERR_NO_AXIS, 0);
                         /* Release BT override so ROS regains control as soon as
                          * packets resume. */
                         bt_override_active = 0;
@@ -2668,7 +2867,6 @@ void StartODriveTask(void *argument)
                 if (qst == osOK) {
                     /* Bit 3 of buttons: emergency stop — bypasses source priority */
                     if (cmd.buttons & BT_ESTOP_BUTTON) {
-                        printf("SM: RUNNING->IDLE (BT stop button)\r\n");
                         ODriveCmdMsg stop_cmd = {0};
                         stop_cmd.type        = ODRIVE_CMD_STOP_ODRIVES;
                         stop_cmd.target_mask = 0x0F;
@@ -2685,7 +2883,6 @@ void StartODriveTask(void *argument)
                      * "stop" from ROS is silently dropped while a BT controller
                      * holds the override (the base keeps driving). */
                     if (cmd.type == ODRIVE_CFG_STOP || cmd.type == ODRIVE_CMD_STOP_ODRIVES) {
-                        printf("SM: RUNNING->IDLE (stop, unconditional)\r\n");
                         ODrive_ProcessCommand(&cmd, odrives, num_odrives, &tx,
                             odrive_odom, x_offset, y_offset, radius,
                             &current_ctrl_mode, &current_input_mode,
@@ -2715,7 +2912,6 @@ void StartODriveTask(void *argument)
                     }
 
                     if (cmd.type == ODRIVE_CFG_STOP) {
-                        printf("SM: RUNNING->IDLE (stop)\r\n");
                         ODrive_ProcessCommand(&cmd, odrives, num_odrives, &tx,
                             odrive_odom, x_offset, y_offset, radius,
                             &current_ctrl_mode, &current_input_mode,
@@ -2724,7 +2920,6 @@ void StartODriveTask(void *argument)
                         break;
                     }
                     if (cmd.type == ODRIVE_CFG_REBOOT) {
-                        printf("SM: RUNNING->BOOT (reboot)\r\n");
                         ODrive_ProcessCommand(&cmd, odrives, num_odrives, &tx,
                             odrive_odom, x_offset, y_offset, radius,
                             &current_ctrl_mode, &current_input_mode,
@@ -2744,7 +2939,6 @@ void StartODriveTask(void *argument)
             case SM_IDLE:
             {
                 if (qst == osOK && cmd.type == ODRIVE_CFG_STARTUP) {
-                    printf("SM: IDLE->STARTUP\r\n");
                     ODrive_ProcessCommand(&cmd, odrives, num_odrives, &tx,
                         odrive_odom, x_offset, y_offset, radius,
                         &current_ctrl_mode, &current_input_mode,
@@ -2753,6 +2947,10 @@ void StartODriveTask(void *argument)
                 }
                 break;
             }
+            case SM_ESTOP:
+                /* Handled above the switch (continue;) — this case exists
+                 * only to keep -Wswitch happy after adding the enum value. */
+                break;
         }
 
         uint32_t delta_t = now - last_telem_tick;
@@ -2762,6 +2960,31 @@ void StartODriveTask(void *argument)
                 &ekf,
                 x_offset, y_offset, radius,
                 u, q_dot, delta_t, (double*)wheel_sign);
+
+            /* Per-axis error detection (diagnostic only, no control impact). */
+            for (uint8_t i = 0; i < num_odrives; i++) {
+                /* Axis fault: AXIS_Error register went non-zero. */
+                if (telemetryMsg.axis_error[i] != 0 && prev_axis_error[i] == 0)
+                    FirmwareError_Push(FERR_AXIS_FAULT, i,
+                                       (uint8_t)(telemetryMsg.axis_error[i] & 0xFF));
+                prev_axis_error[i] = telemetryMsg.axis_error[i];
+
+                /* Heartbeat timeout: axis stopped sending CAN heartbeats. */
+                if (telemetryMsg.updated[i]) {
+                    last_hb_tick[i] = now;
+                    hb_timeout_reported[i] = 0;
+                } else if (sm_state == SM_RUNNING &&
+                           last_hb_tick[i] != 0 &&
+                           (now - last_hb_tick[i]) > HB_TIMEOUT_MS &&
+                           !hb_timeout_reported[i]) {
+                    FirmwareError_Push(FERR_HEARTBEAT_TIMEOUT, i, 0);
+                    hb_timeout_reported[i] = 1;
+                }
+            }
+
+            /* Snapshot the firmware SM state on every push — let the host
+             * distinguish SM_IDLE (commanded) from SM_ESTOP (button held). */
+            telemetryMsg.sm_state = (uint8_t)sm_state;
 
             ODrive_PushLatestTelemetry(CAN_2_UTX_QueueHandle, &telemetryMsg);
             last_telem_tick = now;
