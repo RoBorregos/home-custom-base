@@ -21,7 +21,7 @@ What was done:
     (default True). Emits odom -> base_link after every
     nav_msgs/Odometry publish, replacing robot_localization for the
     omnibase config. See
-    ../../../firmware/STM32H7_OMNIBASE_CAN_BNO085/CM7/omnibase_documentation.md
+    ../../../firmware/STM32H7_OMNIBASE_CAN_BNO085/omnibase_documentation.md
     section 11.
   - Added `E=` / `ELOST=` line parsing (firmware error events). Each is
     logged via get_logger().warn/error and emitted to the browser as a

@@ -30,9 +30,9 @@ RoBorregos custom omnidirectional base — firmware and ROS2 interface for a fou
 | home2 `omnidriver` dashboard EKF compatibility | **Pending**\*\* |
 | IMU staleness watchdog | **Pending** — silent fallback to dead-reckoning if BNO085 stops producing samples |
 
-\* see `firmware/STM32H7_OMNIBASE_CAN_BNO085/CM7/omnibase_documentation.md` §11
+\* see `firmware/STM32H7_OMNIBASE_CAN_BNO085/omnibase_documentation.md` §11
 
-\*\* see `firmware/STM32H7_OMNIBASE_CAN_BNO085/CM7/omnibase_documentation.md` §12
+\*\* see `firmware/STM32H7_OMNIBASE_CAN_BNO085/omnibase_documentation.md` §12
 
 ---
 
@@ -112,7 +112,7 @@ Tasks other than `Start_UART_TX_Task` cannot call `printf()`. Instead they call 
 
 ## EKF and TF
 
-The firmware runs a 6-state EKF (`firmware/.../ekf.c`) fusing wheel odometry with BNO085 IMU yaw/omega_z, replacing the previous Euler dead-reckoning. `odrive_dashboard.py` consumes the EKF's quaternion and full pose/twist covariance and publishes the `odom -> base_link` TF directly (`publish_tf` parameter, default `True`) — this fully replaces `robot_localization` for the omnibase configuration. See `firmware/STM32H7_OMNIBASE_CAN_BNO085/CM7/omnibase_documentation.md` §11 for the full design write-up, replaceability analysis vs. `robot_localization`, and known gaps (§12 covers the pending home2 migration).
+The firmware runs a 6-state EKF (`firmware/.../ekf.c`) fusing wheel odometry with BNO085 IMU yaw/omega_z, replacing the previous Euler dead-reckoning. `odrive_dashboard.py` consumes the EKF's quaternion and full pose/twist covariance and publishes the `odom -> base_link` TF directly (`publish_tf` parameter, default `True`) — this fully replaces `robot_localization` for the omnibase configuration. See `firmware/STM32H7_OMNIBASE_CAN_BNO085/omnibase_documentation.md` §11 for the full design write-up, replaceability analysis vs. `robot_localization`, and known gaps (§12 covers the pending home2 migration).
 
 ---
 

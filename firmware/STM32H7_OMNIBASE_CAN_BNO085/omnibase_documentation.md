@@ -4,7 +4,7 @@
 **Target**: STM32H743 (CM7 core), FreeRTOS + CMSIS-RTOS2
 **Date**: 2026-06-20 (converted from `omnibase_documentation.txt`, updated for EKF + firmware error reporting + ESTOP + CAN parameter access)
 
-> This file documents the firmware as of branch `merged_major_update_ekf`. For the EKF specifically, see Section 11 (design write-up + `robot_localization` replaceability analysis) and Section 12 (pending home2 `omnidriver` migration). For a dated changelog, see `status.txt` next to this file.
+> This file documents the firmware as of branch `merged_major_update_ekf`. For the EKF specifically, see Section 11 (design write-up + `robot_localization` replaceability analysis) and Section 12 (pending home2 `omnidriver` migration). For a dated changelog, see `CM7/status.txt`.
 
 ---
 
@@ -478,7 +478,7 @@ Unchanged call chain: `StartIMUTask()` → `sh2_open()` → `hal_open()` (RST pu
 
 See Section 11 for the full design write-up, the math, and known gaps (no pitch/roll, no IMU outlier rejection on omega_z specifically, no on-MCU gyro bias estimation, no IMU staleness watchdog).
 
-### 5.3 `q_to_ypr` (`Core/Src/sh2/euler.c`)
+### 5.3 `q_to_ypr` (`CM7/Core/Src/sh2/euler.c`)
 
 Unchanged — converts a unit quaternion to yaw/pitch/roll (radians) via the ZYX convention. Note: the BNO085 on this robot reports yaw + omega_z **inverted** vs. the ROS `base_link` convention; this is now corrected once, in firmware, before the EKF integrates anything (`main.c`, just before `ekf_correct_imu`) — previously this correction lived downstream in the dashboard, which is no longer needed/correct once the EKF firmware is flashed (a double-invert risk if both corrections are active — see Section 12.1 item 3 for the home2 `omnidriver` migration note).
 
@@ -551,13 +551,13 @@ Unchanged from the original integration: `sh2_hal_impl.c/.h`, `sh2/sh2.c`, `sh2/
 
 ### 6.2 ODrive / robot control files
 
-`Core/Src/main.c` — the central file. Now also contains: `FirmwareError_Push()`, `vApplicationStackOverflowHook()`, the ESTOP debounce/hold state machine, `Set_Param_Float()` call sites, and the EKF integration inside `ODrive_UpdateTelemetryAndOdometry()`.
+`CM7/Core/Src/main.c` — the central file. Now also contains: `FirmwareError_Push()`, `vApplicationStackOverflowHook()`, the ESTOP debounce/hold state machine, `Set_Param_Float()` call sites, and the EKF integration inside `ODrive_UpdateTelemetryAndOdometry()`.
 
-`Core/Src/ODrive.c` + `Core/Inc/ODrive.h` — low-level CAN TX functions. Gained `Set_Param_Float()` and the `RXSDO_CMD_ID`/`SDO_OPCODE_*` defines this session.
+`CM7/Core/Src/ODrive.c` + `CM7/Core/Inc/ODrive.h` — low-level CAN TX functions. Gained `Set_Param_Float()` and the `RXSDO_CMD_ID`/`SDO_OPCODE_*` defines this session.
 
-`Core/Inc/main.h` — project-level type definitions. Gained the `FirmwareError` struct + all `FERR_*` defines, `ODRIVE_CFG_SET_PARAM_FLOAT`, and `param_endpoint_id`/`param_value` fields on `ODriveCmdMsg`. `OdomData` gained the EKF-shaped fields (quaternion, body-frame velocity, full 6×6 pose/twist covariance) — kept alongside the legacy `x_pos/y_pos/phi` fields for backward compatibility.
+`CM7/Core/Inc/main.h` — project-level type definitions. Gained the `FirmwareError` struct + all `FERR_*` defines, `ODRIVE_CFG_SET_PARAM_FLOAT`, and `param_endpoint_id`/`param_value` fields on `ODriveCmdMsg`. `OdomData` gained the EKF-shaped fields (quaternion, body-frame velocity, full 6×6 pose/twist covariance) — kept alongside the legacy `x_pos/y_pos/phi` fields for backward compatibility.
 
-**`Core/Inc/ekf.h` + `Core/Src/ekf.c` (NEW)** — the 6-state EKF implementation: `ekf_init()`, `ekf_predict()`/equivalent, `ekf_correct_wheel_twist()`, `ekf_correct_imu()`. See Section 11 for the math and design rationale.
+**`CM7/Core/Inc/ekf.h` + `CM7/Core/Src/ekf.c` (NEW)** — the 6-state EKF implementation: `ekf_init()`, `ekf_predict()`/equivalent, `ekf_correct_wheel_twist()`, `ekf_correct_imu()`. See Section 11 for the math and design rationale.
 
 `odrive_task_config.c` — **deleted this session.** Was a design-reference file (never compiled), predating the ESTOP/watchdog/auto-rearm logic. Its state machine diagram is now Section 2.9, its UART parser sub-type table is reflected in Section 9, and its list of unimplemented ODrive CAN commands (Estop, Get_Error, Get_Temperature, Set_Traj_*, Set_Absolute_Position, Get_Torques, Get_Powers) is now Section 10.3.
 
@@ -565,7 +565,7 @@ Unchanged from the original integration: `sh2_hal_impl.c/.h`, `sh2/sh2.c`, `sh2/
 
 Unchanged: `myprintf.c/.h` (printf retarget to USART3, polling, not thread-safe — see Section 4.1 for how this risk is now mitigated by convention), `stm32h7xx_hal_msp.c`, `stm32h7xx_hal_timebase_tim.c`, `stm32h7xx_it.c`, `syscalls.c`.
 
-`Core/Inc/FreeRTOSConfig.h` — `configTOTAL_HEAP_SIZE` raised to 49152 (was 32768) for the EKF's working memory; `configCHECK_FOR_STACK_OVERFLOW = 2` newly added.
+`CM7/Core/Inc/FreeRTOSConfig.h` — `configTOTAL_HEAP_SIZE` raised to 49152 (was 32768) for the EKF's working memory; `configCHECK_FOR_STACK_OVERFLOW = 2` newly added.
 
 ### 6.4 Legacy / unused files
 

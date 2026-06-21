@@ -2,7 +2,7 @@
 
 ROS2 package that bridges the STM32H7 omnibase firmware (USB-CDC serial) to ROS2 topics, and serves a Flask + Flask-SocketIO web dashboard for live monitoring and manual control.
 
-For the firmware side of this link, see `../../../firmware/STM32H7_OMNIBASE_CAN_BNO085/CM7/omnibase_documentation.md` (§11 covers the on-MCU EKF design in detail, §12 the pending home2 `omnidriver` migration). For a dated changelog of this package specifically, see `status.txt` in this directory.
+For the firmware side of this link, see `../../../firmware/STM32H7_OMNIBASE_CAN_BNO085/omnibase_documentation.md` (§11 covers the on-MCU EKF design in detail, §12 the pending home2 `omnidriver` migration). For a dated changelog of this package specifically, see `status.txt` in this directory.
 
 ---
 

@@ -19,7 +19,7 @@ Branch: merged_major_update_ekf
    - odrive_dashboard.py / dashboard.html consume the EKF quaternion and
      covariance, and publish the odom -> base_link TF directly (replaces
      robot_localization for the omnibase config). See
-     firmware/STM32H7_OMNIBASE_CAN_BNO085/CM7/omnibase_documentation.md
+     firmware/STM32H7_OMNIBASE_CAN_BNO085/omnibase_documentation.md
      section 11 for full design detail and known gaps (no
      pitch/roll, no IMU outlier rejection on omega_z, no IMU staleness
      watchdog yet, no on-MCU gyro bias estimation).
