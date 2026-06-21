@@ -68,6 +68,20 @@ void Error_Handler(void);
 #define BT_UART_TOGGLE_BUTTON  0x02
 #define BT_ESTOP_BUTTON 0x04
 
+/* Hardware emergency-stop input. NORMALLY-CLOSED push button wired between
+ * PE2 and GND with the STM32 internal pull-up enabled. Resting state (NC
+ * contact closed to GND) reads LOW; pressed (NC opens, internal pull-up
+ * wins) reads HIGH. A broken wire also reads HIGH, so the e-stop is
+ * fail-safe against open-circuit faults in the harness. */
+#define ESTOP_PIN          GPIO_PIN_2
+#define ESTOP_PORT         GPIOE
+#define ESTOP_EXTI_IRQn    EXTI2_IRQn
+
+/* ESTOP status LED — on while SM_ESTOP is active.
+ * PE0, push-pull output, no pull, active HIGH. */
+#define ESTOP_LED_PIN      GPIO_PIN_0
+#define ESTOP_LED_PORT     GPIOE
+
 typedef struct {
     float Kp;
     float Ki;
@@ -104,7 +118,7 @@ typedef struct {
     double roll;
     double pitch;
 
-    /* Orientation quaternion from BNO085 SH2_ROTATION_VECTOR.
+    /* Orientation quaternion from BNO085 SH2_GAME_ROTATION_VECTOR (6-axis, no mag).
      * Standard convention: (qx, qy, qz, qw) with qw being the real component. */
     float qx;
     float qy;
@@ -145,10 +159,27 @@ typedef struct {
 } EncoderData;
 
 typedef struct {
+	/* Legacy fields (kept so existing slim/fat printf paths stay valid). */
 	double x_pos;
 	double y_pos;
 	double phi;
 	double q_dot[3]; // <- Inertial x_dot, y_dot, z_dot
+
+	/* EKF-shaped output (ROS nav_msgs/Odometry friendly).
+	 * z_pos and roll/pitch are not estimated — they are kept here for
+	 * struct-shape compatibility with downstream ROS messages only. */
+	double z_pos;
+	float  qx, qy, qz, qw;          /* orientation from EKF yaw (flat ground) */
+	double vx_body, vy_body, vz_body;
+	float  wx, wy, wz;              /* wz = EKF omega; wx/wy not estimated */
+
+	/* Full 6x6 covariance matrices (row-major, ROS layout).
+	 * Pose order : [ x,  y,  z,  roll, pitch, yaw ]
+	 * Twist order: [ vx, vy, vz, wx,   wy,    wz ]
+	 * Unestimated states carry a large variance on the diagonal so any
+	 * downstream filter treats them as effectively "unknown". */
+	double pose_covariance[36];
+	double twist_covariance[36];
 } OdomData;
 
 typedef struct {
@@ -193,6 +224,9 @@ typedef enum {
     ODRIVE_CFG_SET_TORQUE          = 0x28,
     ODRIVE_CFG_STOP                = 0x29,
     ODRIVE_CFG_SET_INPUT_POS       = 0x30,
+    /* Arbitrary parameter write (RxSdo) -- endpoint_id + float value.
+     * See RXSDO_CMD_ID in ODrive.h. Endpoint IDs are firmware-build-specific. */
+    ODRIVE_CFG_SET_PARAM_FLOAT     = 0x31,
 } ODriveCmdType;
 
 typedef enum {
@@ -200,6 +234,12 @@ typedef enum {
     SM_STARTUP = 1,
     SM_RUNNING = 2,
     SM_IDLE    = 3,
+    /* SM_ESTOP: entered on hardware e-stop press (rising edge on ESTOP_PIN).
+     * Axes are set IDLE so the base is push-movable. The main loop skips
+     * command processing and the SM_RUNNING auto-rearm block while in this
+     * state. Exited via button release (falling edge after a debounce
+     * dead-band), re-arming back to whatever ctrl_mode was active. */
+    SM_ESTOP   = 4,
 } ODriveSMState;
 
 typedef enum {
@@ -223,6 +263,8 @@ typedef struct {
     float input_pos_target;
     float input_pos_vel_ff;
     float input_pos_trq_ff;
+    uint16_t param_endpoint_id;  // used by ODRIVE_CFG_SET_PARAM_FLOAT
+    float    param_value;        // used by ODRIVE_CFG_SET_PARAM_FLOAT
     uint8_t  source;
     uint16_t buttons;
 } ODriveCmdMsg;
@@ -260,7 +302,57 @@ typedef struct
     float    bt_vy;
     float    bt_wz;
     uint8_t  bt_active;
+    /* Firmware state machine — matches the ODriveSMState enum. Filled by
+     * StartODriveTask before each push so the dashboard can distinguish
+     * SM_IDLE (commanded) from SM_ESTOP (hardware button held), which both
+     * look like axis_state=IDLE on the per-ODrive channels. */
+    uint8_t  sm_state;
 } ODriveTelemetryMsg;
+
+/* ── Firmware error reporting ──────────────────────────────────────────────
+ * FirmwareError is pushed to ERR_QueueHandle by any task; the TX task drains
+ * it and emits  E=<code>,<axis>,<detail>\r\n  on UART3.
+ * axis: 0-3 for per-ODrive, FERR_NO_AXIS (0xFF) for system-level.
+ * detail: HAL_StatusTypeDef, rc code, axis state, or watermark words.
+ * ─────────────────────────────────────────────────────────────────────────*/
+typedef struct {
+    uint8_t code;
+    uint8_t axis;
+    uint8_t detail;
+} FirmwareError;
+
+#define FERR_NO_AXIS              0xFF
+
+/* CAN / bus */
+#define FERR_CAN_TX_TIMEOUT       0x01
+#define FERR_CAN_BUSOFF           0x02
+#define FERR_CAN_RX_FAIL          0x03
+
+/* ODrive startup */
+#define FERR_STARTUP_FAILED       0x10
+
+/* Arm / re-arm */
+#define FERR_ARM_TIMEOUT          0x20
+#define FERR_AXIS_REARM           0x21  /* axis fell out of CLOSED_LOOP, auto-rearm issued */
+
+/* Runtime axis events */
+#define FERR_AXIS_FAULT           0x30  /* AXIS_Error register went non-zero */
+#define FERR_CMD_WATCHDOG         0x31  /* no SET_VEL within CMD_WATCHDOG_TIMEOUT_MS */
+#define FERR_HEARTBEAT_TIMEOUT    0x32  /* axis stopped sending CAN heartbeats */
+
+/* IMU */
+#define FERR_IMU_OPEN             0x40
+#define FERR_IMU_SET_CALLBACK     0x41
+#define FERR_IMU_REPORT_CFG       0x42
+#define FERR_IMU_RESET            0x43
+
+/* BT / queue */
+#define FERR_BT_QUEUE_FULL        0x50
+#define FERR_BT_PARSE_FAIL        0x51
+
+/* System */
+#define FERR_STACK_LOW            0x60  /* detail = remaining words (task id encoded in axis) */
+#define FERR_STACK_OVERFLOW       0x61  /* vApplicationStackOverflowHook fired */
 
 /* USER CODE END EFP */
 

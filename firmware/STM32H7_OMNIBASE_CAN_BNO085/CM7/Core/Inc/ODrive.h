@@ -31,6 +31,15 @@
 #define SET_POSITION_GAIN               0x01A
 #define SET_VEL_GAINS                   0x01B
 
+/* Arbitrary parameter access (CANSimple "RxSdo"/"TxSdo", fw v0.6.x+).
+ * Lets the host write any endpoint in the ODrive's flat parameter tree
+ * (e.g. axis0.controller.config.vel_ramp_rate) without a dedicated fixed
+ * command. Endpoint IDs are firmware-build-specific -- look them up in the
+ * flat_endpoints.json shipped with the ODrive's exact firmware release. */
+#define RXSDO_CMD_ID                    0x004
+#define SDO_OPCODE_READ                 0x00
+#define SDO_OPCODE_WRITE                0x01
+
 extern volatile uint8_t BT_active;
 
 /* Axis Parameters */
@@ -123,6 +132,10 @@ HAL_StatusTypeDef Get_IQ(const Axis *axis, FDCAN_TXmsg *msg);
 HAL_StatusTypeDef Set_Position_Gain(const Axis *axis, FDCAN_TXmsg *msg, float pos_gain);
 
 HAL_StatusTypeDef Set_Vel_Gains(const Axis *axis, FDCAN_TXmsg *msg, float Vel_Gain, float Vel_Int_Gain);
+
+/* Arbitrary parameter write (RxSdo, OPCODE_WRITE) -- sets a single float32
+ * endpoint by its flat_endpoints.json ID. See RXSDO_CMD_ID comment above. */
+HAL_StatusTypeDef Set_Param_Float(const Axis *axis, FDCAN_TXmsg *msg, uint16_t endpoint_id, float value);
 
 HAL_StatusTypeDef Set_Axis_Node_ID(const Axis *axis, FDCAN_TXmsg *msg, uint32_t node_id);
 

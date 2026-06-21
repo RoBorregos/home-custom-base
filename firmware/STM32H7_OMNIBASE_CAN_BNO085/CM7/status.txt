@@ -1,3 +1,109 @@
+EKF + Firmware Error Reporting + ESTOP + CAN Parameter Access
+======================================================
+Date: 2026-06-20
+
+SUMMARY
+-------
+Added an on-MCU 6-state EKF (replacing Euler dead-reckoning), a
+queued firmware-error reporting pipeline (replacing scattered printf()
+debug lines outside the TX task), a hardware ESTOP input with a
+separate press/release debounce and re-arm hold timer, arbitrary
+ODrive parameter writes over CAN (RxSdo), and a default input-mode
+switch from PASSTHROUGH to VEL_RAMP for smoother velocity setpoints.
+See omnibase_documentation.md (converted from .txt this session) for
+the full updated architecture writeup, including section 11 for the
+EKF design detail specifically and section 12 for the pending home2
+omnidriver migration (formerly tracked in standalone ekf_addition.md /
+ekf_home2_update_prompt.txt files, now merged in and deleted).
+
+ARCHITECTURAL RULE (NEW, MUST BE RESPECTED)
+--------------------------------------------
+Only Start_UART_TX_Task may call printf(). Every other task must call
+FirmwareError_Push(code, axis, detail) instead, which queues a
+FirmwareError struct (ERR_QueueHandle, depth 16). Start_UART_TX_Task
+drains it each cycle and emits `E=<code>,<axis>,<detail>\r\n` per
+error, or `ELOST=<n>\r\n` if the queue overflowed (g_errors_lost).
+This exists because printf() is not mutex-protected (MutexUART_DataHandle
+is created but never acquired) — concurrent printf from multiple tasks
+would corrupt UART output. Enforcing single-writer printf by convention
+sidesteps the need for the mutex.
+
+MODIFIED FILES (this session)
+------------------------------
+Core/Inc/main.h
+  - FirmwareError struct {code, axis, detail} (uint8_t each).
+  - FERR_NO_AXIS = 0xFF, and all FERR_* error codes (CAN, ODrive
+    startup/arm/runtime, IMU, BT, system/stack — see full list in
+    omnibase_documentation.md section 7).
+  - ODRIVE_CFG_SET_PARAM_FLOAT = 0x31 added to ODriveCmdType.
+  - ODriveCmdMsg gained param_endpoint_id (uint16_t) and param_value
+    (float) fields for the RxSdo write path.
+
+Core/Inc/FreeRTOSConfig.h
+  - configCHECK_FOR_STACK_OVERFLOW = 2 (pattern-checking stack overflow
+    detection) — previously not set at all.
+
+Core/Inc/ODrive.h + Core/Src/ODrive.c
+  - RXSDO_CMD_ID (0x004), SDO_OPCODE_READ/WRITE defines.
+  - Set_Param_Float(axis, msg, endpoint_id, value) — builds and sends
+    the 8-byte RxSdo OPCODE_WRITE frame (opcode + endpoint_id LE +
+    reserved + float32 value). Fire-and-forget, no TxSdo read-back.
+
+Core/Src/main.c
+  - ekf.h include, EKF struct as a local in StartODriveTask
+    (ekf_init() called once at task start — NOT reset by anything short
+    of an MCU reset; restarting the ROS dashboard does NOT reset it).
+  - EKF_TRUST_IMU flag (currently 1 — IMU corrections applied).
+  - ERR_QueueHandle + FirmwareError_Push() implementation.
+  - vApplicationStackOverflowHook: sets a flag, drives the ESTOP LED,
+    halts — cannot safely call any FreeRTOS API from this hook.
+  - g_can_busoff bitfield (bit0=bus-off from HAL_FDCAN_ErrorStatusCallback,
+    bit1=RX-read-fail from HAL_FDCAN_RxFifo0Callback) — both ISR
+    contexts only SET the flag; FirmwareError_Push() and the actual
+    bus-off recovery happen in task context (FDCAN_RecoverIfBusOff()),
+    since calling osMessageQueuePut from ISR context safety depends on
+    IRQ priority vs configMAX_SYSCALL_INTERRUPT_PRIORITY.
+  - ODrive_ArmAxisConfirmed() gained an axis_idx parameter so
+    FERR_ARM_TIMEOUT logs the 0-3 axis index like every other error
+    code (previously logged axis->NODE_ID, e.g. 36/34/33/40 — fixed,
+    was misleading in the error log).
+  - SM_BOOT heartbeat-wait loop (up to 3s) now drains
+    URX_2_CAN_QueueHandle every 10ms tick instead of leaving it
+    untouched — an active BT stream during boot previously filled the
+    (depth-3) queue almost instantly and flooded FERR_BT_QUEUE_FULL /
+    ELOST on every startup.
+  - ESTOP_DEBOUNCE_MS (90) for press/release sampling, separate
+    ESTOP_RELEASE_HOLD_MS (150) requiring continuous release before
+    re-arming — any re-press during the hold window cancels the
+    pending re-arm.
+  - Boot-time auto-arm and ESTOP re-arm both default to VEL_RAMP input
+    mode (was PASSTHROUGH). ODRIVE_VEL_RAMP_RATE_ENDPOINT_ID (398, for
+    fw v0.6.12) + ODRIVE_STARTUP_VEL_RAMP_RATE (25.0) pushed to all 4
+    axes at boot via Set_Param_Float, alongside the existing
+    Set_Vel_Gains push. Re-verify the endpoint ID if any ODrive is ever
+    reflashed to a different firmware version — IDs are not guaranteed
+    stable across releases.
+  - ODrive_ProcessCommand gained ODRIVE_CFG_SET_PARAM_FLOAT case; UART
+    parser gained the matching sub_type 31 branch (`2 31 <mask>
+    <endpoint_id> <value>`).
+  - StartIMUTask wrapped in #if !IMU_ENABLED to skip all SH2/I2C
+    activity when the IMU is disabled at compile time (was previously
+    spamming FERR_IMU_REPORT_CFG every boot in stub/bench-test mode).
+  - StartDefaultTask gutted to a one-line idle loop (was ~50 lines of
+    dead CAN smoke-test code with conflicting hardcoded node IDs).
+
+KNOWN GAPS (carried forward, not yet addressed)
+-------------------------------------------------
+- No IMU staleness watchdog. g_bno085_seq simply stops incrementing if
+  the BNO085 goes dark; ekf_correct_imu() then silently no-ops forever
+  with no error pushed and no dashboard indicator.
+- No I2C bus-reset recovery (BNO085 brownout mid-transaction still
+  freezes IMU data until reboot) — unchanged from the original BNO085
+  integration below.
+- RxSdo writes are fire-and-forget; no TxSdo read-back implemented.
+
+------------------------------------------------------------
+
 BNO085 I2C Integration — STM32H7_OMNIBASE_CAN_BNO085
 ======================================================
 Date: 2026-04-28

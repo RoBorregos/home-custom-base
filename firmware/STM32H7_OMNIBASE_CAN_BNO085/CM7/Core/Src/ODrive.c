@@ -144,6 +144,20 @@ HAL_StatusTypeDef Set_Vel_Gains(const Axis *axis, FDCAN_TXmsg *msg, float Vel_Ga
 	return HAL_FDCAN_AddMessageToTxFifoQ(&hfdcan1, &msg->header, msg->data);
 }
 
+/* RxSdo write: opcode(1B) + endpoint_id(2B LE) + reserved(1B) + value(4B) = 8B.
+ * No TxSdo response is read back here -- this is fire-and-forget, same as
+ * every other Set_* helper in this file. Use odrivetool/USB to confirm the
+ * value actually landed if you need a readback. */
+HAL_StatusTypeDef Set_Param_Float(const Axis *axis, FDCAN_TXmsg *msg, uint16_t endpoint_id, float value) {
+	Set_TX_Param(&msg->header, axis->NODE_ID, RXSDO_CMD_ID, FDCAN_STANDARD_ID, FDCAN_DATA_FRAME, FDCAN_DLC_BYTES_8);
+	msg->data[0] = SDO_OPCODE_WRITE;
+	msg->data[1] = (uint8_t)(endpoint_id & 0xFF);
+	msg->data[2] = (uint8_t)(endpoint_id >> 8);
+	msg->data[3] = 0; /* reserved */
+	pack_f32(&msg->data[4], value);
+	return HAL_FDCAN_AddMessageToTxFifoQ(&hfdcan1, &msg->header, msg->data);
+}
+
 HAL_StatusTypeDef Set_Axis_Node_ID(const Axis *axis, FDCAN_TXmsg *msg, uint32_t node_id) {
 	Set_TX_Param(&msg->header, axis->NODE_ID, SET_AXIS_NODE_ID, FDCAN_STANDARD_ID, FDCAN_DATA_FRAME, FDCAN_DLC_BYTES_4);
 	pack_u32(&msg->data[0], node_id);

@@ -1,3 +1,109 @@
+ODrive Dashboard — Change Summary (2026-06-20)
+===============================================
+
+NOTE: The dashboard's Axis Lab tab (per-motor inspection/control/
+calibration, #tab-axislab in dashboard.html) is UNTESTED — not yet
+validated against real hardware. Flagged here, in STATUS.txt
+(repo root), README.md (repo root), and README.md (this package).
+
+1. EKF / TF + FIRMWARE ERROR REPORTING
+----------------------------------------
+Files changed:
+  - odrive_comm/odrive_dashboard.py
+  - assets/dashboard.html
+
+What was done:
+  - _parse_and_publish() now consumes the on-MCU EKF's quaternion
+    (ODOM_q*) and full 6x6 covariance (ODOM_var_*) when present, falling
+    back to a yaw-derived quaternion + placeholder covariance for older
+    firmware.
+  - Added a tf2_ros.TransformBroadcaster + `publish_tf` parameter
+    (default True). Emits odom -> base_link after every
+    nav_msgs/Odometry publish, replacing robot_localization for the
+    omnibase config. See
+    ../../../firmware/STM32H7_OMNIBASE_CAN_BNO085/omnibase_documentation.md
+    section 11.
+  - Added `E=` / `ELOST=` line parsing (firmware error events). Each is
+    logged via get_logger().warn/error and emitted to the browser as a
+    `firmware_error` socket event with {code, axis, detail, desc, text}.
+    FERR_DESCRIPTIONS maps every FERR_* code from main.h to a readable
+    string.
+  - dashboard.html: added a dedicated "Firmware errors" log panel,
+    separate from the general activity log (no cross-posting between
+    the two — firmware errors used to also get mirrored into the
+    activity log; that mirror was removed so each panel shows only its
+    own kind of event).
+
+2. SLIM/FAT TELEMETRY FAST-PATH FIX
+--------------------------------------
+Files changed:
+  - odrive_comm/odrive_dashboard.py
+
+Bug: _parse_and_publish had no fast-path guard for the high-rate slim
+odom/IMU line (no per-axis fields, sent every cycle — the fat
+per-axis line is throttled to every 5th cycle). Every slim line fell
+through to the full per-axis parser, defaulting node_ids/axis_states/
+pos_est/etc. to zero and overwriting the good values from the last fat
+line — visible as the dashboard flickering between real telemetry and
+UNDEFINED/0.000 defaults.
+
+Fix: added a fast-path mirroring the one already present in home2's
+omnidriver dashboard — when 'N0' is absent from the parsed line, only
+patch the IMU/EKF-odom/sm_state fields onto a copy of the cached
+`_latest_telem` dict and emit that, instead of rebuilding (and zeroing)
+the whole telemetry dict.
+
+3. ARBITRARY CAN PARAMETER WRITE (RxSdo)
+--------------------------------------------
+Files changed:
+  - odrive_comm/odrive_dashboard.py
+  - assets/dashboard.html
+
+What was done:
+  - New protocol sub-type 31 (CFG_SET_PARAM_FLOAT): `2 31 <mask>
+    <endpoint_id> <value>`. Lets the dashboard set any float32 endpoint
+    in an ODrive's flat parameter tree (e.g.
+    axis0.controller.config.vel_ramp_rate) over CAN, without a
+    dedicated fixed command. Endpoint IDs come from the
+    flat_endpoints.json matching the ODrive's exact firmware version
+    (fw v0.6.12 confirmed on these 4 ODrives) — they are NOT stable
+    across firmware versions.
+  - Added send_set_param_float() public helper and a `set_param_float`
+    web-command handler.
+  - dashboard.html: new "Advanced param (RxSdo)" box (Endpoint ID +
+    Value inputs + "Set param" button) using the existing axis-mask
+    selector.
+  - No read-back (TxSdo) is implemented — fire-and-forget like every
+    other CAN write in this project. Confirm a write landed via
+    odrivetool/USB if certainty matters.
+
+4. INPUT MODE DEFAULT: PASSTHROUGH -> VEL_RAMP
+--------------------------------------------------
+Files changed:
+  - assets/dashboard.html
+
+The Startup input-mode selector (`#sinp`) now defaults to "Vel ramp"
+instead of "Passthrough", matching the firmware's new boot-time default
+(see firmware status.txt / STM32H7 project docs). vel_ramp_rate is
+pushed to 25.0 (turn/s)/s for all 4 axes at boot via the RxSdo path
+above.
+
+5. GAIN SLIDER LIMITS WIDENED
+---------------------------------
+Files changed:
+  - assets/dashboard.html
+
+Pos gain slider: 1-200 -> -20 to 20.
+Vel / Int gain sliders: 0.01-2 / 0.01-4 -> -10 to 10 (both).
+Confirmed (and worth remembering): gains are never sent automatically
+on dashboard connect — only when "Apply gains" is clicked. The
+displayed numbers are static HTML defaults, not a readback of the
+ODrive's actual gains (ODrive's CAN protocol has no GET_VEL_GAINS /
+GET_POSITION_GAIN; gains are write-only over the fixed CAN command
+set).
+
+===============================================
+
 ODrive Dashboard — Change Summary (2026-05-06)
 ===============================================
 
