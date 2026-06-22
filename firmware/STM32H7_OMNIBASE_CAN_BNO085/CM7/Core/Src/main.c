@@ -1951,7 +1951,7 @@ void StartIMUTask(void *argument)
  * are not guaranteed stable across firmware releases. RAM-only write, same
  * caveat as the gains above: re-applied every boot, not save_configuration()'d. */
 #define ODRIVE_VEL_RAMP_RATE_ENDPOINT_ID 398
-#define ODRIVE_STARTUP_VEL_RAMP_RATE     25.0f
+#define ODRIVE_STARTUP_VEL_RAMP_RATE     40.0f   /* was 25.0 — snappier accel; motor current_soft_max raised to 20A to back it */
 
 HAL_StatusTypeDef ODrive_Startup(Axis odrives[], uint8_t num_odrives, FDCAN_TXmsg *msg,
                                   Control_Mode control_mode, Input_Mode input_mode,
