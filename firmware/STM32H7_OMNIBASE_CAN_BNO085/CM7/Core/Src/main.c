@@ -1951,7 +1951,7 @@ void StartIMUTask(void *argument)
  * are not guaranteed stable across firmware releases. RAM-only write, same
  * caveat as the gains above: re-applied every boot, not save_configuration()'d. */
 #define ODRIVE_VEL_RAMP_RATE_ENDPOINT_ID 398
-#define ODRIVE_STARTUP_VEL_RAMP_RATE     25.0f
+#define ODRIVE_STARTUP_VEL_RAMP_RATE     40.0f   /* was 25.0 — snappier accel; motor current_soft_max raised to 20A to back it */
 
 HAL_StatusTypeDef ODrive_Startup(Axis odrives[], uint8_t num_odrives, FDCAN_TXmsg *msg,
                                   Control_Mode control_mode, Input_Mode input_mode,
@@ -2593,6 +2593,7 @@ void StartODriveTask(void *argument)
      * continuously before we re-arm. Any re-press during the hold cancels the timer. */
     uint8_t  estop_release_pending = 0;
     uint32_t estop_release_tick    = 0;
+    uint32_t estop_clear_tick      = 0;
 
     const uint32_t boot_delay_ms = 3000;
     uint32_t boot_tick = osKernelGetTickCount();
@@ -2655,6 +2656,10 @@ void StartODriveTask(void *argument)
                     for (uint8_t i = 0; i < num_odrives; i++) {
                         FDCAN_WAIT_TX_FREE();
                         Set_Axis_Requested_State(&odrives[i], &tx, IDLE);
+                    }
+                    for (uint8_t i = 0; i < num_odrives; i++) {
+                        FDCAN_WAIT_TX_FREE();
+                        Clear_Errors(&odrives[i], &tx);
                     }
                     sm_state           = SM_ESTOP;
                     g_estop_active     = 1;
@@ -2999,8 +3004,17 @@ void StartODriveTask(void *argument)
                 break;
             }
             case SM_ESTOP:
-                /* Handled above the switch (continue;) — this case exists
-                 * only to keep -Wswitch happy after adding the enum value. */
+                /* Periodically clear ODrive errors so the motors stay in
+                 * a freely-backdrivable IDLE state even if the ODrive latches
+                 * a new fault while the button is held (e.g. encoder error
+                 * from someone pushing the base). */
+                if ((now - estop_clear_tick) >= 500u) {
+                    estop_clear_tick = now;
+                    for (uint8_t i = 0; i < num_odrives; i++) {
+                        FDCAN_WAIT_TX_FREE();
+                        Clear_Errors(&odrives[i], &tx);
+                    }
+                }
                 break;
         }
 
