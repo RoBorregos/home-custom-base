@@ -116,6 +116,12 @@ The firmware runs a 6-state EKF (`firmware/.../ekf.c`) fusing wheel odometry wit
 
 ---
 
+## Troubleshooting
+
+See `firmware/STM32H7_OMNIBASE_CAN_BNO085/omnibase_documentation.md` §13 for known issues:
+- **§13.1** — I2C init failures / system not booting (FreeRTOS stack overflow)
+- **§13.2** — ODrive stuck in INITIALIZING and won't clear
+
 ## Developers
 
 - Rogelio Ruiz — [joserogelioruiz12@outlook.com](mailto:joserogelioruiz12@outlook.com)

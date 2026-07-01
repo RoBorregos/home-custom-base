@@ -53,8 +53,8 @@ static void default_params(EKFParams *p) {
     p->q_vy    = 0.8660;
     p->q_omega = 0.7746;
 
-    p->r_wheel_vx    = 0.05;
-    p->r_wheel_vy    = 0.05;
+    p->r_wheel_vx    = 0.30;   /* raised from 0.05 — reduced wheel trust due to one dead motor biasing FK */
+    p->r_wheel_vy    = 0.30;
     /* r_wheel_omega is set to a huge std-dev so wheel-derived yaw rate is
      * effectively ignored — matches r_l's `odom0_config[11] = False` and is
      * the right choice for a mecanum base where slip + mechanical play make

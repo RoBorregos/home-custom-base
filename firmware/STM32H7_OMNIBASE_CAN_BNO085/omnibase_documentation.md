@@ -886,6 +886,26 @@ In `omni_basics.launch.py`: remove the `robot_localization` `Node(...)` entry. R
 
 ---
 
+## Section 13 — Troubleshooting
+
+### 13.1 Stack size — I2C init errors or nothing works at boot
+
+If I2C initialization errors show up or the system just doesn't come up at all, it might be because a task's stack filled up. This happened to me many times. Check the stack sizes in `freertos.c` and increase whichever task you think is the culprit.
+
+---
+
+### 13.2 ODrive stuck in INITIALIZING forever
+
+One of the wheels gets stuck in `INITIALIZING` and won't come out no matter how many times you clear errors. Reasons still unknown.
+
+Per the [ODrive docs](https://docs.odriverobotics.com/v/latest/fibre_types/com_odriverobotics_ODrive.html#ODrive.Error.INITIALIZING), this is expected briefly on power-up or after changing a config like `current_hard_max`. But if it stays like that for more than 1–3 seconds, it might be a hardware issue. The important thing to know: **you cannot clear this error by spamming `Clear_Errors`** — it won't go away while the axis is still initializing.
+
+At RoboCup 2026 this happened and even connecting the ODrive to https://gui.odriverobotics.com/dashboard didn't help — couldn't clear the error from there either, and trying to reconfigure it from the GUI locked it up. Also tried: disconnecting the STM32 so it wouldn't spam CAN, connecting the ODrive alone without the battery to the motors, powering off and back on — it was still stuck in INITIALIZING. Then randomly it went away and everything worked. No idea why.
+
+**Best solution found so far:** turn everything off, wait a few seconds (probably has something to do with the capacitors discharging), then power back on. That's it. It's the only thing that consistently worked.
+
+---
+
 ## Known Limitations and Future Work
 
 1. **No IMU staleness watchdog.** `g_bno085_seq` simply stops incrementing if the BNO085 goes dark (I2C fault, sensor hang); `ekf_correct_imu()` then silently no-ops forever and the EKF falls back to wheel-only dead-reckoning, with no error pushed and no dashboard indicator — unlike the ESP32/PC link rows, which do track age/status explicitly. Candidate fix: track `g_bno085_seq` staleness against a timeout in `ODriveTask` and push a new `FERR_IMU_STALE` code.
