@@ -1,12 +1,29 @@
 # ESP32 + AS5600 → ODrive incremental-encoder bridge
 
+**PRODUCTION SETUP for node 33** — validated end-to-end: bench closed-loop tests
+(`odrive_config/closed_loop_test.py`), power-on self-calibration + self-arm, and a
+real drive test of the full 4-wheel base over the Bluetooth interface with the STM32
+omnibase firmware. (A second approach, SPI-absolute MA732 emulation in
+`../ESP32_AS5600_EncoderBridge_SPI/`, solved calibration persistence but was shelved
+for commutation instability under motion — see its README.)
+
 Bridges an AS5600 magnetic angle sensor (I2C-only — no SPI, no native ABI/quadrature
-output) to a synthesized quadrature A/B + Z-index signal the ODrive v3.6 already
-understands natively via `ENCODER_MODE_INCREMENTAL`. No ODrive firmware changes
-needed — this replaces the coarse external-Hall-tachometer workaround (see
-`../../ODriveV3_6_Test.md`) with a real commutation-grade position reference,
-enabling true `AXIS_STATE_CLOSED_LOOP_CONTROL` instead of forced-commutation
-`LOCKIN_SPIN`.
+output) to a synthesized quadrature A/B signal the ODrive v3.6 already understands
+natively via `ENCODER_MODE_INCREMENTAL`. No ODrive firmware changes needed — this
+replaces the coarse external-Hall-tachometer workaround (see `../../ODriveV3_6_Test.md`)
+with a real commutation-grade position reference, enabling true
+`AXIS_STATE_CLOSED_LOOP_CONTROL` instead of forced-commutation `LOCKIN_SPIN`.
+
+**No Z/index output**, by design. The AS5600 has no hardware index channel to begin
+with, and a software-emulated one (level-based, near the raw zero-crossing) was
+tried and dropped: ODrive's `AXIS_STATE_ENCODER_INDEX_SEARCH` turns out to use the
+exact same forced-commutation lockin mechanism as `AXIS_STATE_ENCODER_OFFSET_CALIBRATION`
+itself (`encoder.cpp`'s `run_index_search()` calls `run_lockin_spin()`), so it doesn't
+avoid the "does this survive load" question either — while our software Z pulse only
+found the index 1 out of 3 attempts in testing. Not worth the wire or the firmware
+complexity. See `../../ODriveV3_6_Test.md` §11/closed_loop_test.py for the full story
+and the reliable alternative: a full offset calibration on every boot (~9s, small
+excursion, 100% success rate in testing).
 
 ## Why a bridge at all
 The AS5600 only exposes I2C (plus an analog/PWM `OUT` pin) — no SPI absolute mode
@@ -35,36 +52,36 @@ missing a beat. See the "Risks" section below before trusting this at full curre
 |-----------|------------------|--------|
 | GPIO25    | GPIO12           | A      |
 | GPIO26    | GPIO13           | B      |
-| GPIO27    | GPIO14           | Z (index) |
 | GND       | GND              | common ground — required |
 
 ESP32 GPIO is 3.3 V logic, matching the ODrive's STM32F405 inputs directly — no
 level shifting needed.
 
+Note: the motor + AS5600 are currently bench-wired to **M0/axis0** (not M1/axis1
+where the wheel will ultimately live) — `ENC0` vs `ENC1` selects which axis a given
+GPIO pin's encoder signal routes to; see `../../ODriveV3_6_Test.md` for why.
+
 ## ODrive-side config
 ```python
-odrv0.axis1.encoder.config.mode = ENCODER_MODE_INCREMENTAL
-odrv0.axis1.encoder.config.cpr  = 4096          # AS5600 native 12-bit resolution
-odrv0.axis1.config.gpio12_mode  = GPIO_MODE_ENC1
-odrv0.axis1.config.gpio13_mode  = GPIO_MODE_ENC1
-odrv0.axis1.config.gpio14_mode  = GPIO_MODE_ENC1
+odrv0.axis0.encoder.config.mode = ENCODER_MODE_INCREMENTAL
+odrv0.axis0.encoder.config.cpr  = 4096          # AS5600 native 12-bit resolution
+odrv0.axis0.encoder.config.use_index = False    # no Z wired -- see "No Z/index output" above
+odrv0.config.gpio12_mode  = GPIO_MODE_ENC0
+odrv0.config.gpio13_mode  = GPIO_MODE_ENC0
 odrv0.save_configuration()
 odrv0.reboot()   # GPIO alternate-function mode is boot-time-only, see main .md Gotcha #2
 ```
-Then the standard calibration flow (same as any incremental encoder — this is
-what the *original* dead S1 setup would have used):
+Then, every boot (this encoder has no absolute reference to persist across a
+power cycle without an index, so this always needs to run fresh — see
+`closed_loop_test.py`'s `ensure_calibrated_and_ready()` for the actual
+implementation used):
 ```python
-odrv0.axis1.requested_state = AXIS_STATE_MOTOR_CALIBRATION
-# wait, check axis1.motor.error == 0
-odrv0.axis1.requested_state = AXIS_STATE_ENCODER_OFFSET_CALIBRATION
-# wait, check axis1.encoder.error == 0
-odrv0.axis1.motor.config.pre_calibrated = True
-odrv0.axis1.encoder.config.pre_calibrated = True
-odrv0.save_configuration()
+odrv0.axis0.requested_state = AXIS_STATE_MOTOR_CALIBRATION   # only needed once; pre_calibrated persists
+# wait, check axis0.motor.error == 0
+odrv0.axis0.requested_state = AXIS_STATE_ENCODER_OFFSET_CALIBRATION   # every boot, ~9s, small excursion
+# wait, check axis0.encoder.error == 0 and axis0.encoder.is_ready == True
+odrv0.axis0.requested_state = AXIS_STATE_CLOSED_LOOP_CONTROL
 ```
-On every subsequent boot: `AXIS_STATE_ENCODER_INDEX_SEARCH` (finds the absolute
-reference from the Z pulse, quick low-current spin) then
-`AXIS_STATE_CLOSED_LOOP_CONTROL` directly — no more `LOCKIN_SPIN`.
 
 If the wheel spins opposite to the commanded sign, flip
 `encoder.config.direction` rather than re-wiring A/B.
@@ -80,9 +97,6 @@ If the wheel spins opposite to the commanded sign, flip
   instead of jumping instantly on each read.
   - 80 kHz has >3x margin over the fastest edge rate this application needs:
     40 wheel RPM × 9:1 reduction = 360 motor RPM = 6 rev/s × 4096 cpr ≈ 24.6 kHz.
-- Z index is **level-based**, not a one-shot pulse: high whenever the emitted
-  position is within a small window (±8 counts) of the raw zero-crossing.
-  Self-correcting in both spin directions, no extra state to desync.
 - WiFi and Bluetooth are explicitly disabled at boot, and CPU is pinned to
   240 MHz — these are the main sources of interrupt jitter that would
   otherwise corrupt the quadrature timing a real closed loop is trusting.

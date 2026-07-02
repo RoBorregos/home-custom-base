@@ -2,9 +2,19 @@
  * ESP32_AS5600_EncoderBridge
  *
  * Bridges an AS5600 magnetic angle sensor (I2C-only, no native SPI/ABI output)
- * to a synthesized quadrature A/B + Z-index signal that the ODrive v3.6 can
- * consume directly via its native ENCODER_MODE_INCREMENTAL input -- no ODrive
- * firmware changes needed.
+ * to a synthesized quadrature A/B signal that the ODrive v3.6 can consume
+ * directly via its native ENCODER_MODE_INCREMENTAL input -- no ODrive firmware
+ * changes needed.
+ *
+ * No Z/index output: the AS5600 has no hardware index channel to begin with
+ * (it's I2C-only; there's nothing to synthesize it FROM in hardware), and a
+ * software-emulated one was tried and dropped -- ODrive's index search uses
+ * the same forced-commutation lockin mechanism as offset calibration itself
+ * (see encoder.cpp's run_index_search() -> run_lockin_spin()), so it doesn't
+ * avoid the load-robustness question either, while adding real unreliability
+ * (1/3 success in testing) and a wire for no real benefit. A full
+ * AXIS_STATE_ENCODER_OFFSET_CALIBRATION on every boot (~9s, small excursion)
+ * is simpler and has been 100% reliable -- see closed_loop_test.py.
  *
  * Board: ESP32-WROOM-32. Timer setup below auto-selects between the Arduino-ESP32
  * core 3.x (ESP-IDF 5.x) and core 2.x legacy timer APIs at compile time, so this
@@ -13,18 +23,19 @@
  *
  * Wiring:
  *   AS5600   VCC -> 3V3, GND -> GND, SDA -> GPIO21, SCL -> GPIO22
- *   ODrive   A   <- GPIO25, B <- GPIO26, Z <- GPIO27, GND <-> ESP32 GND (common ground)
+ *   ODrive   A   <- GPIO25, B <- GPIO26, GND <-> ESP32 GND (common ground)
  *   (ESP32 GPIO is 3.3V logic -- matches the ODrive's STM32F405 inputs directly.)
  *
  * ODrive-side config (once wired):
- *   odrv0.axis1.encoder.config.mode = ENCODER_MODE_INCREMENTAL
- *   odrv0.axis1.encoder.config.cpr  = 4096      # matches AS5600's native 12-bit resolution
- *   odrv0.axis1.config.gpio12_mode  = ENC1      # A
- *   odrv0.axis1.config.gpio13_mode  = ENC1      # B
- *   odrv0.axis1.config.gpio14_mode  = ENC1      # Z (if using this pin for index)
- *   -- run AXIS_STATE_MOTOR_CALIBRATION + AXIS_STATE_ENCODER_OFFSET_CALIBRATION once,
- *      save pre_calibrated=True on both, then AXIS_STATE_ENCODER_INDEX_SEARCH on
- *      subsequent boots before AXIS_STATE_CLOSED_LOOP_CONTROL.
+ *   odrv0.axis0.encoder.config.mode = ENCODER_MODE_INCREMENTAL
+ *   odrv0.axis0.encoder.config.cpr  = 4096      # matches AS5600's native 12-bit resolution
+ *   odrv0.axis0.encoder.config.use_index = False
+ *   odrv0.config.gpio12_mode  = ENC0      # A -- ENC0/ENC1 selects which axis, see main .md
+ *   odrv0.config.gpio13_mode  = ENC0      # B
+ *   -- run AXIS_STATE_MOTOR_CALIBRATION once (pre_calibrated persists fine, it's
+ *      a real electrical property). AXIS_STATE_ENCODER_OFFSET_CALIBRATION does
+ *      NOT persist usefully without an index (see closed_loop_test.py) --
+ *      just run it fresh every boot before AXIS_STATE_CLOSED_LOOP_CONTROL.
  *   -- if the wheel spins the "wrong" way relative to command sign, flip
  *      encoder.config.direction rather than re-wiring A/B.
  *
@@ -39,9 +50,6 @@
  *   - TIMER_FREQ_HZ (80 kHz) is set with >3x margin over the fastest edge
  *     rate this application ever needs (~24.6 kcounts/s at max wheel speed:
  *     40 wheel RPM * 9:1 reduction = 360 motor RPM = 6 rev/s * 4096 cpr).
- *   - The Z pulse is level-based (a small angular window around the raw
- *     zero-crossing), not edge/one-shot -- self-correcting in both spin
- *     directions, no extra state to desync.
  */
 
 #include <Wire.h>
@@ -53,7 +61,6 @@ static const int I2C_SDA_PIN = 21;
 static const int I2C_SCL_PIN = 22;
 static const int A_PIN = 25;
 static const int B_PIN = 26;
-static const int Z_PIN = 27;
 
 // ---------- AS5600 ----------
 static const uint8_t AS5600_ADDR = 0x36;
@@ -62,7 +69,6 @@ static const uint32_t I2C_CLOCK_HZ = 400000;         // AS5600 Fast-mode max
 
 // ---------- quadrature synthesis ----------
 static const int32_t CPR = 4096;                    // AS5600 native counts/rev == ODrive cpr
-static const int32_t Z_WINDOW = 8;                  // +/- counts around raw==0 where Z is high
 static const uint32_t TIMER_FREQ_HZ = 80000;         // ISR rate, see design notes above
 
 // forward=00,01,11,10 (standard x4 quadrature sequence)
@@ -98,12 +104,6 @@ void IRAM_ATTR onTimer() {
 
   digitalWrite(A_PIN, QUAD_A[quad_state]);
   digitalWrite(B_PIN, QUAD_B[quad_state]);
-
-  // CPR is a power of 2, so this AND gives the correct non-negative
-  // modulo even for negative emitted_count (two's complement).
-  uint32_t m = (uint32_t)emitted_count & (CPR - 1);
-  bool z = (m < Z_WINDOW) || (m > (uint32_t)(CPR - Z_WINDOW));
-  digitalWrite(Z_PIN, z ? HIGH : LOW);
 }
 
 bool readAS5600Raw(uint16_t &out) {
@@ -130,10 +130,8 @@ void setup() {
 
   pinMode(A_PIN, OUTPUT);
   pinMode(B_PIN, OUTPUT);
-  pinMode(Z_PIN, OUTPUT);
   digitalWrite(A_PIN, LOW);
   digitalWrite(B_PIN, LOW);
-  digitalWrite(Z_PIN, LOW);
 
   Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN, I2C_CLOCK_HZ);
 

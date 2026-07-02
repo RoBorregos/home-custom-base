@@ -1945,6 +1945,30 @@ void StartIMUTask(void *argument)
 #define ODRIVE_STARTUP_VEL_GAIN     0.3333f
 #define ODRIVE_STARTUP_VEL_INT_GAIN 5.658f
 
+/* Node 33 (v3.6 + AS5600/ESP32 encoder bridge) gets ODrive STOCK gains instead:
+ * the tuned vel_integrator_gain above (5.658, ~17x stock) was tuned for the S1
+ * wheels and EMPIRICALLY destabilizes this axis on the bench -- every bench
+ * CURRENT_LIMIT_VIOLATION trip during bring-up traced to it, while stock gains
+ * ran clean (see ODriveV3_6_Test.md). Re-tune on the assembled robot under
+ * real load before promoting node 33 to the shared tuned values. */
+#define ODRIVE_NODE33_ID            33
+#define ODRIVE_NODE33_VEL_GAIN      0.1667f
+#define ODRIVE_NODE33_VEL_INT_GAIN  0.3333f
+
+/* Axis states in which a Set_Axis_Requested_State frame would ABORT an
+ * in-progress calibration: fw 0.5.6's calibration handlers (e.g.
+ * encoder.cpp run_offset_calibration) exit their loops the moment
+ * requested_state_ changes, and the aborted calibration only reruns on
+ * reboot or an explicit re-request. Never send state requests to an axis
+ * sitting in one of these. Matters for node 33, which self-calibrates its
+ * encoder offset for ~9 s at every power-on (incremental encoder -- the
+ * offset cannot persist across power cycles). */
+#define AXIS_IS_CALIBRATING(s) ((s) == STARTUP_SEQUENCE || \
+                                (s) == FULL_CALIBRATION_SEQUENCE || \
+                                (s) == MOTOR_CALIBRATION || \
+                                (s) == ENCODER_INDEX_SEARCH || \
+                                (s) == ENCODER_OFFSET_CALIBRATION)
+
 /* axis0.controller.config.vel_ramp_rate, written via RxSdo (Set_Param_Float).
  * Endpoint ID is from flat_endpoints.json for fw v0.6.12 -- re-check this ID
  * if any ODrive is ever reflashed to a different firmware version, since IDs
@@ -1970,10 +1994,12 @@ HAL_StatusTypeDef ODrive_Startup(Axis odrives[], uint8_t num_odrives, FDCAN_TXms
 
         /* Push the project-tuned velocity-loop gains BEFORE arming, so the
          * controller uses them on its very first SET_INPUT_VEL frame.
-         * SET_VEL_GAINS doesn't reset axis state — safe to issue anytime. */
+         * SET_VEL_GAINS doesn't reset axis state — safe to issue anytime.
+         * Node 33 gets stock gains instead — see ODRIVE_NODE33_* above. */
         FDCAN_WAIT_TX_FREE();
         st = Set_Vel_Gains(&odrives[i], msg,
-                           ODRIVE_STARTUP_VEL_GAIN, ODRIVE_STARTUP_VEL_INT_GAIN);
+                           (odrives[i].NODE_ID == ODRIVE_NODE33_ID) ? ODRIVE_NODE33_VEL_GAIN     : ODRIVE_STARTUP_VEL_GAIN,
+                           (odrives[i].NODE_ID == ODRIVE_NODE33_ID) ? ODRIVE_NODE33_VEL_INT_GAIN : ODRIVE_STARTUP_VEL_INT_GAIN);
         if (st != HAL_OK) return st;
 
         FDCAN_WAIT_TX_FREE();
@@ -1989,10 +2015,10 @@ HAL_StatusTypeDef ODrive_Startup(Axis odrives[], uint8_t num_odrives, FDCAN_TXms
  * effect. Returns 1 on confirmed arm, 0 if it never confirmed within `attempts`.
  * The ~10 Hz heartbeat keeps axis->AXIS_Current_State fresh via ODrive_RX_CallBack.
  *
- * Armed_State is CLOSED_LOOP_CONTROL for every wheel except node 33, which has
- * no commutation-grade encoder and runs forced-commutation LOCKIN_SPIN instead
- * (custom firmware, see odrive_config/firmware/ in the repo) — so this same
- * arm sequence works unmodified for both kinds of wheel.
+ * Armed_State is CLOSED_LOOP_CONTROL for all four wheels (node 33 included,
+ * since its AS5600/ESP32 encoder bridge enabled true closed loop -- see
+ * firmware/ESP32_AS5600_EncoderBridge/). Kept parameterized via Armed_State
+ * rather than hardcoded, from node 33's LOCKIN_SPIN era.
  *
  * CAN_STUB=1: loopback does not fake heartbeat responses, so AXIS_Current_State
  * never updates. Skip the confirmation loop and return success immediately so
@@ -2556,13 +2582,19 @@ void StartODriveTask(void *argument)
     odrives[1].gear_ratio  = 9;
     odrives[2].gear_ratio  = 9;
     odrives[3].gear_ratio  = 9;
-    /* Node 33 (odrives[2]) has no commutation-grade encoder -- it runs
-     * forced-commutation open loop (custom firmware) instead of true
-     * CLOSED_LOOP_CONTROL, so its healthy/armed state is LOCKIN_SPIN. See
-     * ODrive.h's Armed_State comment and odrive_config/firmware/ in the repo. */
+    /* Node 33 (odrives[2], the v3.6 replacement for the dead S1) now runs TRUE
+     * closed-loop velocity control like the other wheels, using an AS5600
+     * magnetic encoder bridged through an ESP32 as quadrature (see
+     * firmware/ESP32_AS5600_EncoderBridge/). Its saved config has
+     * startup_encoder_offset_calibration + startup_closed_loop_control set, so
+     * on power-up it spins ~+/-16 deg of wheel for ~9 s to self-calibrate
+     * (incremental encoder -- offset cannot persist across power cycles), then
+     * self-arms into CLOSED_LOOP_CONTROL. Arm requests sent while it is still
+     * calibrating simply fail and are retried by ODrive_ArmAxisConfirmed and
+     * the 500 ms auto-recovery loop below. */
     odrives[0].Armed_State = CLOSED_LOOP_CONTROL;
     odrives[1].Armed_State = CLOSED_LOOP_CONTROL;
-    odrives[2].Armed_State = LOCKIN_SPIN;
+    odrives[2].Armed_State = CLOSED_LOOP_CONTROL;
     odrives[3].Armed_State = CLOSED_LOOP_CONTROL;
 
     ODriveSMState sm_state         = SM_BOOT;
@@ -2594,6 +2626,7 @@ void StartODriveTask(void *argument)
     /* Periodic per-axis auto-recovery: re-arm any axis that has fallen out of
      * CLOSED_LOOP_CONTROL (undervoltage, fault, or its own CAN watchdog). */
     uint32_t last_rearm_tick = osKernelGetTickCount();
+    uint8_t  rearm_fail_count[4] = {0};  /* consecutive failed re-arms, per axis (node 33 recovery) */
     const uint32_t REARM_PERIOD_MS = 500;
 
     /* Error-detection state — not involved in control, purely diagnostic. */
@@ -2839,18 +2872,38 @@ void StartODriveTask(void *argument)
                     for (uint8_t i = 0; i < num_odrives; i++) {
                         FDCAN_WAIT_TX_FREE();
                         Set_Vel_Gains(&odrives[i], &tx,
-                                     ODRIVE_STARTUP_VEL_GAIN,
-                                     ODRIVE_STARTUP_VEL_INT_GAIN);
+                                     (odrives[i].NODE_ID == ODRIVE_NODE33_ID) ? ODRIVE_NODE33_VEL_GAIN     : ODRIVE_STARTUP_VEL_GAIN,
+                                     (odrives[i].NODE_ID == ODRIVE_NODE33_ID) ? ODRIVE_NODE33_VEL_INT_GAIN : ODRIVE_STARTUP_VEL_INT_GAIN);
                     }
 
                     /* Push the tuned vel_ramp_rate (RxSdo arbitrary-parameter
                      * write) before arming, same RAM-only/every-boot pattern
-                     * as the gains above. */
+                     * as the gains above. NOTE: node 33 runs fw 0.5.6, which
+                     * has no RxSdo (cmd 0x004 there is Get_Encoder_Error) --
+                     * this frame is harmlessly ignored by it, and its
+                     * vel_ramp_rate=40 comes from its SAVED config instead
+                     * (odrive_config/odrive_node33_v3_6_closedloop_as5600.json). */
                     for (uint8_t i = 0; i < num_odrives; i++) {
                         FDCAN_WAIT_TX_FREE();
                         Set_Param_Float(&odrives[i], &tx,
                                        ODRIVE_VEL_RAMP_RATE_ENDPOINT_ID,
                                        ODRIVE_STARTUP_VEL_RAMP_RATE);
+                    }
+
+                    /* Wait (bounded, <=15 s) for any axis still running a
+                     * power-on calibration before sending ANY state request:
+                     * node 33 self-calibrates its encoder offset at boot and a
+                     * requested_state frame arriving mid-calibration aborts it
+                     * (see AXIS_IS_CALIBRATING above). The STM32 boots much
+                     * faster than that ~9 s calibration, so without this wait
+                     * the arm request below would kill it every single boot. */
+                    for (uint16_t w = 0; w < 1500; w++) {
+                        uint8_t any_calibrating = 0;
+                        for (uint8_t i = 0; i < num_odrives; i++)
+                            if (AXIS_IS_CALIBRATING(odrives[i].AXIS_Current_State))
+                                any_calibrating = 1;
+                        if (!any_calibrating) break;
+                        osDelay(10);
                     }
 
                     /* Arm each axis WITH heartbeat confirmation + retry, instead
@@ -2877,19 +2930,49 @@ void StartODriveTask(void *argument)
                  * setpoint so it does not lurch on recovery. Rate-limited so it
                  * never starves the SET_VEL stream. This also fixes "the S1's
                  * drop out over time and never come back" without a reset.
-                 * Armed_State is CLOSED_LOOP_CONTROL for every wheel except
-                 * node 33, which runs forced-commutation LOCKIN_SPIN instead
-                 * (no commutation-grade encoder) -- see ODrive.h. */
+                 * All four wheels (including node 33, now on an AS5600/ESP32
+                 * encoder bridge) use CLOSED_LOOP_CONTROL -- see ODrive.h.
+                 * For node 33 this loop also doubles as the boot-time retry:
+                 * requests sent while its ~9 s power-on self-calibration is
+                 * still running fail until the axis becomes ready. */
                 if ((now - last_rearm_tick) >= REARM_PERIOD_MS) {
                     last_rearm_tick = now;
                     for (uint8_t i = 0; i < num_odrives; i++) {
                         if (odrives[i].AXIS_Current_State != UNDEFINED &&
                             odrives[i].AXIS_Current_State != odrives[i].Armed_State) {
+                            /* An axis mid-calibration is not faulted -- it is
+                             * recovering. A state request now would ABORT the
+                             * calibration (see AXIS_IS_CALIBRATING); leave it
+                             * alone and let it finish. */
+                            if (AXIS_IS_CALIBRATING(odrives[i].AXIS_Current_State)) {
+                                rearm_fail_count[i] = 0;
+                                continue;
+                            }
                             FirmwareError_Push(FERR_AXIS_REARM, i,
                                                (uint8_t)odrives[i].AXIS_Current_State);
+                            /* Node 33: if plain re-arms keep failing, its
+                             * power-on encoder-offset calibration was likely
+                             * aborted (arm request or ESTOP landed mid-cal) --
+                             * closed loop can then NEVER engage until the
+                             * calibration is redone. Request it explicitly
+                             * (~9 s, wheel moves ~+/-16 deg on its own); the
+                             * gate above protects it from interference and a
+                             * later cycle's re-arm then succeeds. */
+                            if (odrives[i].NODE_ID == ODRIVE_NODE33_ID &&
+                                ++rearm_fail_count[i] >= 6) {   /* ~3 s of failures */
+                                rearm_fail_count[i] = 0;
+                                FDCAN_WAIT_TX_FREE(); Clear_Errors(&odrives[i], &tx);
+                                FDCAN_WAIT_TX_FREE(); Set_Axis_Requested_State(&odrives[i], &tx, ENCODER_OFFSET_CALIBRATION);
+                                continue;
+                            }
                             FDCAN_WAIT_TX_FREE(); Clear_Errors(&odrives[i], &tx);
                             FDCAN_WAIT_TX_FREE(); Set_Axis_Requested_State(&odrives[i], &tx, odrives[i].Armed_State);
                             FDCAN_WAIT_TX_FREE(); Set_Input_Vel(&odrives[i], &tx, 0.0f, 0.0f);
+                        } else {
+                            /* armed (or no heartbeat yet) -- clear the streak so
+                             * a later lone failure can't trip the node-33
+                             * calibration re-request off stale counts */
+                            rearm_fail_count[i] = 0;
                         }
                     }
                 }

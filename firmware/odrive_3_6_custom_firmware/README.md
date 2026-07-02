@@ -1,5 +1,13 @@
 # Patched ODrive v3.6 firmware — reactive open-loop velocity + CAN + PI
 
+> **STATUS UPDATE: node 33 no longer runs open loop.** An AS5600+ESP32 quadrature encoder bridge
+> (`../ESP32_AS5600_EncoderBridge/`) gave it a real commutation-grade encoder and it now runs true
+> `AXIS_STATE_CLOSED_LOOP_CONTROL` like the other wheels (see `ODriveV3_6_Test.md` §12).
+> **This patched image is still what's flashed on the board** — the lockin-era patches are simply
+> inactive in closed loop (reactive-lockin/PI code only runs in `LOCKIN_SPIN`; the CAN
+> `SET_INPUT_VEL` redirect only fires in that state; telemetry wiring happens natively in closed
+> loop). Everything below documents the open-loop era and remains valid reflash/rebuild reference.
+
 Custom build of ODrive firmware **fw-v0.5.6** for the **v3.6-56V** board (node 33 in the omnibase
 system — this ODrive has no commutation-grade encoder, only an external low-resolution Hall
 tachometer, so it runs forced-commutation `LOCKIN_SPIN` instead of true `CLOSED_LOOP_CONTROL`).

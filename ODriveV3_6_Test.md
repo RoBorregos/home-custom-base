@@ -877,3 +877,115 @@ rad/s² in both tools (up from the earlier 8 A / 450 conservative values), per r
 Gains used (`kp=2.0, ki=5.0, limit=100`) were a first reasonable guess, not a tuned result —
 proven stable but not verified optimal (no overshoot/settling-time analysis done). Tune further
 if steady-state accuracy or disturbance rejection needs improving for real driving use.
+
+---
+
+# §12. TRUE CLOSED LOOP: AS5600 + ESP32 encoder bridge (supersedes the open-loop/PI era)
+
+> **This section describes the CURRENT state of node 33.** Everything above (LOCKIN_SPIN forced
+> commutation, reactive open-loop, firmware velocity PI) is superseded: the axis now runs real
+> `AXIS_STATE_CLOSED_LOOP_CONTROL`, at functional parity with the other 3 wheels. The custom
+> firmware from the earlier sections is still what's flashed (its lockin patches are simply
+> inactive in closed loop), so the reflash/rebuild docs above remain valid.
+
+## The encoder: AS5600 bridged through an ESP32 as quadrature
+
+The AS5600 (12-bit magnetic angle sensor, diametric magnet on the motor shaft) is I2C-only — no
+SPI, no ABI — so it can't talk to the ODrive directly in any supported encoder mode. An
+ESP32-WROOM-32 bridges it: reads the angle over I2C (~7 kHz after optimization) and synthesizes
+standard x4 quadrature A/B into the ODrive's native `ENCODER_MODE_INCREMENTAL` input
+(cpr=4096, GPIO12/13 = ENC0, motor+encoder on **M0/axis0**). Full design, wiring, and rationale:
+`firmware/ESP32_AS5600_EncoderBridge/`.
+
+Result: real FOC commutation. Current draw is now load-proportional (~0.1-0.5 A holding a steady
+unloaded 4 RPM vs. the 15 A the open-loop era burned continuously), no sync-loss failure mode,
+and the axis responds to the exact same CAN commands as the S1 wheels.
+
+Key findings along the way (details in the two bridge READMEs):
+- **No Z/index emulation.** Tried, dropped: only 1/3 reliability, and ODrive's index search uses
+  the same forced-commutation lockin as offset calibration anyway, so it bought nothing.
+- **Offset calibration cannot persist across power cycles** with an incremental encoder and no
+  index: the quadrature protocol only carries *change*, so the ODrive's count re-zeroes wherever
+  the shaft sits at boot, invalidating any saved count→electrical-phase mapping
+  (`phase_offset_float`). The fix is a **power-on self-calibration** (see STM32 section below).
+- **An SPI-absolute (MagAlpha MA732) emulation was built and bench-tested** as a second approach
+  (`firmware/ESP32_AS5600_EncoderBridge_SPI/`): calibration persistence genuinely worked, but
+  commutation was unstable under motion (suspected bridge latency corrupting the phase reference
+  → SPINOUT/current-limit trips). Shelved with findings documented; quadrature is production.
+- **Feedback-wiring quality is everything**: a bad rewire (ESP32 GPIO4/5 attempt) produced glitchy
+  A/B that made the closed loop oscillate audibly and trip the 23 A hard limit on a stationary
+  motor. The hand-rotation `shadow_count` monotonicity check (spin one direction, count must climb
+  smoothly, no collapses) is the mandatory pre-flight after ANY wiring change.
+
+## Gains: the main.c "tuned" values destabilize this axis
+
+The project-tuned S1 gains (`vel_gain=0.3333`, `vel_integrator_gain=5.658`) tripped
+`CURRENT_LIMIT_VIOLATION` on this axis on the bench — reproducibly, on BOTH encoder variants.
+ODrive stock gains (`0.1667`/`0.3333`) run clean. main.c now sends stock gains to node 33 and the
+tuned gains to the other three (`ODRIVE_NODE33_*` defines). Re-tune on the assembled robot under
+real load before promoting node 33 to shared values.
+
+Position moves need `INPUT_MODE_TRAP_TRAJ`, not passthrough: a passthrough position step demands
+`pos_gain × error` velocity instantly, then brakes at max current at the target (tripped the hard
+limit on a 0.5-wheel-rev move). `closed_loop_test.py` mode 3 does this correctly.
+
+## Test tool: `odrive_config/closed_loop_test.py`
+
+Menu-driven: 1) the openloop sequence profile at 1/4 scale through closed-loop velocity,
+2) manual wheel-RPM entry, 3) relative position moves in wheel revolutions (trap-traj).
+Defaults to stock gains; `--tuned-gains` opts into the main.c values (bench-unstable, see above).
+Handles the fresh-calibration-if-needed flow automatically.
+
+## ODrive config (saved; backup: `odrive_config/odrive_node33_v3_6_closedloop_as5600.json`)
+
+- axis0: node_id **33**, `ENCODER_MODE_INCREMENTAL`, cpr 4096, GPIO12/13=ENC0
+- CAN **500 kbps** (was 250k default — robot bus runs 500k); axis1 CAN broadcasts silenced
+- **`startup_encoder_offset_calibration=True` + `startup_closed_loop_control=True`**: at every
+  power-on the board self-calibrates (~9 s, wheel moves ~±16° — 1 s rotor lock + 8 electrical
+  revs each way at 10 A) then self-arms into closed-loop velocity/VEL_RAMP at vel=0. Verified on
+  real power cycle. **The shaft must be free to move at boot**; calibrating under load can slip
+  silently → bad offset (untested — see TODO).
+- Motor: `current_lim=15 A` (+8 margin → 23 A hard trip), stock velocity gains saved,
+  `vel_limit=25 turn/s`, `vel_ramp_rate=40`.
+
+## STM32 main.c integration (built, flashed, and DRIVE-TESTED over BT)
+
+- `odrives[2].Armed_State = CLOSED_LOOP_CONTROL` — node 33 takes the identical arm/recovery/ESTOP
+  paths as the S1s. All LOCKIN-era comments rewritten.
+- Per-axis gains (`ODRIVE_NODE33_*`) in both `Set_Vel_Gains` push sites.
+- The RxSdo `vel_ramp_rate` push is a harmless no-op on node 33 (fw 0.5.6 has no RxSdo);
+  its value comes from saved config.
+- **Boot-race fix (critical):** fw 0.5.6's `run_offset_calibration()` ABORTS the moment any
+  `requested_state` frame arrives — and the STM32 boots in ~2 s, mid-way into node 33's ~9 s
+  self-cal. Fixes: (1) `AXIS_IS_CALIBRATING()` guard — never send state requests to a calibrating
+  axis; (2) SM_BOOT waits (≤15 s) for calibrations to finish before arming; (3) the 500 ms
+  recovery loop skips calibrating axes AND, if node 33 fails to arm ~3 s straight (signature of
+  an aborted cal, e.g. ESTOP held during power-on), explicitly requests
+  `ENCODER_OFFSET_CALIBRATION` once and lets it run protected — node 33 self-heals instead of
+  staying dead until a power cycle. Side effect worth knowing: a mid-mission recovery means the
+  wheel autonomously wiggles ±16° for ~9 s.
+- **End-to-end test PASSED**: STM32 flashed, all wheels on CAN, robot driven via the Bluetooth
+  interface with node 33 participating as a normal wheel.
+
+## Limits vs. the S1 wheels (from the config JSONs)
+
+Matched: hard current trip 23 A, vel_limit 25 turn/s (+1.2 tolerance), bus window 10.5-29.0 V,
+overspeed/spinout protections, vel_ramp_rate 40. Different: continuous current 15 A vs the S1s'
+20 A (less torque headroom); `dc_max_positive_current` inf vs 15 A (moot — motor limit binds
+first); FET temp limits are each board's own spec; and **the CAN watchdog is disabled on node 33**
+(S1s: 0.5 s). Deliberate: a 0.5 s watchdog would expire during the silent ~9 s boot cal and abort
+it. Consequence: if the STM32 itself dies mid-drive, the S1s self-stop and node 33 keeps its last
+commanded velocity. The STM32's own command watchdog covers ROS/BT loss; the uncovered case is
+accepted for now.
+
+## Remaining TODO
+- **Brake resistance mismatch**: config says `brake_resistance=2.0` Ω but the physical resistor
+  is 5 Ω → braking absorption runs at ~40% of what the firmware intends; hard decel risks a
+  nuisance DC_BUS_OVER_VOLTAGE trip (bus ~26.7 V, trip 29 V). Hardware-safe direction (resistor
+  FET under-driven, nothing overheats). Fix next time on USB:
+  `odrv0.config.brake_resistance = 5.0; odrv0.save_configuration()` + refresh the JSON backup.
+- Offset-calibration-under-load check: compare `phase_offset_float` calibrated lifted vs. with
+  the wheel on the ground under robot weight (silent-slip risk).
+- Re-tune node 33's velocity gains on the assembled robot; retire the stock-gain exception if a
+  shared tune emerges.
+- SPI-absolute bridge latency (if calibration-free boot ever becomes worth it).
