@@ -59,6 +59,15 @@ typedef struct Axis
     uint8_t  Controller_Status;
     volatile uint8_t UPDATED;
     uint8_t  gear_ratio;
+    /* The axis state that counts as "armed and healthy" for this wheel.
+     * Every wheel except node 33 uses true closed-loop velocity control
+     * (native encoder + onboard PI), so Armed_State == CLOSED_LOOP_CONTROL.
+     * Node 33 (the v3.6 replacement for the dead S1) has no commutation-grade
+     * encoder -- only an external, low-resolution Hall sensor unsuited for
+     * FOC feedback -- so it runs forced-commutation open loop (custom firmware,
+     * see odrive_config/firmware/) and its healthy/armed state is LOCKIN_SPIN
+     * instead. Set once per axis where NODE_ID/gear_ratio are assigned. */
+    uint8_t  Armed_State;
 } Axis;
 
 /* Axis States */

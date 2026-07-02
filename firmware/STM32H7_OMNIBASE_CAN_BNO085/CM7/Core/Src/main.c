@@ -1984,10 +1984,15 @@ HAL_StatusTypeDef ODrive_Startup(Axis odrives[], uint8_t num_odrives, FDCAN_TXms
 }
 
 /* Re-issues the arm triplet (clear errors, set velocity mode, request
- * CLOSED_LOOP_CONTROL) and waits for the HEARTBEAT to confirm the axis actually
- * reached CLOSED_LOOP_CONTROL — instead of trusting that a queued CAN frame took
+ * axis->Armed_State) and waits for the HEARTBEAT to confirm the axis actually
+ * reached that state — instead of trusting that a queued CAN frame took
  * effect. Returns 1 on confirmed arm, 0 if it never confirmed within `attempts`.
  * The ~10 Hz heartbeat keeps axis->AXIS_Current_State fresh via ODrive_RX_CallBack.
+ *
+ * Armed_State is CLOSED_LOOP_CONTROL for every wheel except node 33, which has
+ * no commutation-grade encoder and runs forced-commutation LOCKIN_SPIN instead
+ * (custom firmware, see odrive_config/firmware/ in the repo) — so this same
+ * arm sequence works unmodified for both kinds of wheel.
  *
  * CAN_STUB=1: loopback does not fake heartbeat responses, so AXIS_Current_State
  * never updates. Skip the confirmation loop and return success immediately so
@@ -2000,16 +2005,16 @@ static uint8_t ODrive_ArmAxisConfirmed(Axis *axis, FDCAN_TXmsg *msg,
     (void)attempts; (void)axis_idx;
     FDCAN_WAIT_TX_FREE(); Clear_Errors(axis, msg);
     FDCAN_WAIT_TX_FREE(); Set_Controller_Modes(axis, msg, ctrl, in_mode);
-    FDCAN_WAIT_TX_FREE(); Set_Axis_Requested_State(axis, msg, CLOSED_LOOP_CONTROL);
+    FDCAN_WAIT_TX_FREE(); Set_Axis_Requested_State(axis, msg, axis->Armed_State);
     return 1;
 #else
     for (uint8_t a = 0; a < attempts; a++) {
         FDCAN_WAIT_TX_FREE(); Clear_Errors(axis, msg);
         FDCAN_WAIT_TX_FREE(); Set_Controller_Modes(axis, msg, ctrl, in_mode);
-        FDCAN_WAIT_TX_FREE(); Set_Axis_Requested_State(axis, msg, CLOSED_LOOP_CONTROL);
+        FDCAN_WAIT_TX_FREE(); Set_Axis_Requested_State(axis, msg, axis->Armed_State);
         for (uint8_t w = 0; w < 30; w++) {          /* wait up to ~300 ms */
             osDelay(10);
-            if (axis->AXIS_Current_State == CLOSED_LOOP_CONTROL) return 1;
+            if (axis->AXIS_Current_State == axis->Armed_State) return 1;
         }
         (void)a;
     }
@@ -2551,6 +2556,14 @@ void StartODriveTask(void *argument)
     odrives[1].gear_ratio  = 9;
     odrives[2].gear_ratio  = 9;
     odrives[3].gear_ratio  = 9;
+    /* Node 33 (odrives[2]) has no commutation-grade encoder -- it runs
+     * forced-commutation open loop (custom firmware) instead of true
+     * CLOSED_LOOP_CONTROL, so its healthy/armed state is LOCKIN_SPIN. See
+     * ODrive.h's Armed_State comment and odrive_config/firmware/ in the repo. */
+    odrives[0].Armed_State = CLOSED_LOOP_CONTROL;
+    odrives[1].Armed_State = CLOSED_LOOP_CONTROL;
+    odrives[2].Armed_State = LOCKIN_SPIN;
+    odrives[3].Armed_State = CLOSED_LOOP_CONTROL;
 
     ODriveSMState sm_state         = SM_BOOT;
     Control_Mode  current_ctrl_mode  = VELOCITY_CONTROL;
@@ -2858,21 +2871,24 @@ void StartODriveTask(void *argument)
 
             case SM_RUNNING:
             {
-                /* Periodic per-axis auto-recovery: if an axis fell out of
-                 * CLOSED_LOOP_CONTROL (undervoltage, latched fault, or its own
-                 * CAN watchdog tripping), clear errors, re-arm it, and zero its
+                /* Periodic per-axis auto-recovery: if an axis fell out of its
+                 * own Armed_State (undervoltage, latched fault, or its own CAN
+                 * watchdog tripping), clear errors, re-arm it, and zero its
                  * setpoint so it does not lurch on recovery. Rate-limited so it
                  * never starves the SET_VEL stream. This also fixes "the S1's
-                 * drop out over time and never come back" without a reset. */
+                 * drop out over time and never come back" without a reset.
+                 * Armed_State is CLOSED_LOOP_CONTROL for every wheel except
+                 * node 33, which runs forced-commutation LOCKIN_SPIN instead
+                 * (no commutation-grade encoder) -- see ODrive.h. */
                 if ((now - last_rearm_tick) >= REARM_PERIOD_MS) {
                     last_rearm_tick = now;
                     for (uint8_t i = 0; i < num_odrives; i++) {
                         if (odrives[i].AXIS_Current_State != UNDEFINED &&
-                            odrives[i].AXIS_Current_State != CLOSED_LOOP_CONTROL) {
+                            odrives[i].AXIS_Current_State != odrives[i].Armed_State) {
                             FirmwareError_Push(FERR_AXIS_REARM, i,
                                                (uint8_t)odrives[i].AXIS_Current_State);
                             FDCAN_WAIT_TX_FREE(); Clear_Errors(&odrives[i], &tx);
-                            FDCAN_WAIT_TX_FREE(); Set_Axis_Requested_State(&odrives[i], &tx, CLOSED_LOOP_CONTROL);
+                            FDCAN_WAIT_TX_FREE(); Set_Axis_Requested_State(&odrives[i], &tx, odrives[i].Armed_State);
                             FDCAN_WAIT_TX_FREE(); Set_Input_Vel(&odrives[i], &tx, 0.0f, 0.0f);
                         }
                     }
