@@ -15,9 +15,11 @@
   *   example: "3 0.5 0.0 0.0 00\r\n"
   *
   * SOURCE PRIORITY:
-  *   BT (ESP32) overrides ROS for BT_OVERRIDE_TIMEOUT_MS (500 ms).
-  *   If no BT packet arrives within that window the robot stops and ROS
-  *   regains control.  Bit 3 of the buttons field is an emergency stop.
+  *   BT (ESP32) overrides ROS for BT_OVERRIDE_TIMEOUT_MS (500 ms), but only
+  *   while it actually commands motion -- the ESP32 heartbeat (every 100 ms,
+  *   zero twist) does NOT take control, so ROS can drive with the pad paired
+  *   and idle.  If no MOVING BT packet arrives within that window the robot
+  *   stops and ROS regains control.  Bit 3 of buttons is an emergency stop.
   ******************************************************************************
   * @attention
   *
@@ -46,6 +48,7 @@
 //#include "mcp2515.h"
 #include "ODrive.h"
 #include "ekf.h"
+#include "bt_arbitration.h"
 /* BNO085 SH2 library */
 #include "sh2_hal_impl.h"
 #include "sh2.h"
@@ -3048,11 +3051,20 @@ void StartODriveTask(void *argument)
                     }
 
                     if (cmd.source == CMD_SOURCE_BT) {
-                        if (BT_active == 2) {
-                            /* Active: BT is controlling the robot */
+                        /* The ESP32 sends a packet every HEARTBEAT_MS (100 ms) even
+                         * with the sticks centred, so claiming the override on ANY
+                         * BT packet held it forever and silently dropped every ROS
+                         * command for as long as the pad was on with TX enabled --
+                         * the base only accepted goals after switching the pad off.
+                         * Claim/refresh the override only while BT actually commands
+                         * motion. BT_RX_Task already applies BT_DEADZONE_* before
+                         * queueing, so a centred stick arrives as exact 0.0. */
+                        const uint8_t had_override = bt_override_active;
+                        if (BT_ClaimsOverride(BT_active, cmd.robot_twist)) {
+                            /* Active and driving: BT is controlling the robot */
                             bt_override_active = 1;
                             last_bt_tick       = now;
-                        } else {
+                        } else if (BT_active != BT_STATE_ACTIVE) {
                             /* Paired or Inactive: toggle-off stop packet — release override */
                             bt_override_active = 0;
                         }
@@ -3060,9 +3072,20 @@ void StartODriveTask(void *argument)
                         telemetryMsg.bt_vx = (float)cmd.robot_twist[0];
                         telemetryMsg.bt_vy = (float)cmd.robot_twist[1];
                         telemetryMsg.bt_wz = (float)cmd.robot_twist[2];
+                        /* Drop ONLY a pure idle heartbeat -- nothing was held and
+                         * nothing is claimed. Executing its zero SET_VEL would make
+                         * the 10 Hz heartbeat alternate zeroes with the ROS command
+                         * and the base would stutter while navigating.
+                         * Anything that had the override still falls through, so the
+                         * stopping packets keep working: stick released (stops now,
+                         * BT_OVERRIDE_TIMEOUT_MS releases after), TX toggled off, or
+                         * the pad disconnecting all stop the base immediately. */
+                        if (!bt_override_active && !had_override)
+                            break;
                     } else {
                         /* ROS source: silently drop while BT override is active */
-                        if (bt_override_active && (now - last_bt_tick) < BT_OVERRIDE_TIMEOUT_MS)
+                        if (BT_HoldsOverride(bt_override_active, now, last_bt_tick,
+                                             BT_OVERRIDE_TIMEOUT_MS))
                             break;
                     }
 
