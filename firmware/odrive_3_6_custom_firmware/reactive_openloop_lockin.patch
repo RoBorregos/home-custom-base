@@ -1,0 +1,21 @@
+diff --git a/Firmware/MotorControl/axis.cpp b/Firmware/MotorControl/axis.cpp
+index 03735ce..5736a79 100644
+--- a/Firmware/MotorControl/axis.cpp
++++ b/Firmware/MotorControl/axis.cpp
+@@ -218,6 +218,16 @@ bool Axis::run_lockin_spin(const LockinConfig_t &lockin_config, bool remain_arme
+     float dir = lockin_config.vel >= 0.0f ? 1.0f : -1.0f;
+ 
+     while ((requested_state_ == AXIS_STATE_UNDEFINED) && motor_.is_armed_) {
++        // PATCH (reactive open-loop): continuously feed the live lockin config into
++        // the open-loop controller so writes to general_lockin.vel/current/accel take
++        // effect WITHOUT re-entering the state. phase_vel_ then ramps smoothly from the
++        // current speed to the new target at general_lockin.accel (no restart from 0,
++        // no re-arm). Harmless for the calibration/sensorless callers (their config is
++        // static, so this just re-writes the same values each iteration).
++        open_loop_controller_.target_vel_ = lockin_config.vel;
++        open_loop_controller_.target_current_ = (motor_.config_.motor_type != Motor::MOTOR_TYPE_GIMBAL) ? lockin_config.current : 0.0f;
++        open_loop_controller_.max_phase_vel_ramp_ = lockin_config.accel;
++
+         bool reached_target_vel = std::abs(open_loop_controller_.phase_vel_.any().value_or(0.0f) - lockin_config.vel) <= std::numeric_limits<float>::epsilon();
+         bool reached_target_dist = open_loop_controller_.total_distance_.any().value_or(0.0f) * dir >= lockin_config.finish_distance * dir;
+ 

@@ -1,0 +1,156 @@
+diff --git a/Firmware/MotorControl/axis.cpp b/Firmware/MotorControl/axis.cpp
+index 03735ce..c799964 100644
+--- a/Firmware/MotorControl/axis.cpp
++++ b/Firmware/MotorControl/axis.cpp
+@@ -208,6 +208,21 @@ bool Axis::run_lockin_spin(const LockinConfig_t &lockin_config, bool remain_arme
+         motor_.phase_vel_src_.connect_to(&open_loop_controller_.phase_vel_);
+         motor_.current_control_.phase_vel_src_.connect_to(&open_loop_controller_.phase_vel_);
+         acim_estimator_.rotor_phase_vel_src_.connect_to(&open_loop_controller_.phase_vel_);
++
++        // PATCH (CAN/telemetry passthrough for LOCKIN_SPIN): Axis::start_closed_loop_control()
++        // is the only place that normally wires controller_.pos_estimate_linear_src_ /
++        // vel_estimate_src_ to the encoder -- CANSimple::get_encoder_estimates_callback()
++        // (the periodic ENCODER_ESTIMATES broadcast) reads from those same ports, not
++        // directly from encoder_.pos_estimate_/vel_estimate_. Since LOCKIN_SPIN never runs
++        // start_closed_loop_control(), those ports were left disconnected and the CAN
++        // telemetry would report 0.0 even though encoder_.pos_estimate_/vel_estimate_
++        // update continuously and meaningfully on their own (confirmed: they are gated by
++        // hall_polarity_calibrated, not by the encoder's is_ready/offset-calibration flag).
++        // Wiring them here is pure data routing for telemetry -- it does not affect
++        // control, so it's harmless for the other run_lockin_spin() callers (motor/encoder
++        // calibration, sensorless ramp) too.
++        controller_.pos_estimate_linear_src_.connect_to(&encoder_.pos_estimate_);
++        controller_.vel_estimate_src_.connect_to(&encoder_.vel_estimate_);
+     }
+     wait_for_control_iteration();
+ 
+@@ -217,7 +232,52 @@ bool Axis::run_lockin_spin(const LockinConfig_t &lockin_config, bool remain_arme
+     bool success = false;
+     float dir = lockin_config.vel >= 0.0f ? 1.0f : -1.0f;
+ 
++    // PATCH (velocity PI): integrator state for the optional PI loop below.
++    // Local (not a class member) so it naturally resets to 0 every time
++    // run_lockin_spin() is (re-)entered -- same reset-on-entry semantics as
++    // phase_vel_/open_loop_controller_ state above, no separate reset code needed.
++    float vel_pi_integrator = 0.0f;
++    const float vel_pi_dt = 0.001f;  // matches this loop's ~1kHz osDelay(1) cadence
++
+     while ((requested_state_ == AXIS_STATE_UNDEFINED) && motor_.is_armed_) {
++        // PATCH (reactive open-loop): continuously feed the live lockin config into
++        // the open-loop controller so writes to general_lockin.vel/current/accel take
++        // effect WITHOUT re-entering the state. phase_vel_ then ramps smoothly from the
++        // current speed to the new target at general_lockin.accel (no restart from 0,
++        // no re-arm). Harmless for the calibration/sensorless callers (their config is
++        // static, so this just re-writes the same values each iteration).
++        float commanded_vel = lockin_config.vel;
++
++        // PATCH (velocity PI, opt-in via lockin_config.vel_pi_enable): when disabled
++        // (default), behavior above/below is unchanged pure open-loop. When enabled,
++        // treat `vel` as the setpoint and trim it using the encoder as a plain
++        // tachometer (encoder_.vel_estimate_ is confirmed to update continuously and
++        // meaningfully here even without a commutation-grade encoder -- see the
++        // CAN-telemetry patch above; same reasoning applies). This corrects for
++        // slip/friction/load while commutation itself stays fully open-loop/forced --
++        // it only ever adjusts the *target field speed*, never touches phase alignment,
++        // so it cannot destabilize FOC the way feeding this into a true closed loop
++        // would. encoder_.vel_estimate_ is in encoder "turns"/s (per its cpr); converted
++        // to electrical rad/s with the same *2*pi*pole_pairs factor used everywhere else
++        // in this file (e.g. the CAN SET_INPUT_VEL handler) so the error stays in the
++        // same units run_lockin_spin already commands in.
++        if (lockin_config.vel_pi_enable) {
++            float measured_vel_elec = encoder_.vel_estimate_.any().value_or(0.0f)
++                                       * 2.0f * M_PI * motor_.config_.pole_pairs;
++            float error = lockin_config.vel - measured_vel_elec;
++            vel_pi_integrator = std::clamp(vel_pi_integrator + error * vel_pi_dt,
++                                           -lockin_config.vel_pi_limit, lockin_config.vel_pi_limit);
++            float correction = std::clamp(lockin_config.vel_pi_kp * error + lockin_config.vel_pi_ki * vel_pi_integrator,
++                                           -lockin_config.vel_pi_limit, lockin_config.vel_pi_limit);
++            commanded_vel = lockin_config.vel + correction;
++        } else {
++            vel_pi_integrator = 0.0f;  // keep clean if toggled on later mid-spin
++        }
++
++        open_loop_controller_.target_vel_ = commanded_vel;
++        open_loop_controller_.target_current_ = (motor_.config_.motor_type != Motor::MOTOR_TYPE_GIMBAL) ? lockin_config.current : 0.0f;
++        open_loop_controller_.max_phase_vel_ramp_ = lockin_config.accel;
++
+         bool reached_target_vel = std::abs(open_loop_controller_.phase_vel_.any().value_or(0.0f) - lockin_config.vel) <= std::numeric_limits<float>::epsilon();
+         bool reached_target_dist = open_loop_controller_.total_distance_.any().value_or(0.0f) * dir >= lockin_config.finish_distance * dir;
+ 
+diff --git a/Firmware/MotorControl/axis.hpp b/Firmware/MotorControl/axis.hpp
+index 1bfd58d..8f57591 100644
+--- a/Firmware/MotorControl/axis.hpp
++++ b/Firmware/MotorControl/axis.hpp
+@@ -29,6 +29,21 @@ public:
+         bool finish_on_vel = false;
+         bool finish_on_distance = false;
+         bool finish_on_enc_idx = false;
++        // PATCH (velocity PI for reactive open-loop LOCKIN_SPIN): when
++        // vel_pi_enable is false (default), behavior is byte-for-byte the
++        // existing pure open-loop drive (target_vel_ = vel, unchanged). When
++        // true, `vel` is treated as the setpoint and a PI loop -- fed by the
++        // encoder's own vel_estimate_ (works as a plain tachometer here; see
++        // run_lockin_spin()) -- trims the actual commanded field speed to
++        // correct for slip/friction/load. This is the single toggle: flip
++        // vel_pi_enable to switch this axis between pure open-loop and
++        // PI-corrected open-loop. Only meaningful for general_lockin (the
++        // other LockinConfig_t users -- calibration_lockin, sensorless_ramp --
++        // leave it false and are unaffected).
++        bool vel_pi_enable = false;
++        float vel_pi_kp = 0.0f;          // [(rad/s elec) / (rad/s elec)]
++        float vel_pi_ki = 0.0f;          // [(rad/s elec) / (rad/s elec * s)]
++        float vel_pi_limit = 200.0f;     // [rad/s elec] max correction magnitude (anti-windup clamp)
+     };
+ 
+     struct TaskTimes {
+diff --git a/Firmware/communication/can/can_simple.cpp b/Firmware/communication/can/can_simple.cpp
+index 988c3c4..883f5a4 100644
+--- a/Firmware/communication/can/can_simple.cpp
++++ b/Firmware/communication/can/can_simple.cpp
+@@ -279,8 +279,26 @@ void CANSimple::set_input_pos_callback(Axis& axis, const can_Message_t& msg) {
+ }
+ 
+ void CANSimple::set_input_vel_callback(Axis& axis, const can_Message_t& msg) {
+-    axis.controller_.input_vel_ = can_getSignal<float>(msg, 0, 32, true);
++    float input_vel = can_getSignal<float>(msg, 0, 32, true);
++    axis.controller_.input_vel_ = input_vel;
+     axis.controller_.input_torque_ = can_getSignal<float>(msg, 32, 32, true);
++
++    // PATCH (CAN velocity passthrough for reactive open-loop LOCKIN_SPIN):
++    // controller_.input_vel_ above is only ever consumed by the closed-loop
++    // controller task, which does not run while this axis is in LOCKIN_SPIN
++    // (forced-commutation open loop, used when there is no commutation-grade
++    // encoder). Without this, a SET_INPUT_VEL sent to this axis would be
++    // silently absorbed and do nothing. Redirect the same command into
++    // general_lockin.vel instead, which the reactive-open-loop patch in
++    // Axis::run_lockin_spin() already re-reads live every control iteration --
++    // so this axis can be commanded with the exact same CAN message every
++    // other (closed-loop) axis receives.
++    // input_vel_ is in encoder/motor-shaft turns/s (standard ODrive convention,
++    // matching what the host already sends to closed-loop axes via gear_ratio);
++    // general_lockin.vel is electrical rad/s, hence *2*pi*pole_pairs.
++    if (axis.current_state_ == Axis::AXIS_STATE_LOCKIN_SPIN) {
++        axis.config_.general_lockin.vel = input_vel * 2.0f * M_PI * axis.motor_.config_.pole_pairs;
++    }
+ }
+ 
+ void CANSimple::set_input_torque_callback(Axis& axis, const can_Message_t& msg) {
+diff --git a/Firmware/odrive-interface.yaml b/Firmware/odrive-interface.yaml
+index 34cb09d..eb8e9e8 100644
+--- a/Firmware/odrive-interface.yaml
++++ b/Firmware/odrive-interface.yaml
+@@ -592,6 +592,14 @@ interfaces:
+       finish_on_vel: bool
+       finish_on_distance: bool
+       finish_on_enc_idx: bool
++      vel_pi_enable: bool
++      vel_pi_kp:
++        type: float32
++      vel_pi_ki:
++        type: float32
++      vel_pi_limit:
++        type: float32
++        unit: rad/s
+ 
+   ODrive.Axis.CanConfig:
+     c_is_class: False
