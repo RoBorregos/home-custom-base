@@ -4,7 +4,7 @@
 **Target**: STM32H743 (CM7 core), FreeRTOS + CMSIS-RTOS2
 **Date**: 2026-06-20 (converted from `omnibase_documentation.txt`, updated for EKF + firmware error reporting + ESTOP + CAN parameter access)
 
-> This file documents the firmware as of branch `merged_major_update_ekf`. For the EKF specifically, see Section 11 (design write-up + `robot_localization` replaceability analysis) and Section 12 (pending home2 `omnidriver` migration). For a dated changelog, see `CM7/status.txt`.
+> This file documents the firmware as of branch `merged_major_update_ekf`. For the EKF specifically, see Section 11 (design write-up + `robot_localization` replaceability analysis) and Section 12 (home2 `omnidriver` migration, completed). For a dated changelog, see `CM7/status.txt`.
 
 ---
 
@@ -847,9 +847,9 @@ What this does **not** replace: `map → odom` TF (still comes from SLAM — `sl
 
 ---
 
-## Section 12 — Pending: home2 `omnidriver` EKF Migration
+## Section 12 — Completed: home2 `omnidriver` EKF Migration
 
-The home-custom-base `odrive_comm` dashboard (this repo) is fully updated to consume the on-MCU EKF (Section 6, `odrive_dashboard.py`). The home2 `omnidriver` package is a **separate, downstream fork** of the same dashboard, hardened for production but **not yet updated** — this is still open work, tracked here (previously tracked in a standalone `ekf_addition.md`/`ekf_home2_update_prompt.txt`, merged into this doc since the EKF itself is tested and in use; only the home2 migration remains outstanding).
+The home-custom-base `odrive_comm` dashboard (this repo) is fully updated to consume the on-MCU EKF (Section 6, `odrive_dashboard.py`). The home2 `omnidriver` package is a **separate, downstream fork** of the same dashboard, hardened for production. **This migration is done in home2**: `omnidriver/odrive_dashboard.py` consumes `ODOM_vxb`/`ODOM_vyb`, the EKF quaternion and covariance, no longer inverts the IMU yaw, and publishes the `odom → base_link` TF (`publish_tf`, default `True`); `nav_main/launch/omni_setup/omni_basics.launch.py` no longer launches `robot_localization`, and Nav2 reads `/odrive/odom`. The subsections below are kept as the record of what the migration required.
 
 ### 12.1 Required changes (~60 lines across `_parse_and_publish`, `_publish_imu_odom`, `__init__`, the parameter callback)
 
@@ -912,7 +912,6 @@ At RoboCup 2026 this happened and even connecting the ODrive to https://gui.odri
 2. **No I2C bus-reset recovery.** Unchanged from the original BNO085 integration — a brownout mid-transaction still freezes IMU data until reboot.
 3. **RxSdo writes are fire-and-forget.** No TxSdo read-back implemented (Section 10.2).
 4. **`vApplicationStackOverflowHook` halts, doesn't recover.** By design — a corrupted stack can't safely run recovery code.
-5. **home2 `omnidriver` dashboard not yet updated for this firmware.** See Section 12 for the ~60-line migration checklist (baud rate, drop manual world→body un-rotation, drop yaw inversion, prefer EKF quaternion/covariance, add TF). Don't flash this firmware against an un-updated `omnidriver` — yaw/velocity will double-invert and TF won't publish.
-6. **BT-only watchdog is redundant.** Superseded by the general command watchdog; candidate for removal after further testing.
-7. **`MutexUART_DataHandle` still unused.** Acceptable as long as the "only `UART_TX_Task` calls `printf()`" convention holds (Section 4.1) — revisit if that rule is ever broken.
-8. **Recurring CAN bus-off / axis-fault / mass-arm-timeout observed in one test run.** Likely a wiring/termination/connector issue, possibly vibration-induced given the arm-vibration tuning context this firmware is being tested under — not a firmware bug, but flagged here since it would corrupt PID-tuning data collected during an affected run. Investigate hardware (connector seating, termination resistors) before trusting such a run's data.
+5. **BT-only watchdog is redundant.** Superseded by the general command watchdog; candidate for removal after further testing.
+6. **`MutexUART_DataHandle` still unused.** Acceptable as long as the "only `UART_TX_Task` calls `printf()`" convention holds (Section 4.1) — revisit if that rule is ever broken.
+7. **Recurring CAN bus-off / axis-fault / mass-arm-timeout observed in one test run.** Likely a wiring/termination/connector issue, possibly vibration-induced given the arm-vibration tuning context this firmware is being tested under — not a firmware bug, but flagged here since it would corrupt PID-tuning data collected during an affected run. Investigate hardware (connector seating, termination resistors) before trusting such a run's data.

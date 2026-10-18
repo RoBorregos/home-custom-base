@@ -26,7 +26,8 @@ Branch: merged_major_update_ekf
    - NOTE: the home2 `omnidriver` dashboard fork still needs ~60 lines
      of changes to consume this firmware correctly (baud rate, drop
      manual world->body un-rotation, drop yaw inversion, prefer EKF
-     quaternion/covariance, add TransformBroadcaster). Not done yet.
+     quaternion/covariance, add TransformBroadcaster). Done since in
+     home2 (see omnibase_documentation.md section 12).
 
 2. Firmware error reporting pipeline (FirmwareError struct, ERR_QueueHandle)
    - All non-TX tasks now route diagnostics through FirmwareError_Push()
@@ -117,8 +118,6 @@ Known open items (not yet done, flagged during this session):
     the EKF silently falls back to wheel-only dead-reckoning with no
     error pushed and no dashboard indicator (unlike the ESP32/PC link
     status rows, which do have explicit age/status tracking).
-  - home2 omnidriver dashboard not yet updated for EKF firmware
-    compatibility (see omnibase_documentation.md section 12).
   - Recurring CAN bus-off / axis-fault / mass-arm-timeout events seen
     in one test run — likely a wiring/termination/connector issue,
     possibly vibration-induced; not a firmware bug. Investigate
