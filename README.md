@@ -27,12 +27,10 @@ RoBorregos custom omnidirectional base — firmware and ROS2 interface for a fou
 | ESTOP hardware input with separate press/release debounce + re-arm hold | Working |
 | Stack overflow detection (`configCHECK_FOR_STACK_OVERFLOW=2`) + periodic watermark check | Working |
 | ControlTask (heading controller / path planner) | **Pending** — scaffolded, body empty |
-| home2 `omnidriver` dashboard EKF compatibility | **Pending**\*\* |
+| home2 `omnidriver` dashboard EKF compatibility | Working — the dashboard is the sole `odom -> base_link` publisher; `robot_localization` is no longer launched (`nav_main/launch/omni_setup/omni_basics.launch.py`) |
 | IMU staleness watchdog | **Pending** — silent fallback to dead-reckoning if BNO085 stops producing samples |
 
 \* see `firmware/STM32H7_OMNIBASE_CAN_BNO085/omnibase_documentation.md` §11
-
-\*\* see `firmware/STM32H7_OMNIBASE_CAN_BNO085/omnibase_documentation.md` §12
 
 ---
 
@@ -85,7 +83,6 @@ Node IDs are pre-assigned in firmware at boot before FDCAN RX is activated. Conf
 - No IMU staleness watchdog — if the BNO085 stops producing samples, `ekf_correct_imu` silently stops applying corrections forever; the EKF falls back to wheel-only dead-reckoning with no error pushed and no dashboard indicator (unlike the ESP32/PC link rows, which do track age/status explicitly).
 - `DefaultTask` is created but gutted to a one-line idle loop (kept only to avoid CubeMX regen conflicts).
 - BT-only watchdog (`BT_OVERRIDE_TIMEOUT_MS`) is now redundant — superseded by the general velocity watchdog. Pending removal after testing.
-- home2's `omnidriver` dashboard fork is not yet updated to consume the on-MCU EKF firmware correctly (baud rate, yaw inversion, EKF quaternion/covariance, TF) — see `omnibase_documentation.md` §12. Don't flash this EKF firmware against an un-updated `omnidriver` without checking that first.
 - Arbitrary CAN parameter writes (RxSdo, used for e.g. `vel_ramp_rate`) are fire-and-forget — no TxSdo read-back is implemented, so a write isn't confirmed to have landed without checking via `odrivetool`/USB.
 - The dashboard's **Axis Lab tab** (per-motor inspection/control/calibration) is **untested** — has not been validated against real hardware.
 
@@ -112,7 +109,7 @@ Tasks other than `Start_UART_TX_Task` cannot call `printf()`. Instead they call 
 
 ## EKF and TF
 
-The firmware runs a 6-state EKF (`firmware/.../ekf.c`) fusing wheel odometry with BNO085 IMU yaw/omega_z, replacing the previous Euler dead-reckoning. `odrive_dashboard.py` consumes the EKF's quaternion and full pose/twist covariance and publishes the `odom -> base_link` TF directly (`publish_tf` parameter, default `True`) — this fully replaces `robot_localization` for the omnibase configuration. See `firmware/STM32H7_OMNIBASE_CAN_BNO085/omnibase_documentation.md` §11 for the full design write-up, replaceability analysis vs. `robot_localization`, and known gaps (§12 covers the pending home2 migration).
+The firmware runs a 6-state EKF (`firmware/.../ekf.c`) fusing wheel odometry with BNO085 IMU yaw/omega_z, replacing the previous Euler dead-reckoning. `odrive_dashboard.py` consumes the EKF's quaternion and full pose/twist covariance and publishes the `odom -> base_link` TF directly (`publish_tf` parameter, default `True`) — this fully replaces `robot_localization` for the omnibase configuration. See `firmware/STM32H7_OMNIBASE_CAN_BNO085/omnibase_documentation.md` §11 for the full design write-up, replaceability analysis vs. `robot_localization`, and known gaps.
 
 ---
 
