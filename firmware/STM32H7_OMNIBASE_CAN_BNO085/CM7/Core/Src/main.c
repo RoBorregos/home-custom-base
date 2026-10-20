@@ -15,9 +15,11 @@
   *   example: "3 0.5 0.0 0.0 00\r\n"
   *
   * SOURCE PRIORITY:
-  *   BT (ESP32) overrides ROS for BT_OVERRIDE_TIMEOUT_MS (500 ms).
-  *   If no BT packet arrives within that window the robot stops and ROS
-  *   regains control.  Bit 3 of the buttons field is an emergency stop.
+  *   BT (ESP32) overrides ROS for BT_OVERRIDE_TIMEOUT_MS (500 ms), but only
+  *   while it actually commands motion -- the ESP32 heartbeat (every 100 ms,
+  *   zero twist) does NOT take control, so ROS can drive with the pad paired
+  *   and idle.  If no MOVING BT packet arrives within that window the robot
+  *   stops and ROS regains control.  Bit 3 of buttons is an emergency stop.
   ******************************************************************************
   * @attention
   *
@@ -46,6 +48,7 @@
 //#include "mcp2515.h"
 #include "ODrive.h"
 #include "ekf.h"
+#include "bt_arbitration.h"
 /* BNO085 SH2 library */
 #include "sh2_hal_impl.h"
 #include "sh2.h"
@@ -495,11 +498,12 @@ Error_Handler();
   /* Assign ODrive CAN node IDs BEFORE FDCAN RX is activated, so heartbeats are
    * matched from the very first frame (the RX ISR filters by odrives[].NODE_ID,
    * which is otherwise 0 until StartODriveTask runs after the scheduler starts).
-   * These must match axis0.config.can.node_id on each S1. */
-  odrives[0].NODE_ID = 36;
+   * These must match axis0.config.can.node_id on each S1.
+   * Index = IK wheel position: [0]=FL [1]=FR [2]=RL [3]=RR (remapped 2026-10-19). */
+  odrives[0].NODE_ID = 40;
   odrives[1].NODE_ID = 34;
   odrives[2].NODE_ID = 33;
-  odrives[3].NODE_ID = 40;
+  odrives[3].NODE_ID = 36;
   MX_FDCAN1_Init();
   MX_USART2_UART_Init();
   /* USER CODE BEGIN 2 */
@@ -680,12 +684,13 @@ static void MX_FDCAN1_Init(void)
   hfdcan1.Init.AutoRetransmission = DISABLE;
 #else
   hfdcan1.Init.Mode = FDCAN_MODE_NORMAL;
-  /* One-shot transmit (no auto-retransmit). For 100 Hz periodic setpoints a
-   * frame that is not ACKed (a momentarily absent ODrive / bus glitch) should
-   * be DROPPED and superseded by the next command, NOT retried forever. With
-   * AutoRetransmission ENABLED a single un-ACKed frame pins the (small) TX FIFO
-   * and rapidly drives the Transmit-Error-Counter to BUS-OFF. */
-  hfdcan1.Init.AutoRetransmission = DISABLE;
+  /* Auto-retransmit ON. One-shot mode (DAR) also drops a frame that merely
+   * LOSES ARBITRATION, and commands to the highest node IDs (40 -> 0x50D,
+   * 36 -> 0x48D) lose to the ODrives' 100 Hz telemetry all the time: those two
+   * axes missed setpoints, hit WATCHDOG and misbehaved. An absent ODrive does
+   * not stall TX: any live node ACKs. FDCAN_WAIT_TX_FREE and the bus-off
+   * recovery already bound the dead-bus case. */
+  hfdcan1.Init.AutoRetransmission = ENABLE;
 #endif
 
   hfdcan1.Init.TransmitPause = DISABLE;
@@ -2543,10 +2548,10 @@ void StartODriveTask(void *argument)
     const double  radius        = 0.0762;
     const double  wheel_sign[4] = { -1.0, 1.0, -1.0, 1.0 };
 
-    odrives[0].NODE_ID     = 36;
+    odrives[0].NODE_ID     = 40;
     odrives[1].NODE_ID     = 34;
     odrives[2].NODE_ID     = 33;
-    odrives[3].NODE_ID     = 40;
+    odrives[3].NODE_ID     = 36;
     odrives[0].gear_ratio  = 9;
     odrives[1].gear_ratio  = 9;
     odrives[2].gear_ratio  = 9;
@@ -2569,7 +2574,9 @@ void StartODriveTask(void *argument)
      * BT link dropped). `cmd_watchdog_fired` is a latch so we don't spam
      * the CAN bus while the link is still down; it clears as soon as a new
      * SET_VEL arrives. */
-    const uint32_t CMD_WATCHDOG_TIMEOUT_MS = 500;
+    /* Must stay below the ODrive's own axis0.config.watchdog_timeout (0.5 s),
+     * or the ODrive watchdog trips before our zero-velocity resend starts. */
+    const uint32_t CMD_WATCHDOG_TIMEOUT_MS = 300;
     uint32_t last_vel_cmd_tick = osKernelGetTickCount();
     uint8_t  cmd_watchdog_fired = 0;
     /* While the command watchdog is latched, re-send the zero-velocity stop
@@ -2768,8 +2775,12 @@ void StartODriveTask(void *argument)
         /* If we just received a velocity command from any source, refresh the
          * watchdog. We do this before the state machine so a SET_VEL that is
          * later dropped (e.g. ROS command masked by an active BT override)
-         * still proves the upstream link is alive. */
-        if (qst == osOK && cmd.type == ODRIVE_CMD_SET_VEL) {
+         * still proves the upstream link is alive. An idle BT heartbeat does
+         * NOT count: it is dropped below without sending anything on CAN, so
+         * letting it refresh the watchdog starved the ODrive watchdog with the
+         * pad on and ROS silent (axes cycling green/red at rest). */
+        if (qst == osOK && cmd.type == ODRIVE_CMD_SET_VEL &&
+            (cmd.source != CMD_SOURCE_BT || BT_ClaimsOverride(BT_active, cmd.robot_twist))) {
             last_vel_cmd_tick  = now;
             cmd_watchdog_fired = 0;
         }
@@ -2949,11 +2960,20 @@ void StartODriveTask(void *argument)
                     }
 
                     if (cmd.source == CMD_SOURCE_BT) {
-                        if (BT_active == 2) {
-                            /* Active: BT is controlling the robot */
+                        /* The ESP32 sends a packet every HEARTBEAT_MS (100 ms) even
+                         * with the sticks centred, so claiming the override on ANY
+                         * BT packet held it forever and silently dropped every ROS
+                         * command for as long as the pad was on with TX enabled --
+                         * the base only accepted goals after switching the pad off.
+                         * Claim/refresh the override only while BT actually commands
+                         * motion. BT_RX_Task already applies BT_DEADZONE_* before
+                         * queueing, so a centred stick arrives as exact 0.0. */
+                        const uint8_t had_override = bt_override_active;
+                        if (BT_ClaimsOverride(BT_active, cmd.robot_twist)) {
+                            /* Active and driving: BT is controlling the robot */
                             bt_override_active = 1;
                             last_bt_tick       = now;
-                        } else {
+                        } else if (BT_active != BT_STATE_ACTIVE) {
                             /* Paired or Inactive: toggle-off stop packet — release override */
                             bt_override_active = 0;
                         }
@@ -2961,9 +2981,20 @@ void StartODriveTask(void *argument)
                         telemetryMsg.bt_vx = (float)cmd.robot_twist[0];
                         telemetryMsg.bt_vy = (float)cmd.robot_twist[1];
                         telemetryMsg.bt_wz = (float)cmd.robot_twist[2];
+                        /* Drop ONLY a pure idle heartbeat -- nothing was held and
+                         * nothing is claimed. Executing its zero SET_VEL would make
+                         * the 10 Hz heartbeat alternate zeroes with the ROS command
+                         * and the base would stutter while navigating.
+                         * Anything that had the override still falls through, so the
+                         * stopping packets keep working: stick released (stops now,
+                         * BT_OVERRIDE_TIMEOUT_MS releases after), TX toggled off, or
+                         * the pad disconnecting all stop the base immediately. */
+                        if (!bt_override_active && !had_override)
+                            break;
                     } else {
                         /* ROS source: silently drop while BT override is active */
-                        if (bt_override_active && (now - last_bt_tick) < BT_OVERRIDE_TIMEOUT_MS)
+                        if (BT_HoldsOverride(bt_override_active, now, last_bt_tick,
+                                             BT_OVERRIDE_TIMEOUT_MS))
                             break;
                     }
 
@@ -3001,6 +3032,29 @@ void StartODriveTask(void *argument)
                         (double*)wheel_sign, telemetryMsg.IK_computed_wheel_speeds);
                     sm_state = SM_RUNNING;
                 }
+                /* Maintenance while stopped (e.g. FULL_CALIBRATION + save over
+                 * RxSdo): SM_RUNNING's auto-rearm would abort a calibration by
+                 * forcing CLOSED_LOOP. Motion commands stay blocked here. */
+                else if (qst == osOK && (cmd.type == ODRIVE_CFG_SET_STATE ||
+                                         cmd.type == ODRIVE_CFG_CLEAR_ERRORS ||
+                                         cmd.type == ODRIVE_CFG_SET_PARAM_FLOAT)) {
+                    ODrive_ProcessCommand(&cmd, odrives, num_odrives, &tx,
+                        odrive_odom, x_offset, y_offset, radius,
+                        &current_ctrl_mode, &current_input_mode,
+                        (double*)wheel_sign, telemetryMsg.IK_computed_wheel_speeds);
+                }
+                /* Keep the ODrive watchdogs fed with zero velocity: unfed, the
+                 * S1 disarms any requested state (calibration included) at once. */
+                if ((now - last_wd_stop_tick) >= WD_STOP_RESEND_MS) {
+                    last_wd_stop_tick = now;
+                    ODriveCmdMsg zero_cmd = {0};
+                    zero_cmd.type        = ODRIVE_CMD_SET_VEL;
+                    zero_cmd.target_mask = 0x0F;
+                    ODrive_ProcessCommand(&zero_cmd, odrives, num_odrives, &tx,
+                        odrive_odom, x_offset, y_offset, radius,
+                        &current_ctrl_mode, &current_input_mode,
+                        (double*)wheel_sign, telemetryMsg.IK_computed_wheel_speeds);
+                }
                 break;
             }
             case SM_ESTOP:
@@ -3028,10 +3082,12 @@ void StartODriveTask(void *argument)
 
             /* Per-axis error detection (diagnostic only, no control impact). */
             for (uint8_t i = 0; i < num_odrives; i++) {
-                /* Axis fault: AXIS_Error register went non-zero. */
+                /* Axis fault: AXIS_Error register went non-zero. detail = index
+                 * of the highest set ODriveError bit (e.g. 24 WATCHDOG, 26
+                 * SPINOUT, 12 CURRENT_LIMIT); the old `& 0xFF` hid them all as 0. */
                 if (telemetryMsg.axis_error[i] != 0 && prev_axis_error[i] == 0)
                     FirmwareError_Push(FERR_AXIS_FAULT, i,
-                                       (uint8_t)(telemetryMsg.axis_error[i] & 0xFF));
+                                       (uint8_t)(31 - __builtin_clz(telemetryMsg.axis_error[i])));
                 prev_axis_error[i] = telemetryMsg.axis_error[i];
 
                 /* Heartbeat timeout: axis stopped sending CAN heartbeats. */
