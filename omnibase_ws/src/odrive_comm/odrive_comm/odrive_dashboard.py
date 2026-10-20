@@ -196,7 +196,7 @@ FERR_DESCRIPTIONS = {
     0x10: 'ODrive startup failed',
     0x20: 'Arm timeout (all retries failed)',
     0x21: 'Axis fell out of CLOSED_LOOP — auto-rearm issued',
-    0x30: 'ODrive axis fault (AXIS_Error non-zero)',
+    0x30: 'ODrive axis fault (AXIS_Error non-zero; detail = highest error bit index)',
     0x31: 'Command watchdog fired — no SET_VEL received',
     0x32: 'Heartbeat timeout — axis stopped responding',
     0x40: 'IMU sh2_open failed',
@@ -230,7 +230,7 @@ class ODriveDashboardNode(Node):
         self.declare_parameter('baud_rate',           230400)
         self.declare_parameter('use_stamped_cmd_vel', True)
         self.declare_parameter('tx_period',           0.1)
-        self.declare_parameter('node_ids',            [33, 34, 35, 40])
+        self.declare_parameter('node_ids',            [40, 34, 33, 36])
         self.declare_parameter('enable_web_gui',      True)
         self.declare_parameter('web_gui_port',        5000)
         # Frame ids used in the ROS Imu and Odometry messages.
