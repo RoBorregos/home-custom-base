@@ -6,7 +6,7 @@ RoBorregos custom omnidirectional base — firmware and ROS2 interface for a fou
 
 ## Current Status
 
-**Platform**: STM32H743 (CM7) · FreeRTOS · four ODrive S1 (CAN, fw v0.6.12) · BNO085 IMU (I2C) · ESP32 BT (USART2) · ROS computer (USART3 @ 230,400 baud)
+**Platform**: STM32H755 (CM7) · FreeRTOS · four ODrive S1 (CAN, fw v0.6.12) · BNO085 IMU (I2C) · ESP32 BT (USART2) · ROS computer (USART3 @ 230,400 baud)
 
 | Feature | Status |
 |---|---|

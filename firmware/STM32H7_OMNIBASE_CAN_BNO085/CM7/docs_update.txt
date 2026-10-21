@@ -40,7 +40,7 @@ Both run at 115 200 baud, 8N1.
 Page 1 contains "asdfasdfasdfasdf" as the project state description.
 Replace with an accurate summary, e.g.:
 
-  "Four-wheel mecanum-drive robot controller. STM32H743 (CM7) running
+  "Four-wheel mecanum-drive robot controller. STM32H755 (CM7) running
    FreeRTOS. Four ODrives (CAN), BNO085 IMU (I2C), ESP32 BT module
    (USART2), ROS computer (USART3). Velocity control operational.
    Odometry and telemetry at 100 Hz. IMU data telemetry-only (not yet

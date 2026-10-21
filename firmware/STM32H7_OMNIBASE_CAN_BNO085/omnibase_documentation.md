@@ -1,7 +1,7 @@
 # STM32H7 OMNIBASE — Complete Technical Documentation
 
 **Project**: STM32H7_OMNIBASE_CAN_BNO085
-**Target**: STM32H743 (CM7 core), FreeRTOS + CMSIS-RTOS2
+**Target**: STM32H755 (CM7 core), FreeRTOS + CMSIS-RTOS2
 **Date**: 2026-06-20 (converted from `omnibase_documentation.txt`, updated for EKF + firmware error reporting + ESTOP + CAN parameter access)
 
 > This file documents the firmware as of branch `merged_major_update_ekf`. For the EKF specifically, see Section 11 (design write-up + `robot_localization` replaceability analysis) and Section 12 (home2 `omnidriver` migration, completed). For a dated changelog, see `CM7/status.txt`.
