@@ -696,7 +696,9 @@ static void MX_FDCAN1_Init(void)
   hfdcan1.Init.TransmitPause = DISABLE;
   hfdcan1.Init.ProtocolException = DISABLE;
   hfdcan1.Init.NominalPrescaler = 2;
-  hfdcan1.Init.NominalSyncJumpWidth = 1;
+  /* SJW = Seg2 (max). SJW=1 (2.5% of the bit) leaves little room to resync;
+   * suspected cause of node 33 (S1 hw 5.2) going BUS_OFF ~36x/s (2026-10-23). */
+  hfdcan1.Init.NominalSyncJumpWidth = 8;
   hfdcan1.Init.NominalTimeSeg1 = 31;
   hfdcan1.Init.NominalTimeSeg2 = 8;
   hfdcan1.Init.DataPrescaler = 1;

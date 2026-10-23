@@ -486,6 +486,14 @@ Unchanged — converts a unit quaternion to yaw/pitch/roll (radians) via the ZYX
 
 Unchanged fixed-command-set mechanics (`Set_TX_Param`, 11-bit ID = `(node_id<<5)|cmd_id`, `FDCAN_WAIT_TX_FREE()` with a 50ms hard timeout — now pushes `FERR_CAN_TX_TIMEOUT` instead of printing). See Section 10 for the new RxSdo arbitrary-parameter-write path, which uses cmd_id `0x004` instead of one of the fixed command IDs.
 
+**FDCAN1 bit timing (500 kbps).** HSE 8 MHz → PLL1Q 40 MHz → `NominalPrescaler` 2 → 40 tq/bit: `NominalTimeSeg1` 31 + `NominalTimeSeg2` 8 (sample point 80%), **`NominalSyncJumpWidth` 8** (= Seg2, the maximum).
+
+The SJW used to be 1 (2.5% of the bit). With that setting the ODrive S1 on node 33 (hw 5.2, fw 0.6.12) reported `can.error = BUS_OFF`, and `can.n_restarts` kept climbing: +36/s while armed and +16/s with the PWM off in e-stop. The S1 received only ~8 frames/s, so its 0.5 s watchdog kept expiring even with the base at rest. The dashboard showed `[FW ERR] ODrive axis fault (axis 2, detail=24)` (bit 24 = `WATCHDOG_TIMER_EXPIRED`), followed by `Axis fell out of CLOSED_LOOP — auto-rearm issued (detail=1)` every 0.5 s. No heartbeat timeout appeared. Its config matched the other three nodes.
+
+After setting SJW = 8, `n_restarts` stayed flat for 40 s and `n_rx` rose to ~20 frames/s (2026-10-23).
+
+**Diagnosing a node that keeps hitting WATCHDOG:** connect USB to that ODrive and sample `odrv0.can.n_restarts` and `odrv0.can.n_rx` over 10 s. `can.error` is sticky, so judge by whether `n_restarts` is still increasing.
+
 ### 5.5 / 5.6 Mecanum IK (`computeNecessaryWheelSpeedsMecanum` / `bodySpeedsFromUMecanum`)
 
 Unchanged kinematic model. `bodySpeedsFromUMecanum` (renamed from `globalSpeedsFromUMecanum`) now feeds the EKF's predict step instead of directly dead-reckoning a global pose.
